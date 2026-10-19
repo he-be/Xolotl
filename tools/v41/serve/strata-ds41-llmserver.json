@@ -12,6 +12,7 @@
     "--kv-fp4",
     "--route-bias", "0.5",
     "--route-bias-file", "0.3",
+    "--route-bias-remote", "0.5",
     "--arena-gib", "72",
     "--tier-batch-pcie", "0.5",
     "--remote-reserve-gib", "0.6",
