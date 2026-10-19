@@ -249,6 +249,12 @@ struct Ds41Dense::Impl {
     struct GKey { int il, kind; int64_t cap, n; bool operator<(const GKey & o) const {
         return std::tie(il, kind, cap, n) < std::tie(o.il, o.kind, o.cap, o.n); } };
     std::map<GKey, ggml_cgraph *> graphs;
+    // pass graphs with 1 < n <= kPassGraphN (the DSpark verify widths: t + depth-4 drafts + a re-fed row), cached
+    // like the n = 1 ones instead of built + allocated per layer per pass (DS41_PASS_GRAPHS=0: per pass, as before).
+    // Their own node context, dropped wholesale when it runs low (the KV cap buckets move as the context grows).
+    ggml_context * gctx_m = nullptr;
+    std::map<GKey, ggml_cgraph *> mgraphs;
+    long mgraph_resets = 0;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
     std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
@@ -263,6 +269,7 @@ struct Ds41Dense::Impl {
         if (sctx) ggml_free(sctx);
         if (ictx) ggml_free(ictx);
         if (gctx) ggml_free(gctx);
+        if (gctx_m) ggml_free(gctx_m);
         if (own_backend && backend) ggml_backend_free(backend);
     }
     ggml_tensor * W(const std::string & n) const { return w.get(n); }
@@ -1039,6 +1046,36 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
     return gf;
 }
 
+// ================================================================== cached pass graphs (1 < n <= kPassGraphN)
+
+static constexpr int64_t kPassGraphN = 8;
+static constexpr size_t kPassGraphCtx = (size_t) 256 << 20;
+
+static bool pass_graphs_on(int64_t n) {
+    static const bool on = env_on("DS41_PASS_GRAPHS", true);
+    return on && n > 1 && n <= kPassGraphN;
+}
+
+template <class F>
+static ggml_cgraph * pass_graph(Ds41Dense::Impl & im, const Ds41Dense::Impl::GKey & key, F build) {
+    auto it = im.mgraphs.find(key);
+    if (it != im.mgraphs.end()) return it->second;
+    // worst case of one graph: 8192 nodes' tensors + the graph struct
+    const size_t need = ggml_tensor_overhead() * 8192 * 2 + ggml_graph_overhead_custom(8192, false);
+    if (!im.gctx_m || ggml_get_mem_size(im.gctx_m) - ggml_used_mem(im.gctx_m) < need) {
+        if (im.gctx_m) {
+            for (const auto & kv : im.mgraphs) im.allo_dec.graph_epoch.erase(kv.second);
+            std::fprintf(stderr, "ds41_dense: pass graph cache full (%zu graphs) - dropped\n", im.mgraphs.size());
+            im.mgraphs.clear();
+            ggml_free(im.gctx_m);
+            ++im.mgraph_resets;
+        }
+        ggml_init_params gp = { kPassGraphCtx, nullptr, true };
+        im.gctx_m = ggml_init(gp);
+    }
+    return im.mgraphs.emplace(key, build(im.gctx_m)).first->second;
+}
+
 // ================================================================== public API
 
 Ds41Dense::Ds41Dense() : p_(new Impl()) {}
@@ -1131,6 +1168,9 @@ bool Ds41Dense::set_columns(int nc) {
     // every cached graph holds views of the old columns (their addresses are fixed at the first allocation), and the
     // allocators remember graphs by address - all of it goes, and is rebuilt lazily for the new tensors
     im.graphs.clear();
+    for (const auto & kv : im.mgraphs) im.allo_dec.graph_epoch.erase(kv.second);
+    im.mgraphs.clear();
+    if (im.gctx_m) { ggml_free(im.gctx_m); im.gctx_m = nullptr; }
     im.logits_out.clear();
     im.predict_out.clear();
     im.predict_out_n.clear();
@@ -1501,18 +1541,21 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     ggml_context * gc = nullptr;
     ggml_cgraph * gf = nullptr;
     const bool cached = n == 1;
+    const bool mcached = pass_graphs_on(n);
     std::vector<uint8_t> meta;
     if (cached) {
         auto it = im.graphs.find({ -1, 0, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1 }, build_init(im, im.gctx, 1)).first;
         gf = it->second;
+    } else if (mcached) {
+        gf = pass_graph(im, Impl::GKey { -1, 0, 0, n }, [&](ggml_context * c) { return build_init(im, c, n); });
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_init(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached || mcached);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1710,18 +1753,21 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
+    const bool mcached = pass_graphs_on(n);
     if (cached) {
         const Impl::GKey key { il, 1, cap, 1 };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
         gf = it->second;
+    } else if (mcached) {
+        gf = pass_graph(im, Impl::GKey { il, 1, cap, n }, [&](ggml_context * c) { return build_attn(im, c, il, n); });
     } else {
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
         ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached || mcached);
     if (gc) ggml_free(gc);
     if (!ok) return false;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
@@ -1787,17 +1833,20 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
     std::vector<uint8_t> meta;
+    const bool mcached = pass_graphs_on(n);
     if (cached) {
         auto it = im.graphs.find({ -1, 2, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1 }, build_finish(im, im.gctx, 1)).first;
         gf = it->second;
+    } else if (mcached) {
+        gf = pass_graph(im, Impl::GKey { -1, 2, 0, n }, [&](ggml_context * c) { return build_finish(im, c, n); });
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached || mcached);
     if (gc) ggml_free(gc);
     return ok;
 }
