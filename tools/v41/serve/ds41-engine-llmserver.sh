@@ -16,7 +16,7 @@ export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
 export STRATA_SERVE_LOOKUP="${STRATA_SERVE_LOOKUP:-14}"
 export STRATA_SERVE_DSPARK_EVICT="${STRATA_SERVE_DSPARK_EVICT:-4096}"
 export STRATA_DENSE_REQUANT="${STRATA_DENSE_REQUANT-q6_K}"
-export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
+export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-0}"
 # ZFS: the Engram tables have no raw-device path (FIEMAP)
 export STRATA_ENGRAM_RAWDEV="${STRATA_ENGRAM_RAWDEV:-0}"
 [ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
@@ -30,5 +30,5 @@ GDB=()
 # DS41_NSYS=<report path>: the engine under nsys (CUDA API + kernels + copies, graphs as one range)
 [ -n "${DS41_NSYS:-}" ] && GDB=(/usr/local/bin/nsys profile -t cuda,nvtx --sample=none --cpuctxsw=none
     --cuda-memory-usage=false --cuda-graph-trace=graph --kill=none -f true -o "$DS41_NSYS")
-exec systemd-run --scope -q --unit="ds41-serve-$$" -p MemoryMax="${DS41_MEMORY_MAX:-57G}" -p MemorySwapMax=0 \
+exec systemd-run --scope -q --unit="ds41-serve-$$" -p MemoryMax="${DS41_MEMORY_MAX:-84G}" -p MemorySwapMax=0 \
     "${GDB[@]}" "$BUILD_DIR/ds41_generate" "$@"

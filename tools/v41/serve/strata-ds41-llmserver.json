@@ -4,7 +4,7 @@
     "-m", "/root/models/V41-GSQ/V41-GSQ.gguf",
     "--backend", "cuda",
     "--experts", "gpu",
-    "--engram", "/root/models/FP8-engram",
+    "--engram", "/mnt/engram/FP8-engram",
     "--rank", "/root/models/V41-GSQ/rank.bin",
     "--ctx", "131072",
     "--stop", "1",
@@ -12,7 +12,7 @@
     "--kv-fp4",
     "--route-bias", "0.5",
     "--route-bias-file", "0.3",
-    "--arena-gib", "47",
+    "--arena-gib", "72",
     "--remote-reserve-gib", "0.6",
     "--remote-device", "1",
     "--prompt-batch", "12288"
