@@ -1101,6 +1101,15 @@ void Ds41Dense::clear_vision() {
     im.n_vis = 0;
 }
 
+void Ds41Dense::engram_history(const int * ids, int64_t n) {
+    Impl & im = *p_;
+    if (!im.engram.enabled()) return;
+    for (int64_t p = 0; p < n; ++p) {
+        if (ids[p] < 0) im.engram.set_dead(p);
+        else im.engram.set_token(p, ids[p]);
+    }
+}
+
 // The NC-column tensors (see Impl::nctx): (re)created for `NC` columns, zeroed.  Every one is per-pass scratch (a pass
 // writes the columns it reads), so a resize between passes loses nothing.
 static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {

@@ -78,6 +78,9 @@ public:
     /// with a different image does).  rows/pos must stay alive until those positions have been fed.
     void set_vision(const float * rows, const int64_t * pos, int n_rows);
     void clear_vision();
+    /// Rewrite Engram's by-position history for positions [0, n) from the prompt as the conversation cache holds it
+    /// (a negative id = an image row: DEAD).  A resumed prompt's first passes hash the positions before them from it.
+    void engram_history(const int * ids, int64_t n);
     /// Blocks present in the file (all 40 for the real model; a prefix for a partial test file).
     int64_t n_layer() const;
     ggml_backend_t backend() const;

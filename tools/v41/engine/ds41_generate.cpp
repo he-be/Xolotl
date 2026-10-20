@@ -159,6 +159,32 @@ static bool map_vision(const std::vector<int> & ids, int image_token, const std:
     return true;
 }
 
+static uint64_t fnv1a(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto * b = static_cast<const uint8_t *>(p);
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// The prompt as the conversation cache matches it (Strata #2228 for V4.1): ids, with every image row replaced by a
+// NEGATIVE id made from that picture's key and the row's index, so a token-only prefix test tells two pictures apart
+// (each image span is one run of image_token) and a picture sent again matches.  keys: the server's img_keys (its
+// normalized bytes' hash, in prompt order); absent or a different count = the embedding floats' hash.  Negative ids
+// never equal a real token, and Ds41Dense::engram_history reads them as the image's DEAD positions.
+static std::vector<int> match_ids(const std::vector<int> & ids, const std::vector<std::vector<float>> & recs,
+                                  const std::vector<int64_t> & counts, const std::vector<int64_t> & vis_pos,
+                                  const std::vector<uint64_t> & keys) {
+    std::vector<int> m = ids;
+    size_t v = 0;
+    for (size_t k = 0; k < recs.size(); ++k) {
+        const uint64_t key = keys.size() == recs.size() ? keys[k] : fnv1a(recs[k].data(), recs[k].size() * 4);
+        for (int64_t r = 0; r < counts[k] && v < vis_pos.size(); ++r, ++v) {
+            const uint64_t h = fnv1a(&r, sizeof(r), fnv1a(&key, sizeof(key)));
+            m[(size_t) vis_pos[v]] = -1 - (int) (h & 0x3fffffff);
+        }
+    }
+    return m;
+}
+
 bool parse(int argc, char ** argv, Args & a) {
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
@@ -1194,16 +1220,10 @@ int main(int argc, char ** argv) {
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         std::string line;
-        bool previous_vision = false;
         while (next_line(line)) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
             dense.clear_vision();
-            if (previous_vision) {
-                hist.clear();
-                snap_len = -1;
-                previous_vision = false;
-            }
             // GENI = GEN with an image-embedding file: GENI <max_new> [k=v ..] <embeddings file> <ids csv> (the file
             // holds one strata-vision record per image, in prompt order; the engine lands them on the image_token runs).
             const bool geni = line.rfind("GENI ", 0) == 0;
@@ -1214,6 +1234,7 @@ int main(int argc, char ** argv) {
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file, req_rbr = cfg_route_bias_remote;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
+            std::vector<uint64_t> img_keys;   // GENI img_keys=<hex>,<hex>,...: each picture's key (see match_ids)
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
@@ -1232,6 +1253,11 @@ int main(int argc, char ** argv) {
                 else if (k == "route_bias_remote") req_rbr = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
                 else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+                else if (k == "img_keys") {
+                    std::stringstream ks(v);
+                    std::string h;
+                    while (std::getline(ks, h, ',')) img_keys.push_back(std::strtoull(h.c_str(), nullptr, 16));
+                }
             }
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
@@ -1260,8 +1286,8 @@ int main(int argc, char ** argv) {
             // vision: resolve this request's image rows onto its image_token runs and hand them to the dense layers
             std::vector<float> vis_rows;
             std::vector<int64_t> vis_pos;
-            const bool is_vision = geni;
-            if (is_vision) {
+            std::vector<int> mids;   // the ids the conversation cache matches (an image prompt's: match_ids)
+            if (geni) {
                 if (!dense.vision()) { std::printf("ERR image input requires --vision\n"); std::fflush(stdout); continue; }
                 std::string verr;
                 std::vector<std::vector<float>> recs;
@@ -1272,25 +1298,22 @@ int main(int argc, char ** argv) {
                     std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); continue;
                 }
                 if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
-                // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
-                // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
-                dense.drop_park();
-                park_hist.clear();
-                hist.clear();
-                snap_len = -1;
+                // the cache matches the image rows by picture (match_ids), so an image prompt reuses, snapshots and
+                // parks like a text one: an agent turn after a screenshot no longer re-reads the whole conversation
+                mids = match_ids(ids, recs, counts, vis_pos, img_keys);
                 dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
-                previous_vision = true;
             } else {
+                mids = ids;
                 dense.clear_vision();
             }
             size_t lcp = 0;
-            while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            while (lcp < hist.size() && lcp < mids.size() && hist[lcp] == mids[lcp]) ++lcp;
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
             if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
                 size_t lp = 0;
-                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
+                while (lp < park_hist.size() && lp < mids.size() && park_hist[lp] == mids[lp]) ++lp;
                 lp_show = lp;
                 // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
                 // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
@@ -1356,7 +1379,13 @@ int main(int argc, char ** argv) {
             }
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
-            if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
+            if (reused > 0) {
+                // Engram hashes the 3 positions before each fed one from its by-position history, which neither
+                // snapshot() nor park() saves: a side request (or a parked one's) wrote its own tokens there
+                dense.engram_history(mids.data(), reused);
+                std::printf("RESUME %d\n", reused);
+                std::fflush(stdout);
+            }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
@@ -1622,9 +1651,8 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 continue;
             }
-            hist = ids;
-            // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
-            if (total > reused && !is_vision && dense.snapshot(total)) {
+            hist = mids;
+            if (total > reused && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
@@ -1742,7 +1770,9 @@ int main(int argc, char ** argv) {
                                 int m = 1;
                                 while (m < 64 && q - m >= 0 && hist[(size_t) (q - m)] == sq(n - m)) ++m;
                                 if (m < lk_g + 1) continue;
-                                const int L = std::min({cap, m - lk_g + 1, n - q});
+                                int L = std::min({cap, m - lk_g + 1, n - q});
+                                for (int i = 0; i < L; ++i)   // an image row (match_ids: negative) is no token to draft
+                                    if (sq(q + 1 + i) < 0) { L = i; break; }
                                 if (L < 2) break;   // the latest match copies too little: not worth a pass
                                 if (lk_agree && sq(q + 1) != sp_ids[0]) break;
                                 for (int i = 0; i < L; ++i) dr[i] = sq(q + 1 + i);
