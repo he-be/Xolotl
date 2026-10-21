@@ -48,6 +48,27 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 
 ## Recently added
 
+- **Batch slots** for the DeepSeek-V4.1 engine (#22, NektoDron): `"parallel": N` in a ds41 config runs several
+  requests in one pass over the model, one token each, on the server's existing slot scheduler. How it works, what a
+  slot costs and the limits: [docs/BATCHING.md](docs/BATCHING.md).
+- **Conversation pool** (#19, #20, NektoDron): every conversation is kept at its turn boundary in pinned host RAM
+  (`--conversation-cache-mib`, default 8192) and a request resumes from the longest matching prefix, pictures
+  included. Agents taking turns no longer re-read their prompts (measured on a 5090: three agents at 30-60K tokens,
+  47.5 -> 3.96 s a turn).
+- **Long prompts** past 512K tokens no longer run out of memory or crash on the pass graph (#21, NektoDron): 768K and
+  1M prompts complete.
+- **Exact resumes** (#18, NektoDron): a partial unpark resumes only inside the window ring, and the Engram history is
+  written back on every resume (bit-identical to a fresh prefill). The **image encoder runs on the GPU** with fast
+  SDPA (#17, NektoDron).
+- **Multi-GPU layer split** (AtticusG3 / buster, Niko1221, bsvinay): `--layer-split` across cards with a PCIe hand-off,
+  an optional head device for the output head + DSpark, a VRAM expert cache per GPU and sm_70 (V100) support:
+  [docs/MULTI_GPU.md](docs/MULTI_GPU.md), [BUSTER.md](BUSTER.md). Under a split the engine serves one request at a
+  time with its own split-aware conversation cache; batch slots and the pool are single-card.
+- **Remote expert card** (`--remote-device`, masahiro hibi): a second GPU holds extra experts for the first, with
+  `--route-bias-remote`.
+- Serve: STOP cancels a long prefill (clawdia-saka), `--kv-q8` / `--kv-type` for the compressed KV + indexer keys,
+  a park window floor for agent side calls, cached DSpark verify-width graphs, forced tool calls in V4.1's DSML shape,
+  and the expert-cache fixes from clawdia-saka.
 - **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
   [IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)
   (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). A V4 is in the works.
@@ -92,7 +113,8 @@ What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. 
   Everything measured here is on Linux.
 - **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
   `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
-  had prompt-path crashes).
+  had prompt-path crashes). **Tesla V100 (sm_70):** experimental DS41-on-Buster path only — see [BUSTER.md](BUSTER.md)
+  (`STRATA_EXPERIMENTAL_SM60=ON`, CUDA 12.x, no chunk-MMQ on Volta).
 - **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
   prefill will be slower. Below 16 GB won't work.
 - **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the

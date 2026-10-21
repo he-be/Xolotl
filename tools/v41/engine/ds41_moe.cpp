@@ -1748,6 +1748,10 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     im_->g = geom;
     im_->cfg = cfg;
     im_->blobs = blobs;
+    // hand-port of sakamoto-sann b1e0db08: a NaN or negative auto budget would size the uniform cache nonsensically
+    if (!std::isfinite(cfg.slot_gib) || cfg.slot_gib < 0) {
+        err = "VRAM slot budget must be finite and nonnegative"; return false;
+    }
     if (!ds41_moe_blob_layout(geom, im_->f, err)) return false;
     im_->blob = (int64_t) im_->f.bytes;
     // per-CLASS formats and blob sizes (class = layer unless the geometry is per-expert; all equal to f / blob for a
@@ -1799,6 +1803,10 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     err = "this build has no CUDA tier (compiled without DS4_MOE_CUDA); set cfg.cpu_only";
     return false;
 #else
+    if (cfg.cuda_device >= 0 && cudaSetDevice(cfg.cuda_device) != cudaSuccess) {
+        err = "cudaSetDevice(" + std::to_string(cfg.cuda_device) + ") failed";
+        return false;
+    }
     Gpu& gp = *(im_->gpu = std::unique_ptr<Gpu>(new Gpu()));
     gp.arena.blob = im_->blob;
     gp.arena.n_layers = geom.n_layers;
@@ -2161,14 +2169,18 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     // A per-layer-sized geometry (MiMo) opens its cache now: one slot per ranked expert, each the size of ITS
     // layer's blob, until `slots` experts or `slot_gib` bytes.  The seed below admits in the same order, so slot i
     // is ranked[i]'s and fits it exactly; the cache never evicts, so a slot never meets another layer's blob.
-    if (im_->mixed_sizes && im_->gpu && !im_->gpu->cache && !im_->cfg.no_cache && im_->cfg.slots > 0) {
+    // slots=0 + slot_gib>0 (buster dual-V100): size the VRAM cache from free GiB, not a fake slot count.
+    const bool want_cache = !im_->cfg.no_cache && (im_->cfg.slots > 0 || im_->cfg.slot_gib > 0);
+    if (im_->mixed_sizes && im_->gpu && !im_->gpu->cache && want_cache) {
         const double budget = im_->cfg.slot_gib > 0 ? im_->cfg.slot_gib * 1073741824.0
                                                      : (double) im_->cfg.slots * (double) im_->blob;
+        const int64_t max_slots = im_->cfg.slots > 0 ? im_->cfg.slots
+                                                     : (int64_t) (budget / std::max<int64_t>(1, im_->blob)) + 4096;
         std::vector<int64_t> sizes;
         std::vector<char> seen((size_t) (im_->g.n_layers * im_->g.n_experts), 0);
         double used = 0;
         for (const auto& le : ranked) {
-            if ((int64_t) sizes.size() >= im_->cfg.slots) break;
+            if ((int64_t) sizes.size() >= max_slots) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
             char& sn = seen[(size_t) (le.first * im_->g.n_experts + le.second)];
             if (sn) continue;
@@ -2184,20 +2196,25 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
         }
     }
-    // uniform blobs with defer_cache, or with an auto slot budget: the cache opens now (after the prompt chunks gave
-    // their VRAM back), at most `slots` experts and slot_gib bytes of whole 256-aligned slots (open_sized's padding)
-    int64_t n_uni = im_->cfg.slots;
-    if (im_->cfg.slot_gib > 0)
-        n_uni = std::min<int64_t>(n_uni, (int64_t) (im_->cfg.slot_gib * 1073741824.0 / (double) ((im_->blob + 255) / 256 * 256)));
+    // uniform blobs with defer_cache, or with an auto slot budget (#15), or slots=0 + slot_gib>0 (buster layer split):
+    // the cache opens now (after the prompt chunks gave their VRAM back), at most `slots` experts (none = no cap) and
+    // slot_gib bytes of whole 256-aligned slots (open_sized's padding)
+    int64_t n_uni = im_->cfg.slots > 0 ? im_->cfg.slots : 0;
+    if (im_->cfg.slot_gib > 0) {
+        const int64_t by_gib = (int64_t) (im_->cfg.slot_gib * 1073741824.0 / (double) ((im_->blob + 255) / 256 * 256));
+        n_uni = n_uni > 0 ? std::min<int64_t>(n_uni, by_gib) : by_gib;
+    }
     if (!im_->mixed_sizes && (im_->cfg.defer_cache || im_->cfg.slot_gib > 0) && im_->gpu && !im_->gpu->cache &&
-        !im_->cfg.no_cache && n_uni > 0) {
+        want_cache && n_uni > 0) {
         std::vector<int64_t> sizes((size_t) n_uni, im_->blob);
         im_->gpu->cache.reset(new strata::core::ExpertCache());
         if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
-    const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
+    const int64_t want = im_->cfg.slots > 0
+        ? std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots())
+        : im_->gpu->cache->full_slots();
     // the order the slots fill in.  A per-layer-sized cache (MiMo) keeps the rank: its sizes list above pairs slot
     // i with ranked[i].  Everywhere else a preceding release_cache() supplies the warm set.
     const std::vector<std::pair<int32_t, int32_t>> fill_order = im_->mixed_sizes ? ranked : warm_first(*im_, ranked, want);
@@ -2222,6 +2239,10 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         // pinned arena, file-tier blobs read by 8 threads into pinned buffers (the serial seed read one blob at a time:
         // ~7 s for ~1850 experts after a prompt).  Same slots, same bytes.
         strata::core::ExpertCache& cache = *im_->gpu->cache;
+        if (im_->cfg.cuda_device >= 0 && cudaSetDevice(im_->cfg.cuda_device) != cudaSuccess) {
+            err = "seed: cudaSetDevice failed";
+            return false;
+        }
         std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert
         for (const auto& le : fill_order) {
             if (filled >= want) break;
@@ -2243,8 +2264,15 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         std::vector<std::thread> th;
         const double t0 = now_ms();
         const int nth = (int) std::min<size_t>(8, fjobs.size());
+        const int seed_dev = im_->cfg.cuda_device;
         for (int k = 0; k < nth; ++k)
-            th.emplace_back([&]() {
+            th.emplace_back([&, seed_dev]() {
+                if (seed_dev >= 0 && cudaSetDevice(seed_dev) != cudaSuccess) {
+                    bad = true;
+                    std::lock_guard<std::mutex> lk(mu);
+                    terr = "seed worker: cudaSetDevice failed";
+                    return;
+                }
                 uint8_t* buf = nullptr;
                 if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
                     bad = true;
@@ -4040,9 +4068,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                      im.nact_multi_n.size(), im.nact_multi_act.size());
         for (int i = 0; i < nj; ++i) {
             const cpu::ExpertJobMulti& j = im.jobs[(size_t) i];
-            std::fprintf(stderr, "[dbg_x] job%d blob=%p fmt=%p gu_act=%d gu_type=%d act_bytes=%d nt=%d nact0=%p out0=%p\n",
-                         i, (const void*) j.blob, (const void*) j.fmt, j.fmt ? j.fmt->gu_act : -9, j.fmt ? j.fmt->gu_type : -9,
-                         j.fmt ? j.fmt->act_bytes : -9, j.nt, j.nact[0], (void*) j.out[0]);
+            std::fprintf(stderr, "[dbg_x] job%d blob=%p fmt=%p gu_act=%p gu_type=%d act_bytes=%d nt=%d nact0=%p out0=%p\n",
+                         i, (const void*) j.blob, (const void*) j.fmt, j.fmt ? (const void*) j.fmt->gu_act : nullptr,
+                         j.fmt ? j.fmt->gu_type : -9, j.fmt ? j.fmt->act_bytes : -9, j.nt, (void*) j.nact[0],
+                         (void*) j.out[0]);
         }
     }
     xmark(3);
@@ -5233,8 +5262,21 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
     if (!im_->gpu->cache->segmented()) { err = "the cache is not segmented"; return -1; }
-    if (im_->cfg.vram_lru) { err = "--vram-lru"; return -1; }
+    // The layer-major path does not perform LRU admission. Keep its live slot
+    // mapping, remove the tail, and restore those exact (slot, layer, expert)
+    // records after the batch. Opt-in until real-model byte/quality gates pass.
+    static const bool keep_lru = [] {
+        const char * value = std::getenv("STRATA_SERVE_KEEP_LRU");
+        return value && value[0] == '1';
+    }();
+    if (im_->cfg.vram_lru && (!keep_lru || im_->mixed_sizes)) {
+        err = "--vram-lru (uniform cache needs STRATA_SERVE_KEEP_LRU=1)";
+        return -1;
+    }
     if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
+    if (im_->cfg.cuda_device >= 0 && cudaSetDevice(im_->cfg.cuda_device) != cudaSuccess) {
+        err = "shrink_cache_for: cudaSetDevice failed"; return -1;
+    }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
     size_t fr = 0, tot = 0;
@@ -5247,7 +5289,12 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
               std::to_string(c.bytes() >> 20) + " MiB)";
         return -1;
     }
-    const int64_t keep = c.slots_within(keep_bytes);
+    // shrink rounds its byte argument UP. Choose a segment boundary DOWN so
+    // the batch really receives need_bytes; otherwise pb_cap splits a small
+    // continuation into two full expert sweeps.
+    const int64_t keep_boundary = keep_bytes / c.segment_bytes() * c.segment_bytes();
+    const int64_t keep = c.slots_within(keep_boundary);
+    if (keep <= 0) { err = "the batch needs every cache segment"; return -1; }
     const int64_t NX = im_->g.n_experts;
     std::vector<std::array<int32_t, 3>> gone;
     for (int64_t l = 0; l < im_->g.n_layers; ++l)
@@ -5257,7 +5304,7 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
         }
     std::sort(gone.begin(), gone.end());
     const int64_t n = c.evict_from(keep);
-    if (!c.shrink(c.bytes_of(keep), err)) return -1;
+    if (!c.shrink(keep_boundary, err)) return -1;
     im_->admitted = im_->admitted > n ? im_->admitted - n : 0;
     im_->pf_n = 0;   // staged prefetches may point at evicted experts' slots
     im_->shrunk = std::move(gone);
@@ -5271,10 +5318,35 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
 int64_t Ds41MoeTier::regrow_cache(std::string& err) {
 #if defined(DS4_MOE_CUDA)
     if (im_->shrunk.empty() || !im_->gpu || !im_->gpu->cache) { im_->shrunk.clear(); return 0; }
+    if (im_->cfg.cuda_device >= 0 && cudaSetDevice(im_->cfg.cuda_device) != cudaSuccess) {
+        err = "regrow_cache: cudaSetDevice failed"; im_->shrunk.clear(); return -1;
+    }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     const double t0 = now_ms();
     std::string ge;
-    if (!c.grow(c.full_bytes(), ge)) { err = "regrow_cache: grow: " + ge; im_->shrunk.clear(); return -1; }
+    // After a layer-major batch the driver often cannot map another VMM segment (fragmentation).
+    // Prefer keeping the hot shrunk cache over wiping both GPUs and PCIe-reseeding.
+    if (!c.grow(c.full_bytes(), ge)) {
+        (void) cudaDeviceSynchronize();
+        if (!c.grow(c.full_bytes(), ge)) {
+            size_t fr = 0, tot = 0;
+            (void) cudaMemGetInfo(&fr, &tot);
+            // Keeping a maxed-out shrunk cache leaves no room for the next pass graph (seen: 38 MiB OOM
+            // on CUDA1 with ~275 MiB "free" but fragmented). Only soft-keep when there is real headroom.
+            if (fr >= (size_t) (1.5 * 1073741824.0)) {
+                std::fprintf(stderr, "serve: keep-cache regrow soft-fail (%s) - keeping %lld resident (%.2f GiB free)\n",
+                             ge.c_str(), (long long) im_->admitted, fr / 1073741824.0);
+                im_->shrunk.clear();
+                err.clear();
+                return 0;
+            }
+            std::fprintf(stderr, "serve: keep-cache regrow fail (%s, %.2f GiB free) - re-seed needed\n",
+                         ge.c_str(), fr / 1073741824.0);
+            im_->shrunk.clear();
+            err = "regrow_cache: grow: " + ge;
+            return -1;
+        }
+    }
     std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert (not in the arena: read from the file)
     int64_t added = 0;
     for (const auto& j : im_->shrunk) {
