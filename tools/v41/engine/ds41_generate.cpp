@@ -401,7 +401,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: see tools/v41/engine/ds41_generate.cpp\n");
         return 2;
     }
-    ds41_apply_mmq_cc_policy(a.backend == "cuda", a.chunk_mmq);
+    ds41_apply_mmq_cc_policy(a.backend == "cuda", a.chunk_mmq, a.remote_device);
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file

@@ -13,7 +13,7 @@
 
 namespace strata::v41 {
 
-bool ds41_min_visible_cuda_cc(int& min_cc_encoded, std::string& err) {
+bool ds41_min_visible_cuda_cc(int& min_cc_encoded, std::string& err, int skip) {
     min_cc_encoded = 100;
 #if defined(STRATA_ENABLE_CUDA)
     int nd = 0;
@@ -23,6 +23,7 @@ bool ds41_min_visible_cuda_cc(int& min_cc_encoded, std::string& err) {
     }
     int min_cc = 100;
     for (int d = 0; d < nd; ++d) {
+        if (d == skip) continue;
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) {
             err = "cudaGetDeviceProperties failed";
@@ -35,13 +36,13 @@ bool ds41_min_visible_cuda_cc(int& min_cc_encoded, std::string& err) {
     return true;
 }
 
-void ds41_apply_mmq_cc_policy(bool backend_is_cuda, bool& chunk_mmq) {
+void ds41_apply_mmq_cc_policy(bool backend_is_cuda, bool& chunk_mmq, int remote_device) {
     if (!backend_is_cuda || !chunk_mmq) return;
     const char* force = std::getenv("STRATA_FORCE_CHUNK_MMQ");
     if (force && force[0] == '1') return;
     int min_cc = 100;
     std::string err;
-    if (!ds41_min_visible_cuda_cc(min_cc, err)) {
+    if (!ds41_min_visible_cuda_cc(min_cc, err, remote_device)) {
         chunk_mmq = false;
         return;
     }
