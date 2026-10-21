@@ -6,7 +6,7 @@
     "--experts", "gpu",
     "--engram", "/mnt/engram/FP8-engram",
     "--rank", "/root/models/V41-GSQ/rank.bin",
-    "--ctx", \"262144\",
+    "--ctx", "262144",
     "--stop", "1",
     "--arena-adapt",
     "--kv-fp4",

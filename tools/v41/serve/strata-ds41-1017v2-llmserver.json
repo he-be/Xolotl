@@ -12,7 +12,7 @@
     "--rank",
     "/root/models/V41-XQ-1017-v2/rank-1017-085.bin",
     "--ctx",
-    \"262144\",
+    "262144",
     "--stop",
     "1",
     "--arena-adapt",
