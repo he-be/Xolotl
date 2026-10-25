@@ -153,7 +153,7 @@ def dequantize(raw, ty):
     raise ValueError(f"unsupported GGML type {ty}")
 
 
-def _pread(fd, n, off):
+def _pread_raw(fd, n, off):
     if hasattr(os, "pread"):
         return os.pread(fd, n, off)
     os.lseek(fd, off, os.SEEK_SET)   # Windows has no os.pread; one reader per process, so seek + read is safe
@@ -181,7 +181,7 @@ class SidecarWeights:
         nbytes = ggml_nbytes(shape, ty)
         raw = bytearray()
         while len(raw) < nbytes:
-            b = _pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
+            b = _pread_raw(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
             if not b:
                 raise OSError(f"{name}: short read")
             raw += b
@@ -215,7 +215,7 @@ _ST_TYPES = {"F32": (F32, 4), "F16": (F16, 2), "BF16": (BF16, 2)}
 def _pread(fd, nbytes, off, name):
     raw = bytearray()
     while len(raw) < nbytes:
-        b = os.pread(fd, nbytes - len(raw), off + len(raw))
+        b = _pread_raw(fd, nbytes - len(raw), off + len(raw))
         if not b:
             raise OSError(f"{name}: short read")
         raw += b
