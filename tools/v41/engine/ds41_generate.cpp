@@ -557,7 +557,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "ds41_generate: --head-device requires --stage-devices (the trunk GPUs, not the head)\n");
             return 2;
         } else {
-            for (int d = 0; d < n_dev && (int) split_devs.size() < 2; ++d) split_devs.push_back(d);
+            // one GPU per stage, in order: "24" = 2 stages, "7,14,20,27,34" = 6 (it took the first 2 GPUs whatever the
+            // split, so a 3+ stage split without --stage-devices failed with "need N stage devices", issue #33)
+            const int want = a.layer_split == "auto" ? 2 : 2 + (int) std::count(a.layer_split.begin(), a.layer_split.end(), ',');
+            for (int d = 0; d < n_dev && (int) split_devs.size() < want; ++d) split_devs.push_back(d);
         }
         if (head_cuda_device >= 0 && split_devs.size() < 2) {
             std::fprintf(stderr, "ds41_generate: --head-device needs a multi-stage layer split\n");
@@ -713,7 +716,11 @@ int main(int argc, char ** argv) {
             if (!r) { r = 1; ++got; }
         }
     }
+    // STRATA_DS41_REMOTE_BIAS=1 (with STRATA_DS41_REMOTE): the helper's experts take --route-bias's bonus too, as the
+    // ones in this card's VRAM do (they cost a round trip that runs under the layer's own work, not a PCIe copy)
+    static const bool remote_bias = std::getenv("STRATA_DS41_REMOTE_BIAS") && std::getenv("STRATA_DS41_REMOTE_BIAS")[0] == '1';
     auto resident_now = [&](int64_t l, int64_t e) {
+        if (remote_bias && ds41_tier_for(pipe, (int) l).remote_holds(l, e)) return true;
         if (!proxy_res.empty()) return proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
         return ds41_tier_for(pipe, (int) l).resident(l, e);
     };
@@ -756,6 +763,9 @@ int main(int argc, char ** argv) {
     };
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
     static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
+    // STRATA_DEC_PROF=2: a device sync before each stamp, so each stage holds its own GPU work (slower; diagnostic)
+    static const bool dsync = dprof && std::getenv("STRATA_DEC_PROF")[0] == '2';
+    auto dp_now = [&]() { if (dsync) Ds41MoeTier::device_sync(); return now_ms(); };
     // decode: finish(l) and predict(l+1) as one graph (identical results; STRATA_NO_FUSE_PREDICT=1 = separate graphs)
     static const bool fuse_predict = std::getenv("STRATA_NO_FUSE_PREDICT") == nullptr;
     // STRATA_ADVISE_AHEAD=k (0 = off): at layer l, predict layer l+k's routing from the current state and hint its
@@ -795,14 +805,14 @@ int main(int argc, char ** argv) {
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
-        double ta = dprof ? now_ms() : 0;
+        double ta = dprof ? dp_now() : 0;
         if (dump_main) {
             dm_tok = tok;
             dm_pos = pos;
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
         }
         if (!pipe.dense(0).begin(&tok, 1, pos)) { ferr = pipe.dense(0).last_error(); return false; }
-        if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
+        if (dprof) { const double t = dp_now(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
         bool have_pred = false;
         auto one_layer = [&](int l) -> bool {
@@ -833,10 +843,10 @@ int main(int argc, char ** argv) {
                 }
                 have_pred = false;
             }
-            if (dprof) { const double t1 = now_ms(); dp[1] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[1] += t1 - ta; ta = t1; }
             const float * fn = nullptr;
             if (!d.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = d.last_error(); return false; }
-            if (dprof) { const double t1 = now_ms(); dp[2] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[2] += t1 - ta; ta = t1; }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
@@ -857,7 +867,7 @@ int main(int argc, char ** argv) {
             const bool tok_ok = rdev ? t.run_to_dev(l, ids1.data(), w1.data(), fn, rdev)
                                      : t.run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (!tok_ok) { ferr = "tier.run failed"; return false; }
-            if (dprof) { const double t1 = now_ms(); dp[3] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[3] += t1 - ta; ta = t1; }
             const float * rsum = rdev ? nullptr : routed1.data();
             if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < stage_end) {
                 int t16[16];
@@ -865,16 +875,16 @@ int main(int argc, char ** argv) {
                     int ahead[16 * 8];
                     const int na = std::max(0, std::min({spec_ahead, 8, stage_end - l - 2}));
                     if (!d.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = d.last_error(); return false; }
-                    if (dprof) { const double t1 = now_ms(); dp[4] += t1 - ta; ta = t1; }
+                    if (dprof) { const double t1 = dp_now(); dp[4] += t1 - ta; ta = t1; }
                     if (spec_l1 && l + 1 < stage_end) t.spec_read(l + 1, t16, std::min(spec_top, 16));
                     for (int ai = 0; ai < na; ++ai)
                         if (l + 2 + ai < stage_end) t.spec_read(l + 2 + ai, ahead + ai * 16, std::min(spec_top, 16));
-                    if (dprof) { const double t1 = now_ms(); dp[5] += t1 - ta; ta = t1; }
+                    if (dprof) { const double t1 = dp_now(); dp[5] += t1 - ta; ta = t1; }
                 } else if (!d.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = d.last_error(); return false; }
                 for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                 have_pred = true;
             } else if (!d.finish(l, rsum)) { ferr = d.last_error(); return false; }
-            if (dprof) { const double t1 = now_ms(); dp[4] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[4] += t1 - ta; ta = t1; }
             for (int j = 0; dump_main && j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
                 d.read_state(dm_x, dm_pre);
@@ -964,7 +974,7 @@ int main(int argc, char ** argv) {
         // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
         static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
         double tq = now_ms();
-        auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
+        auto lap = [&](int i) { const double t = dp_now(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
@@ -1636,6 +1646,7 @@ int main(int argc, char ** argv) {
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
+        static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
         std::string line;
         bool previous_vision = false;
         // ---- batch slots (--batch-slots N; the protocol is at the top of this file).  Slot s's conversation is a Conv
@@ -2290,6 +2301,19 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (rewind1 && !unparked && snap_len > 1 && lcp + 1 == (size_t) snap_len && lcp < ids.size() && dense.restore()) {
+                // STRATA_SERVE_REWIND1=1 (opt-in): the request matches the snapshot's prompt except its LAST token -
+                // DeepSeek's template, in thinking mode, re-renders the previous turn's "<think>" generation prompt as
+                // "</think>" once a new user message follows (drop_thinking), so every new user message re-read the whole
+                // conversation.  Restore the snapshot and re-feed from that token: one token back is exact - after
+                // restore() the window ring holds [P - RAW, P) and the ratio-2 compressor state P - 2, P - 1, so the
+                // re-fed token's window and group partner are intact; KV / compressed / indexer rows and Engram's history
+                // are positional and are overwritten.  Two tokens back would not be (see the partial unpark above).
+                hist.resize(lcp);
+                if (live_id.size() > lcp) live_id.resize(lcp);
+                reused = (int) lcp;
+                std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
+                snap_len = -1;
             } else if (pool_on) {
                 // an unrelated request: the conversation it overwrites goes to the pool
                 save_live("unrelated");
@@ -2629,14 +2653,17 @@ int main(int argc, char ** argv) {
             int sp_ids[5] = {0}, sp_tmp[5];
             float sp_conf[5];
 #if defined(DS41_HAVE_DSPARK)
-            if (ok && dsp && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
+            // the cache opens before dsp is tested: open_cache() re-creates DSpark when STRATA_SERVE_DSPARK_EVICT freed it
+            // for this prompt's batch (otherwise the tail is skipped and the turn decodes without drafts)
+            if (ok && sp_tail > 0 && defer_vram && !cache_open) {
                 const double to0 = now_ms();
-                if (defer_vram && !cache_open) {
-                    if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
-                    else cache_open = true;
-                }
+                if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
+                else cache_open = true;
                 ph_open = now_ms() - to0;
-                if (ok) { bias_now = pass_bias; apply_bias(); }
+            }
+            if (ok && dsp && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16); routing as the passes
+                bias_now = pass_bias;
+                apply_bias();
                 const double tt0 = now_ms();
                 std::vector<int> spos;
                 if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
@@ -2846,6 +2873,15 @@ int main(int argc, char ** argv) {
                         while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
                         k = kk;
                     }
+                    // STRATA_DSPARK_CUM=<c> (after upstream Strata f73ae5a6): also stop where the product of the leading
+                    // drafts' confidences - the chance they all survive - falls below c.  Lossless, as the cut above.
+                    static const float cum_s = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : -1.0f;
+                    if (cum_s > 0) {
+                        float pc = 1.0f;
+                        int kk = 0;
+                        while (kk < k && (pc *= 1.0f / (1.0f + std::exp(-sp_conf[kk]))) >= cum_s) ++kk;
+                        k = kk;
+                    }
                     const bool refeed = dirty && ((P + 1) & 1);
                     for (int i = 0; i < k; ++i) dr[i] = sp_ids[i];
                     bool is_lk = false;
@@ -2945,9 +2981,11 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+            if (st.remote > 0) std::fprintf(stderr, ", %lld remote", (long long) st.remote);   // STRATA_DS41_REMOTE
+            std::fprintf(stderr, "\n");
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
@@ -3177,6 +3215,13 @@ int main(int argc, char ** argv) {
             if (conf_tau >= 0) {
                 int kk = 0;
                 while (kk < k && sig(sp_conf[kk]) >= conf_tau) ++kk;
+                k = kk;
+            }
+            static const float cum = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : -1.0f;
+            if (cum > 0) {   // STRATA_DSPARK_CUM=<c>: as the serve loop
+                float pc = 1.0f;
+                int kk = 0;
+                while (kk < k && (pc *= sig(sp_conf[kk])) >= cum) ++kk;
                 k = kk;
             }
             const bool refeed = dirty && ((P + 1) & 1);

@@ -14,6 +14,32 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
 > redirect here; nothing DeepSeek-V4.1 was removed.
 
+> **DeepSeek-V4.1 V4 is up (25 Oct)** on [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)
+> (`v4/`, same size as V3). It's the best build so far: on held-out text it agrees with the full-precision model 86.9%
+> of the time on the top-1 token vs V3's 82.9% (KL 0.306 vs 0.405, through the real engine), and its perplexity is
+> within 0.4% of the full model's. The 1,056 hottest experts are kept exactly as DeepSeek trained them (native FP4). On
+> the full Gauntlet v2 it solved 6/7 (score 6.50), against the DeepSeek API's 5/7 (6.41) and our September build's 4/7
+> (6.20), one run each.
+>
+> **Downloaded V4 already? Grab the new rank file.** V4 first shipped pointing at V3's expert ranking. On 25 Oct I
+> added `v4/rank-1017-v4.bin`, V4's own one: faster, and no worse on quality. It's 123 KB, no need to touch the model:
+> `hf download IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored v4/rank-1017-v4.bin --local-dir V41-XQ-1017`, then
+> point `--rank` at it and pull the latest Xolotl.
+>
+> Heads up though, right now V4 is slower than V3 because those hot experts are bigger, so fewer fit in VRAM. Served
+> with DSpark it's at 17.5 / 19.6 tok/s decode after 8K / 20K-token prompts with the new rank and
+> `--tier-batch-pcie 0.25` (from 15.6 / 16.8 at release; V3 does ~22). I'm working on it in the engine now (the Q2_0
+> CPU rows already went 5-9x) and the numbers go on the HF card as they land. Needs Xolotl from 21 Oct or newer.
+
+> **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
+> [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of DeepSeek-V4.1-Flash-1017
+> (the unedited model, IQ2_XXS and IQ2_XS), thanks heaps to ISTA for putting those out. I've now run IQ2_XS on my 4090
+> and it works: perplexity 3.93 on a 256-token test (our V3 3.60, same flags) and sane chat answers. To use it, set `-m`
+> in the DeepSeek config to their first shard (`...-00001-of-00004.gguf`, the other shards get picked up automatically)
+> and keep `--engram` pointing at our Engram tables (steps on our HF card). The hash tables are identical so ours work
+> with their weights. They're text only in Xolotl (their files don't carry the router's image bias), so leave the
+> `vision` section out of the config for them.
+
 ## What one PC can do
 
 **One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive.** Every number is measured on that machine,
@@ -48,6 +74,9 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 
 ## Recently added
 
+- **GLM-5.3-Flash long conversations no longer crash** (#46, vthomasino): when the graph pool fills and gets rebuilt,
+  every cached graph (predict and rows included) and the CUDA backend's captured graphs are dropped too, so nothing
+  replays against freed memory. Regression tool: `tools/xolotl-glm-manylengths.py`.
 - **Batch slots** for the DeepSeek-V4.1 engine (#22, NektoDron): `"parallel": N` in a ds41 config runs several
   requests in one pass over the model, one token each, on the server's existing slot scheduler. How it works, what a
   slot costs and the limits: [docs/BATCHING.md](docs/BATCHING.md).
@@ -70,8 +99,9 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
   a park window floor for agent side calls, cached DSpark verify-width graphs, forced tool calls in V4.1's DSML shape,
   and the expert-cache fixes from clawdia-saka.
 - **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
-  [IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)
-  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). A V4 is in the works.
+  [IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)
+  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix; **V4** 152 GiB, out 25 Oct, with our XQ
+  refinement on every expert and the hottest experts kept in native FP4: 85.7% top-1 agreement with the full model vs V3's 81.5%).
 - **Native Windows** for the DeepSeek-V4.1 engine (MSVC + CUDA, RTX 50 notes from #14): [docs/WINDOWS.md](docs/WINDOWS.md).
 - **Vision** input for DeepSeek-V4.1 (#8), per-request routing options (#11), a 16-row tier call (#9) and a uniform
   VRAM expert cache under the auto slot budget (#15).
@@ -93,7 +123,7 @@ ninja -C build-xolotl      # strata, strata-dense, glm_generate, ds41_generate, 
 
 Get a model: DeepSeek-V4.1-Flash is **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
 (152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps), or the newer
-**[1017 builds](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)** of the October checkpoint. Then serve it
+**[1017 builds](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (V4 recommended) of the October checkpoint. Then serve it
 (edit the model paths in its config first):
 
 ```bash
