@@ -1121,6 +1121,7 @@ int main(int argc, char ** argv) {
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
     // --serve: STRATA_SERVE_DSPARK=<sidecar> (opt-in) - speculative SAMPLING (spec_accept), same output distribution
     const char * dsp_path = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+    if (dsp_path && !*dsp_path) dsp_path = nullptr;   // an empty value means off (issue #53)
     if (a.serve && dsp_path && (!defer_vram || S < 17)) {
         std::fprintf(stderr, "serve: STRATA_SERVE_DSPARK needs the GPU layer-major prompt path - DSpark off\n");
         dsp_path = nullptr;
@@ -1129,7 +1130,9 @@ int main(int argc, char ** argv) {
     std::unique_ptr<Ds41DSpark> dsp;
 #endif
     auto open_cache = [&]() -> bool {
+        const double toc = now_ms();
         for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).release_pass();
+        if (std::getenv("STRATA_SEED_LOG")) std::fprintf(stderr, "seed: release_pass %.0f ms\n", now_ms() - toc);
 #if defined(DS41_HAVE_DSPARK)
         if (dsp_path && !dsp) {
             Ds41DSparkConfig sc;
@@ -1150,6 +1153,7 @@ int main(int argc, char ** argv) {
                 if (a.serve) {
                     std::fprintf(stderr, "serve: DSpark disabled (%s) — decoding without drafts\n", err.c_str());
                     dsp.reset();
+                    dsp_path = nullptr;   // off for the run: no DSpark tail to feed, no retry each request (#53)
                 } else {
                     err = "DSpark init: " + err;
                     return false;
@@ -1271,6 +1275,9 @@ int main(int argc, char ** argv) {
                 // failed" on a 21K prompt with Whisper's 2.5 GB resident).
                 Ds41Dense & batch_dense = pipe.enabled() ? pipe.dense(0) : dense;
                 for (;;) {
+                    // a DSpark batch seed is read off the final layer-major batch; a 1-token remainder would run on the
+                    // chunk path and capture nothing (prompt = batch + 1: "DSpark batch seed captured nothing", #53)
+                    if (bcap_n > 0 && n - c0 - B == 1 && B > 2) --B;
                     const auto set_cols = [&](int cols) -> bool {
                         if (!pipe.enabled()) {
                             if (cols <= dense.columns()) return true;
@@ -1647,6 +1654,15 @@ int main(int argc, char ** argv) {
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
+        // STRATA_SERVE_REWIND_GAP (tokens; default 16, 0 = off): a request that continues the live conversation but
+        // is a FEW tokens shorter than the live history.  That is what an aborted turn leaves behind: the harness
+        // cancels the in-flight request (ctrl+x / chat:sendNow) and drops its partial assistant turn, so the next
+        // template render differs by a few tokens (DeepSeek's thinking re-render / an empty assistant turn) and
+        // lcp sits just under hist.size() - every exact reuse branch above misses and with pool_on the whole
+        // conversation is parked as "unrelated" and re-read.  Positional caches make a short rewind safe inside the
+        // window ring (RAW - SWA = 16); the forward pass re-feeds from the common prefix and overwrites the stale
+        // tail.  Same rule as the partial unpark, which is why 16 is the ceiling.
+        static const int rewind_gap = std::getenv("STRATA_SERVE_REWIND_GAP") ? std::atoi(std::getenv("STRATA_SERVE_REWIND_GAP")) : 16;
         std::string line;
         bool previous_vision = false;
         // ---- batch slots (--batch-slots N; the protocol is at the top of this file).  Slot s's conversation is a Conv
@@ -2314,6 +2330,20 @@ int main(int argc, char ** argv) {
                 reused = (int) lcp;
                 std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
                 snap_len = -1;
+            } else if (rewind_gap > 0 && !unparked && !hist.empty() && lcp > 0 && lcp < hist.size() &&
+                       lcp < ids.size() && hist.size() - lcp <= (size_t) rewind_gap) {
+                // STRATA_SERVE_REWIND_GAP: the live state continues this prompt but overshoots it by a few tokens
+                // (an aborted turn's dropped assistant turn).  Keep the state and re-feed from the common prefix;
+                // round down to an even position so the ratio-2 compressor's group partner is re-fed too.
+                const size_t gap = hist.size() - lcp;
+                size_t rs = lcp & ~(size_t) 1;
+                if (rs < 1) rs = lcp;
+                hist.resize(rs);
+                if (live_id.size() > rs) live_id.resize(rs);
+                snap_len = -1;   // the end state belonged to the dropped turn
+                reused = (int) rs;
+                std::fprintf(stderr, "serve: rewound the live state to %zu (gap %zu <= %d, STRATA_SERVE_REWIND_GAP)\n",
+                             rs, gap, rewind_gap);
             } else if (pool_on) {
                 // an unrelated request: the conversation it overwrites goes to the pool
                 save_live("unrelated");
@@ -2359,6 +2389,11 @@ int main(int argc, char ** argv) {
                 std::fflush(stdout);
             }
             const int total = (int) ids.size();
+            // STRATA_PROFILE_SERVE_REQ=N (diagnostic): nsys --capture-range=cudaProfilerApi captures exactly request N
+            // (0-based, prompt + decode) of a serve run
+            static const int prof_req = std::getenv("STRATA_PROFILE_SERVE_REQ") ? std::atoi(std::getenv("STRATA_PROFILE_SERVE_REQ")) : -1;
+            static bool prof_req_on = false;
+            if (prof_req >= 0 && n_req == prof_req && !prof_req_on) { Ds41MoeTier::profiler(true); prof_req_on = true; }
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
             // result) runs on the decode side instead - small dense passes, the cache and the decode biases: the
@@ -2387,7 +2422,28 @@ int main(int argc, char ** argv) {
             // (+ 32-token decode) passes / batch: +30 5.0 (1.7) / 6.0 (2.0), +60 6.6 (1.7) / 7.0 (2.0), +90 9.7 (1.0) /
             // 7.7 (1.7), +150 17.6 (1.4) / 9.8 (1.6).  Decode right after a batch starts colder (the VRAM cache is
             // re-seeded), hence the margin above the ~80-token crossover.
-            static const int batch_min = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : 128;
+            // V4 (2026-10-25, Mal's serve config, warm cache, turnprobe.py x3 interleaved): 16 is the default now - the
+            // batch won at every size, decode after it no slower: +32 tokens 7.37 -> 3.94 s, +50 5.62 -> 4.40 s,
+            // +85 9.41 -> 5.27 s (decode after 16.7 / 21.3 / 18.4 -> 17.7 / 21.0 / 20.8 tok/s).
+            // #59: the pass/batch crossover is a property of the BOX, not of the engine.  When the RAM arena holds
+            // every routed expert (file tier 0) a short turn's passes have no disk reads and win up to ~128-152 new
+            // tokens (5090/EPYC report, 2026-10-26); when an arena misses to the file tier the layer-major batch wins
+            // even at 16 (bm_ab.txt, 4090/DDR4, this config: 32 new 3.94 s batch vs 7.37 s passes; 50 4.40 vs 5.62;
+            // 85 5.27 vs 9.41).  So the default follows the arena: 128 when it took everything, else 16.  The env
+            // (STRATA_SERVE_BATCH_MIN, 0 = off) still wins on any box; the cost-based selector the issue proposes is
+            // the next step, this is the safe default until it is measured.
+            static const int bm_env = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : -1;
+            int64_t ft_all = 0;
+            for (int st = 0; st < pipe.n_stages(); ++st) ft_all += pipe.tier(st).file_tier();
+            static const int batch_min = bm_env >= 0 ? bm_env : (ft_all == 0 ? 128 : 16);
+            static bool bm_logged = false;
+            if (!bm_logged) {
+                bm_logged = true;
+                std::fprintf(stderr, "serve: batch path threshold %d new tokens (%s; file-tier experts %lld)\n", batch_min,
+                             bm_env >= 0 ? "STRATA_SERVE_BATCH_MIN"
+                                         : (ft_all == 0 ? "the arena holds every expert" : "a file tier is present"),
+                             (long long) ft_all);
+            }
             bool force_batch = false;
             if (batch_min > 0 && batch_tail && sp_tail > 0 && bcap == 0 && delta >= batch_min && PB > 1 && delta >= 2) {
                 bcap = sp_tail; dh = delta; force_batch = true; by_step = false;
@@ -2449,7 +2505,32 @@ int main(int argc, char ** argv) {
                     // (s6: 8731 columns before DSpark loads, 5434 after), so a long prompt takes fewer expert sweeps.
                     // open_cache() re-creates it for the tail (~1-4 s); the window is re-seeded by the tail as always.
                     static const int dsp_evict = std::getenv("STRATA_SERVE_DSPARK_EVICT") ? std::atoi(std::getenv("STRATA_SERVE_DSPARK_EVICT")) : 0;
-                    if (dsp && dsp_evict > 0 && dh >= dsp_evict) {
+                    // ... but only when the batch would NOT already take the whole turn in one sweep with DSpark loaded
+                    // (the width line below, on the VRAM free now): a 6.4K V4 prompt fits 7165 columns either way, and
+                    // the eviction then only cost the 2.5 s reload.  STRATA_SERVE_DSPARK_EVICT_FIT=0: always evict.
+                    static const bool evict_fit = !(std::getenv("STRATA_SERVE_DSPARK_EVICT_FIT") && std::atoi(std::getenv("STRATA_SERVE_DSPARK_EVICT_FIT")) == 0);
+                    auto one_sweep_now = [&]() -> bool {
+                        if (!evict_fit || mc.cpu_only || PB <= 1) return false;
+                        size_t frb = std::numeric_limits<size_t>::max();
+                        for (int st = 0; st < pipe.n_stages(); ++st) {
+#ifdef STRATA_ENABLE_CUDA
+                            cudaSetDevice(pipe.stages[(size_t) st].cuda_device);
+#endif
+                            size_t fr = 0, tot = 0;
+                            ggml_backend_dev_memory(ggml_backend_get_device(pipe.stages[(size_t) st].backend), &fr, &tot);
+                            frb = std::min(frb, fr);
+                        }
+                        if (frb == std::numeric_limits<size_t>::max()) return false;
+                        const double g_need = (double) dense.span_graph_bytes(total, SB);
+                        const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
+                        const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
+                        const int64_t fit = std::min<int64_t>((int64_t) (room / (0.95 * 1048576.0)), (int64_t) (room_g / (0.78 * 1048576.0)));
+                        const bool one = fit >= dh && PB >= dh;
+                        if (one) std::fprintf(stderr, "serve: DSpark kept for a %d-token batch (%lld columns fit with it loaded)\n",
+                                              dh, (long long) fit);
+                        return one;
+                    };
+                    if (dsp && dsp_evict > 0 && dh >= dsp_evict && !one_sweep_now()) {
                         dsp.reset();
                         std::fprintf(stderr, "serve: DSpark weights freed for a %d-token batch\n", dh);
                     }
@@ -2472,8 +2553,13 @@ int main(int argc, char ** argv) {
             prefill_cancelled = false;
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
+                // STRATA_BIAS_REFRESH (see the decode loop): the biased passes (STRATA_SERVE_PASS_BIAS=1) rebuild the bias too
+                static const int fs_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::atoi(std::getenv("STRATA_BIAS_REFRESH")) : 1;
+                int fs_n = 0;
                 for (int i = 0; i < dh; ) {
                     if (stop_prefill()) return false;
+                    if (fs_refresh > 0 && bias_now && bias_set && fs_n > 0 && fs_n % fs_refresh == 0) apply_bias();
+                    ++fs_n;
                     const int m = std::min(pass_max, dh - i);
                     if (m == 1) {
                         const double ts0 = now_ms();
@@ -2668,6 +2754,9 @@ int main(int argc, char ** argv) {
                 std::vector<int> spos;
                 if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
                     const int c0s = total - bcap_got;
+                    // the capture wrote the final batch's rows at the END of bcap_vh (row bcap_n - cn + t); a final batch
+                    // shorter than the tail fills only the last bcap_got of its bcap rows, so read from there, not from row 0
+                    const size_t vh0 = (size_t) (bcap - bcap_got);   // bcap: this request's tail width (bcap_n is cleared after the feed)
                     for (int i0 = c0s; ok && i0 < total; i0 += 16) {
                         if (stop_prefill()) { ok = false; break; }
                         const int m = std::min(16, total - i0);
@@ -2677,10 +2766,10 @@ int main(int argc, char ** argv) {
                         if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // the batch's last row
                         if (i0 == c0s) cur_seed_n = 0;
                         cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
-                        std::copy_n(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, (size_t) m * 3 * n_embd,
+                        std::copy_n(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, (size_t) m * 3 * n_embd,
                                     cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                         cur_seed_n += m;
-                        if (!dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                        if (!dsp->step(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
                                        last ? sp_ids : sp_tmp, sp_conf)) {
                             ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                         }
@@ -2926,6 +3015,12 @@ int main(int argc, char ** argv) {
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
                     const double tq2 = now_ms();
                     ++rq_pass; rq_acc += acc;
+                    // STRATA_BIAS_REFRESH=N (default 1, 0 = the old per-request snapshot; changes outputs like any residency change): the route bias + file penalty
+                    // are a snapshot of the VRAM set taken when the request's decode starts, while the vram_lru admissions
+                    // and arena rebalance keep changing that set - so a long decode biases toward evicted experts and away
+                    // from admitted ones.  Every N verify passes the bias is rebuilt from the set as it is now.
+                    static const int bias_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::atoi(std::getenv("STRATA_BIAS_REFRESH")) : 1;
+                    if (bias_refresh > 0 && bias_now && bias_set && rq_pass % bias_refresh == 0) apply_bias();
                     if (is_lk) {
                         ++lk_pass; lk_dr += k; lk_acc += acc;
                         if (2 * acc < k) { lk_cool = lk_back; lk_back = std::min(64, lk_back * 2); }
@@ -3022,6 +3117,7 @@ int main(int argc, char ** argv) {
             }
 #endif
             tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
+            if (prof_req_on) { Ds41MoeTier::profiler(false); prof_req_on = false; }
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
@@ -3088,9 +3184,14 @@ int main(int argc, char ** argv) {
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
     // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
     const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
+    // STRATA_PROFILE_PROMPT=1: nsys --capture-range=cudaProfilerApi captures exactly the layer-major prompt (as
+    // STRATA_PROFILE_DECODE does the decode)
+    static const bool prof_prompt = std::getenv("STRATA_PROFILE_PROMPT") != nullptr;
+    if (prof_prompt) Ds41MoeTier::profiler(true);
     const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
+    if (prof_prompt) Ds41MoeTier::profiler(false);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)

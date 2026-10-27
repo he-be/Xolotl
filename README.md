@@ -26,10 +26,17 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > `hf download IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored v4/rank-1017-v4.bin --local-dir V41-XQ-1017`, then
 > point `--rank` at it and pull the latest Xolotl.
 >
-> Heads up though, right now V4 is slower than V3 because those hot experts are bigger, so fewer fit in VRAM. Served
-> with DSpark it's at 17.5 / 19.6 tok/s decode after 8K / 20K-token prompts with the new rank and
-> `--tier-batch-pcie 0.25` (from 15.6 / 16.8 at release; V3 does ~22). I'm working on it in the engine now (the Q2_0
-> CPU rows already went 5-9x) and the numbers go on the HF card as they land. Needs Xolotl from 21 Oct or newer.
+> **V4 speed update (25 Oct, late): it's caught up, and prefill is way up.** On the coding tasks below (21 HumanEval, 10
+> tool calls, 3 agentic loops) V4 solved **21/21, 10/10, 3/3** and decoded at **25.7 tok/s** (29.0 with the newer
+> conversation-seeded VRAM cache). On the **full HumanEval (all 164)** it got **162/164** (98.8%, greedy, 32K thinking budget,
+> decoding at 40 tok/s across the run). Prefill on a fresh prompt is **289-297 tok/s at 8K and 395-409 at 20K** (dense half at
+> Q8_0), up from 192 / 271 this morning, and decode is 21.7-21.8 / 22.6-24.5 tok/s after 8K / 20K prompts. Short follow-up messages got a lot quicker too: a 32-token
+> message now takes ~3.9 s instead of ~7.4. With the default Q6_K re-quant prefill is 298-300 / 385-388 and decode
+> 23.5-23.9 / 25.3-25.6. It's all engine work, none of it costs quality: the route bias refreshing as you go, zero-copy NVMe reads,
+> read-ahead per layer, MMQ for the experts staged from RAM, DSpark staying loaded when the prompt fits anyway, and short
+> turns going through the prompt batch, and the VRAM cache reloading with this conversation's experts after each
+> prompt. Pull the latest Xolotl (25 Oct or newer) and use
+> `--rank v4/rank-1017-v4.bin --tier-batch-pcie 0.25`.
 
 > **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
 > [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of DeepSeek-V4.1-Flash-1017
@@ -49,6 +56,7 @@ loops), greedy, thinking on with a 32K-token thinking budget.
 | Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | **289-409 tok/s** | **25.7 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
 | **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
 | **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
 | **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
@@ -60,7 +68,8 @@ on a 24 GB card with the speculative-decode draft loaded).
 DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts (the default since 2026-10-17):
 187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
 (`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
-30K / 44K prompts. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
+30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
+prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
 [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).</sub>
 
 **What that means in practice:**
@@ -183,6 +192,12 @@ Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 (its engin
 [perronemirko](https://github.com/perronemirko/Strata)'s. The DeepSeek-V4.1 and GLM-5.3-Flash engines, the GSQ quant
 and the unification are Indras Mirror's. Model weights: DeepSeek, Zhipu AI, Qwen, with quants and fine-tunes by
 peasantsmith, ukisai, d0xin and gcsa-abliterix.
+
+Contributors, with thanks: [NektoDron](https://github.com/NektoDron) (MMQ id slack, forced tool calls, the arena pipe
+and indexer WMMA opt-ins, #48-#52; checked #55; the Q3_K + GPTQ Q2_0 lite calibration and allocation tooling, #58),
+[paul123637-lab](https://github.com/paul123637-lab) (the DSpark seed fixes, #54 and #56; RTX 5080 and 5060 Ti helper
+numbers), [kelheor](https://github.com/kelheor) (the vision `pread` fix, #51), [exye137](https://github.com/exye137)
+(the thread-local CUDA stream leak, #57) and [penink-WH](https://github.com/penink-WH) (AC922 rig).
 
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.

@@ -1348,7 +1348,7 @@ if(STRATA_NATIVE_EXPERTS)
     include(FetchContent)
     FetchContent_Declare(strata_llamacpp
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
+      GIT_TAG 6050b467c07a95c7b87debd4ddac2f8ba8d9b807
       GIT_SHALLOW FALSE)
     FetchContent_GetProperties(strata_llamacpp)
     if(NOT strata_llamacpp_POPULATED)
@@ -1365,6 +1365,10 @@ if(STRATA_NATIVE_EXPERTS)
       message(STATUS "xolotl: applied tools/xolotl/ggml/xolotl-ggml.patch to the fetched llama.cpp")
     endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+    # the engines' cmake (v41_engine / ds4_dense / glm) take ggml's private headers from STRATA_GGML_DIR, else from
+    # third_party/llama.cpp - a fresh clone has neither, so point them at the fetched tree (a normal variable: the
+    # cached option stays empty)
+    set(STRATA_GGML_DIR ${strata_llamacpp_SOURCE_DIR})
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
