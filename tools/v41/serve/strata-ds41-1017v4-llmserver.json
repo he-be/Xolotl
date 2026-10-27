@@ -47,7 +47,8 @@
     "CUDA_VISIBLE_DEVICES": "1,0",
     "STRATA_SERVE_DSPARK": "/root/models/V41-XQ-1017-v3/V41-MTP-Vision-1017.Q2_K.gguf",
     "STRATA_DENSE_REQUANT_CACHE": "/root/models/V41-XQ-1017-v4/cache",
-    "DS41_MEMORY_MAX": "120G"
+    "DS41_MEMORY_MAX": "120G",
+    "STRATA_SERVE_BATCH_MIN": "128"
   },
   "allowed_hosts": "*",
   "sampling": {

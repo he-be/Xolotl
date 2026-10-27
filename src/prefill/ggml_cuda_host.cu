@@ -143,5 +143,10 @@ struct CachingPool : ggml_cuda_pool {
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int, int) {
     return std::unique_ptr<ggml_cuda_pool>(new CachingPool());
 }
+// llama.cpp 6050b467 added this overload and pool() inlines a call to it, so targets that link this shim instead of
+// ggml-cuda (test_ds41_moe_gpu) failed to link
+std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(ggml_backend_cuda_context &, int, int) {
+    return std::unique_ptr<ggml_cuda_pool>(new CachingPool());
+}
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {}
