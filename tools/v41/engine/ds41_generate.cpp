@@ -740,6 +740,13 @@ int main(int argc, char ** argv) {
                                : (bias_now && a.route_bias_remote != 0.0f && tier.in_remote(l, e)) ? a.route_bias_remote
                                : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) &&
                                   !ds41_tier_for(pipe, (int) l).in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+            // STRATA_RB_EXACT_FROM=L: layers >= L route exactly (no route bias; the prune part stays).  DSpark reads the
+            // outputs of layers 36-38, but exact late layers do not raise its acceptance (llm-server code bench 10/29:
+            // L 36 / 30 / 0 = 4.12-4.14 tok/pass as with the bias, tok/s -7 / -12 / -33%)
+            static const int rb_exact_from = std::getenv("STRATA_RB_EXACT_FROM") ? std::atoi(std::getenv("STRATA_RB_EXACT_FROM")) : -1;
+            if (rb_exact_from >= 0 && l >= rb_exact_from)
+                for (int64_t e = 0; e < TG.n_experts; ++e)
+                    if (pruned.empty() || !pruned[(size_t) (l * TG.n_experts + e)]) rb[(size_t) e] = 0.0f;
             for (int st = 0; st < pipe.n_stages(); ++st) {
                 if (l < pipe.layer_lo(st) || l >= pipe.layer_hi(st)) continue;
                 pipe.dense(st).set_route_bias((int) l, rb.data());
@@ -3156,6 +3163,9 @@ int main(int argc, char ** argv) {
 #endif
             }
         }
+#if defined(DS41_HAVE_DSPARK)
+        if (std::getenv("STRATA_DSPARK_COUNT")) dsp.reset();   // its destructor writes the counts; _Exit below skips it
+#endif
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
         // on it until the client closes the pipe - leave without the static destructors

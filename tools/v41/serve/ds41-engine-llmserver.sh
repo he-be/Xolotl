@@ -33,6 +33,6 @@ GDB=()
     -ex "thread apply all bt 12" --args)
 # DS41_NSYS=<report path>: the engine under nsys (CUDA API + kernels + copies, graphs as one range)
 [ -n "${DS41_NSYS:-}" ] && GDB=(/usr/local/bin/nsys profile -t cuda,nvtx --sample=none --cpuctxsw=none
-    --cuda-memory-usage=false --cuda-graph-trace=graph --kill=none -f true -o "$DS41_NSYS")
+    --cuda-memory-usage=false --cuda-graph-trace=${DS41_NSYS_GRAPH:-graph} --kill=none -f true -o "$DS41_NSYS")
 exec systemd-run --scope -q --unit="ds41-serve-$$" -p MemoryMax="${DS41_MEMORY_MAX:-84G}" -p MemorySwapMax=0 \
     "${GDB[@]}" "$BUILD_DIR/ds41_generate" "$@"

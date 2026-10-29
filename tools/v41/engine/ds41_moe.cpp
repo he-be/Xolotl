@@ -959,10 +959,15 @@ bool remote_build(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>
     const std::vector<char> head = vram_head(im, ranked);
     r.off.assign((size_t) (NL * NX), -1);
     std::vector<std::array<int64_t, 3>> jobs;   // layer, expert, offset
+    // STRATA_DS41_REMOTE_SKIP=N: leave the first N of that ranking to the host (arena / the main card's cache) and
+    // start the card's share after them - the hottest experts then stay with the faster main card (default 0)
+    const int64_t skip = std::getenv("STRATA_DS41_REMOTE_SKIP") ? std::atoll(std::getenv("STRATA_DS41_REMOTE_SKIP")) : 0;
+    int64_t seen = 0;
     for (const auto& le : ranked) {
         if (le.first < 0 || le.first >= NL || le.second < 0 || le.second >= NX || !im.g.routed(le.first)) continue;
         const size_t at = (size_t) (le.first * NX + le.second);
         if (head[at] || r.off[at] >= 0) continue;
+        if (seen++ < skip) continue;
         const size_t b = ((size_t) im.bl[(size_t) im.g.cls(le.first, le.second)] + 255) & ~(size_t) 255;
         if (r.used + b > r.cap) continue;   // a smaller class may still fit
         r.off[at] = (int64_t) r.used;
