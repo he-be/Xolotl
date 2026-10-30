@@ -10,7 +10,7 @@
     "--engram",
     "/mnt/engram/FP8-engram-1017",
     "--rank",
-    "/root/models/V41-XQ-1017-v4/rank-1017-v4.bin",
+    "/root/models/V41-XQ-1017-v4/rank-1017-v4-code.bin",
     "--ctx",
     "262144",
     "--stop",
