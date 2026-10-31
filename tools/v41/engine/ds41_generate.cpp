@@ -14,6 +14,8 @@
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
 //        GENI <max_new> [k=v ..] <image embeddings file> <ids csv>   (GEN with vision; see --image-token)
+//        CHECKPOINT_PAUSE -> CHECKPOINT_PAUSED (idle CUDA graph clock, before driver checkpoint)
+//        CHECKPOINT_RESUME -> CHECKPOINT_RESUMED paused_us=N graph_execs=N (after restore/unlock)
 //   out: READY <ctx> stop, RESUME <reused>, PP <read> <total> <ms> <tok/s>, T <id>, DONE ..., ERR <text>
 // --batch-slots N (or Strata's --batch N, which serve/server.py passes for "parallel": N): N conversations decode
 // together, one row each per batch window (Strata's slot protocol, serve/server.py generate_batched; INFO batch_slots=N):
@@ -1649,7 +1651,25 @@ int main(int argc, char ** argv) {
             resid_all += pipe.tier(st).resident();
             arena_all += pipe.tier(st).arena_experts();
         }
+#ifdef STRATA_ENABLE_CUDA
+        // An explicitly checkpointed idle interval must not age the CUDA graph
+        // eviction clock. Preserve executables and all model/KV/expert-cache state.
+        // DSpark shares a dense backend; each backend's clock is adjusted once.
+        std::vector<ggml_backend_t> checkpoint_backends;
+        auto checkpoint_backend = [&](ggml_backend_t backend) {
+            if (ggml_backend_is_cuda(backend) &&
+                std::find(checkpoint_backends.begin(), checkpoint_backends.end(), backend) == checkpoint_backends.end())
+                checkpoint_backends.push_back(backend);
+        };
+        for (const auto & stage : pipe.stages) checkpoint_backend(stage.backend);
+        if (pipe.head) checkpoint_backend(pipe.head->backend);
+        bool checkpoint_clock_paused = false;
+        int64_t checkpoint_pause_started_us = 0;
+#endif
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld", ctxv, (long long) resid_all, (long long) arena_all);
+#ifdef STRATA_ENABLE_CUDA
+        if (!checkpoint_backends.empty()) std::printf(" checkpoint_clock=1");
+#endif
         if (pool_on) std::printf(" conversation_cache_mib=%d conversation_cache_slots=%d", a.conv_mib, a.conv_slots);
         if (NS > 0) std::printf(" batch_slots=%d slot_cache=1", NS);   // serve/server.py: the slot protocol (generate_batched)
         std::printf("\n");
@@ -2026,6 +2046,52 @@ int main(int argc, char ** argv) {
             }
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
+            if (line == "CHECKPOINT_PAUSE" || line == "CHECKPOINT_RESUME") {
+                // The server drains requests before PAUSE and sends RESUME after
+                // driver restore/unlock (also after a recoverable checkpoint failure).
+                // Neither command is a prompt: leave vision and every slot unchanged.
+                if (any_active()) {
+                    std::printf("ERR %s: batch slots are active\n", line.c_str());
+                } else {
+#ifdef STRATA_ENABLE_CUDA
+                    if (checkpoint_backends.empty()) {
+                        std::printf("ERR %s: no CUDA backend\n", line.c_str());
+                    } else if (line == "CHECKPOINT_PAUSE") {
+                        if (!checkpoint_clock_paused) {
+                            checkpoint_pause_started_us = ggml_time_us();
+                            checkpoint_clock_paused = true;
+                        }
+                        std::printf("CHECKPOINT_PAUSED\n");
+                    } else {
+                        int64_t paused_us = 0, graph_execs = 0;
+                        if (checkpoint_clock_paused) {
+                            paused_us = std::max<int64_t>(0, ggml_time_us() - checkpoint_pause_started_us);
+                            for (ggml_backend_t backend : checkpoint_backends)
+                                graph_execs += ggml_backend_cuda_graph_cache_shift_age(backend, paused_us);
+                            checkpoint_clock_paused = false;
+                            checkpoint_pause_started_us = 0;
+                        }
+                        std::fprintf(stderr, "serve: checkpoint clock resumed: paused_us=%lld graph_execs=%lld; "
+                                             "model, KV and expert-cache state retained\n",
+                                     (long long) paused_us, (long long) graph_execs);
+                        std::printf("CHECKPOINT_RESUMED paused_us=%lld graph_execs=%lld\n",
+                                    (long long) paused_us, (long long) graph_execs);
+                    }
+#else
+                    std::printf("ERR %s: CUDA checkpoint is unsupported in this build\n", line.c_str());
+#endif
+                }
+                std::fflush(stdout);
+                continue;
+            }
+#ifdef STRATA_ENABLE_CUDA
+            if (checkpoint_clock_paused) {
+                // No new graph may be created or used during the measured pause.
+                std::printf("ERR checkpoint clock is paused; CHECKPOINT_RESUME is required\n");
+                std::fflush(stdout);
+                continue;
+            }
+#endif
             // the slot lines: BSTOP ends a slot at its next window; BYIELD for a read that has ended meanwhile; BGEN
             // <slot> <max_new> .. reads the prompt into <slot> as a GEN 1, then the slot decodes on (BADM)
             int admit = -1;
@@ -2225,14 +2291,25 @@ int main(int argc, char ** argv) {
                 if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) live = (int) lcp;
                 else if (cont_last) live = (int) lcp - 1;
                 else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len <= ids.size()) live = snap_len;
-                const ConvMatch m = pool.best_prefix(ids.data(), rid.data(), rid.size(), (int64_t) ids.size());
-                int64_t pr = m.resume();
-                const bool exact = m.pos > 0 && m.pos == (int64_t) ids.size();
-                if (exact && !m.has_logits) pr = 0;                      // nothing to sample the first token from
-                if (!exact && pr >= (int64_t) ids.size()) pr = 0;        // a partial resume must feed something
-                lp_show = (size_t) m.lcp;
+                ConvMatch m;
+                int64_t pr = 0;
+                bool exact = false;
+                auto match = [&]() {
+                    m = pool.best_prefix(ids.data(), rid.data(), rid.size(), (int64_t) ids.size());
+                    pr = m.resume();
+                    exact = m.pos > 0 && m.pos == (int64_t) ids.size();
+                    if (exact && !m.has_logits) pr = 0;                      // nothing to sample the first token from
+                    if (!exact && pr >= (int64_t) ids.size()) pr = 0;        // a partial resume must feed something
+                    lp_show = (size_t) m.lcp;
+                };
+                match();
                 if (pr > live) {
+                    // the live conversation's save may continue (and supersede) the very record matched - a turn of
+                    // the same chat, with its boundaries carried over - so match again against what the pool holds now
                     save_live("switch");
+                    match();
+                }
+                if (pr > live) {
                     ConvRestore rs;
                     std::string perr;
                     const double t0 = now_ms();
@@ -2314,6 +2391,14 @@ int main(int argc, char ** argv) {
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
             if (reuse_override >= 0) { reused = reuse_override; regen = pool_regen; }   // a partial unpark / a pool record
             else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) {
+                // STRATA_SERVE_TURN_SAVE (default on): the turn boundary this request moves past goes to the pool as
+                // it would on a switch.  The live snapshot is the only state a resume below the last boundary could
+                // come from (the window ring and the ratio-2 state rewind at most kConvPartialMax), so a client that
+                // later edits the history (opencode's tool-output pruning) found no boundary <= the common prefix and
+                // re-read the whole prompt: "reuse lcp=10484 ... snap=-1 -> reused=0".  Records continue each other,
+                // so this is incremental: the new chunks and one boundary's regions (the fence below orders it)
+                static const bool turn_save = !(std::getenv("STRATA_SERVE_TURN_SAVE") && std::getenv("STRATA_SERVE_TURN_SAVE")[0] == '0');
+                if (turn_save && pool_on) save_live("turn");
                 reused = (int) lcp;
                 if (live_dirty && (reused & 1)) {   // re-feed the last accepted token (its group's ratio-2 state)
                     --reused;
@@ -3096,6 +3181,13 @@ int main(int argc, char ** argv) {
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
             if (st.remote > 0) std::fprintf(stderr, ", %lld remote", (long long) st.remote);   // STRATA_DS41_REMOTE
+            // INSTRUMENT (no behaviour change): the file tier's real cost per request, and whether it is re-reading
+            // experts the vram_lru rule would admit.  `blocked` is the host's pure wait in the read pool (the ports
+            // 'fwait'); `block` also spans the HIT launches, which overlap the reads.
+            if (st.fileg > 0)
+                std::fprintf(stderr, "; file tier %lld staged, %lld recurring (%.0f%%), blocked %.1f ms of %.1f ms",
+                             (long long) st.fileg, (long long) st.fileg_recurring,
+                             100.0 * (double) st.fileg_recurring / (double) st.fileg, st.fwait_ms, st.file_ms);
             std::fprintf(stderr, "\n");
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
@@ -3127,9 +3219,11 @@ int main(int argc, char ** argv) {
             if (rq_pass > 0) {
                 const double n = (double) rq_pass;
                 std::fprintf(stderr, "serve: pass split %.2f ms/pass = verify %.2f (dense %.2f, tier %.2f, taps %.2f, logits %.2f) "
-                             "+ sample %.2f + draft %.2f + other %.2f\n", dec_ms / n, sq_ms[0] / n, (pv_ms[0] - pv0[0]) / n,
+                             "+ sample %.2f + draft %.2f + other %.2f; file blocked %.2f ms/pass (%.1f%% of the pass)\n",
+                             dec_ms / n, sq_ms[0] / n, (pv_ms[0] - pv0[0]) / n,
                              (pv_ms[1] - pv0[1]) / n, (pv_ms[2] - pv0[2]) / n, (pv_ms[3] - pv0[3]) / n, sq_ms[1] / n,
-                             sq_ms[2] / n, (dec_ms - sq_ms[0] - sq_ms[1] - sq_ms[2]) / n);
+                             sq_ms[2] / n, (dec_ms - sq_ms[0] - sq_ms[1] - sq_ms[2]) / n,
+                             st.fwait_ms / n, 100.0 * (st.fwait_ms / n) / std::max(1e-9, dec_ms / n));
             }
 #endif
             tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader

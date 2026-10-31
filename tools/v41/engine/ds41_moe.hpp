@@ -305,7 +305,7 @@ struct Ds41MoeConfig {
     /// Uniform blobs (DS4): open the VRAM cache at the seed instead of at init, so prompt chunks (run_chunk) can use
     /// that VRAM first (build_arena_from_routes -> chunks -> release_chunk -> seed_from_routes).
     bool defer_cache = false;
-    double mem_floor_gib = 3.0;   ///< refuse an arena that would leave less than this much MemAvailable
+    double mem_floor_gib = 3.0;   ///< refuse an arena that would leave less than this much MemAvailable (+ ARC: STRATA_ZFS_ARC)
     double max_arena_gib = 60.0;  ///< hard ceiling on the arena, whatever `arena_gib` says
     /// VRAM budget for the expert cache in GiB, for geometries whose blob size varies per layer (MiMo): the seed
     /// takes the ranked profile's head until `slots` experts OR this many bytes, sizing each slot to its expert.
@@ -379,6 +379,9 @@ struct Ds41MoeStats {
     int64_t file_tier = 0;          ///< reads served by the blob source instead of the arena
     double gap_ms = 0, hit_ms = 0, pcie_ms = 0, cpu_ms = 0, wall_ms = 0;
     double file_ms = 0;             ///< time spent reading file-tier blobs (inside run / prefetch)
+    double fwait_ms = 0;            ///< gpu_run_n_ex: host time BLOCKED in the file-tier read pool (the ports 'fwait')
+    int64_t fileg = 0;              ///< gpu_run_n_ex: file-tier (NVMe) experts staged onto the card this request
+    int64_t fileg_recurring = 0;    ///< ...of which the vram_lru admission rule would admit (so FILEG re-reads them)
     int64_t arena_swaps = 0;        ///< arena_adapt: file-tier experts moved into the arena
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)

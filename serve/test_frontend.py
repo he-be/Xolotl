@@ -3,7 +3,7 @@ import copy
 from pathlib import Path
 import unittest
 
-from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
+from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages, require_messages
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
@@ -340,3 +340,29 @@ class FencedJsonCallInWrapper(unittest.TestCase):
         other = [{"name": "other", "parameters": {}}]
         calls, text = self.run_parser(raw, len(raw), False, tools=other)
         self.assertEqual((calls, text), ([], raw))
+
+
+class PreserveThinking(unittest.TestCase):
+    """Qwen3.6's preserve_thinking, from chat_template_kwargs (as vLLM passes it) or the config's default: the history's
+    replies keep their (empty) thinking blocks, so the next turn's prompt extends the tokens the engine holds."""
+
+    def test_passed_to_the_template(self):
+        req = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"},
+                            {"role": "user", "content": "again"}],
+               "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": True}}
+        messages, tools, kwargs = openai_to_messages(req)
+        self.assertIs(kwargs.get("preserve_thinking"), True)
+        tok = ByteTokenizer()
+        template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+        svc = Service(MockEngine(tok, "ok"), tok, template)
+        self.assertNotIn("preserve_thinking", openai_to_messages({**req, "chat_template_kwargs": {}})[2])
+        svc.preserve_thinking = True                       # the config's default
+        self.assertEqual(svc.render_prompt(messages, tools, {k: v for k, v in kwargs.items() if k != "preserve_thinking"}),
+                         svc.render_prompt(messages, tools, kwargs))
+class EmptyConversation(unittest.TestCase):
+    def test_no_message_is_an_error_a_message_is_not(self):
+        with self.assertRaises(ValueError):
+            require_messages(openai_to_messages({"messages": []})[0])
+        with self.assertRaises(ValueError):
+            require_messages(openai_to_messages({})[0])
+        require_messages(openai_to_messages({"messages": [{"role": "user", "content": "hi"}]})[0])

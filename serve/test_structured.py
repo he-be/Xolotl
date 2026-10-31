@@ -53,7 +53,9 @@ class Structured(unittest.TestCase):
             return response.status, data if "event-stream" in response.headers.get("Content-Type", "") else json.loads(data)
 
     def setUp(self):
-        self.tok = ByteTokenizer()
+        class GrammarTokenizer(ByteTokenizer):
+            SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+        self.tok = GrammarTokenizer()
         self.engine = MockEngine(self.tok, json.dumps(STORY), max_context=16384)
         self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
@@ -111,6 +113,41 @@ class Structured(unittest.TestCase):
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt, max_tokens=5)[0], 502)
         # Plain text callers retain normal streaming, without a JSON validation gate.
         self.assertEqual(self.chat("Prose.", response_format={"type": "text"})[0], 200)
+
+    def test_latex_escape_repair_is_opt_in_and_only_after_a_strict_failure(self):
+        # #2893: \alpha is not a JSON escape. Off by default: still a 502. On: one retry after the strict parse failed.
+        bad = r'{"answer":"the angle \alpha and \gamma_0"}'
+        self.assertEqual(self.chat(bad, response_format={"type": "json_object"})[0], 502)
+        self.assertEqual(self.chat(bad, response_format={"type": "json_object", "repair_latex_escapes": False})[0], 502)
+        code, reply = self.chat(bad, response_format={"type": "json_object", "repair_latex_escapes": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]),
+                         {"answer": "the angle \\alpha and \\gamma_0"})
+        # streaming asks for the same check before any content leaves
+        _, raw = self.chat(bad, stream=True, response_format={"type": "json_object", "repair_latex_escapes": True})
+        self.assertIn(r"\\alpha", raw)
+        # the repair does not hide what is wrong with the answer itself
+        fmt = {"type": "json_object", "repair_latex_escapes": True}
+        for script in ('[]', r'{"x":NaN}', r'{"a":"\alpha","a":2}', 'no json at all', r'{"x":"\alpha'):
+            self.assertEqual(self.chat(script, response_format=fmt)[0], 502, script)
+        self.assertEqual(self.chat(r'{"answer":"\alpha"}', response_format=fmt, max_tokens=5)[0], 502)
+
+    def test_latex_escape_repair_helper(self):
+        fix = structured.repair_latex_escapes
+        self.assertEqual(fix(r'{"a":"\alpha \gamma_0"}'), r'{"a":"\\alpha \\gamma_0"}')
+        for same in (r'{"a":"x\ny\t\"q\" \\ \/ \u00e9"}', '{"a": 1}', ''):
+            self.assertEqual(fix(same), same)
+        self.assertEqual(fix(r'{"a":"\u12"}'), r'{"a":"\\u12"}')        # \u without four hex digits
+        self.assertEqual(fix(r'{"a":"\\alpha"}'), r'{"a":"\\alpha"}')    # an escaped backslash is skipped as a pair
+        self.assertEqual(fix("\\"), "\\\\")                              # a lone trailing backslash
+        # \b is a valid escape: untouched, so it parses (as a backspace), as it does without the option
+        self.assertEqual(json.loads(fix(r'{"a":"\beta \alpha"}'))["a"], "\beta \\alpha")
+
+    def test_the_repair_option_reaches_the_responses_format(self):
+        from serve.responses import text_format
+        self.assertEqual(text_format({"text": {"format": {"type": "json_object", "repair_latex_escapes": True}}}),
+                         {"type": "json_object", "repair_latex_escapes": True})
+        self.assertEqual(text_format({"text": {"format": {"type": "json_object"}}}), {"type": "json_object"})
 
     def test_rejected_schema_does_not_load_the_engine_or_retry(self):
         with mock.patch.object(self.svc, "load") as load:
@@ -200,6 +237,122 @@ class Structured(unittest.TestCase):
                     self.assertEqual(code, 400)
                     self.assertIn("only JSON objects", reply["error"]["message"])
             load.assert_not_called()
+
+    def native_capture(self):
+        from serve.server import StrataEngine
+        self.engine.info = {"engine": "q36", "grammar": 1}
+        original = self.engine.generate
+        seen = []
+
+        def generate(ids, max_new, sampling, cancel, embeddings=None):
+            keys = StrataEngine.sampling_keys(sampling)
+            path = sampling.get("_grammar_path")
+            seen.append((keys, Path(path).read_text() if path else None))
+            yield from original(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.generate = generate
+        return seen
+
+    def test_native_all_structured_aliases_reach_protocol(self):
+        seen = self.native_capture()
+        raw = 'root ::= "yes" | "no"'
+        schema = object_schema({"answer": {"type": "integer"}})
+        fields = [
+            {"response_format": {"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}},
+            {"response_format": {"type": "json_object"}},
+            {"structured_outputs": {"json": schema}},
+            {"structured_outputs": {"json_object": True}},
+            {"guided_json": schema}, {"guided_json": json.dumps(schema)}, {"json_schema": schema},
+            {"structured_outputs": {"grammar": raw}}, {"guided_grammar": raw}, {"grammar": raw},
+            {"structured_outputs": {"choice": ["yes", "no"]}}, {"guided_choice": ["yes", "no"]},
+        ]
+        self.engine.scripts = self.engine.scripts[:1]
+        self.engine.script = self.tok.encode('{"answer":4}', parse_special=True) + self.tok.encode("<|im_end|>", parse_special=True)
+        for field in fields:
+            with self.subTest(field=field):
+                code, reply = self.chat(response_format=None, **{k: v for k, v in field.items() if k != "response_format"}) if "response_format" not in field else self.chat(**field)
+                self.assertEqual(code, 200, reply)
+                keys, grammar = seen[-1]
+                self.assertIn(" grammar=", keys)
+                self.assertNotIn("grammar_after=", keys)
+                self.assertIn("root ::=", grammar)
+
+    def test_native_thinking_trigger_and_compact_schema(self):
+        seen = self.native_capture()
+        self.svc.structured_compact = True
+        self.engine.script = self.tok.encode('Check.</think>{"answer":4}', parse_special=True) + self.tok.encode("<|im_end|>", parse_special=True)
+        code, reply = self.chat(response_format={"type": "json_object"}, reasoning_effort="low")
+        self.assertEqual(code, 200, reply)
+        self.assertIn('space ::= ""', seen[-1][1])
+        trigger = self.tok.encode("</think>", parse_special=True)[0]
+        self.assertIn(f" grammar_after={trigger}", seen[-1][0])
+
+    def test_native_incompatible_and_malformed_constraints_are_400(self):
+        self.native_capture()
+        bad = [
+            {"grammar": ""}, {"guided_choice": []}, {"guided_choice": [1]},
+            {"structured_outputs": []}, {"structured_outputs": {}},
+            {"structured_outputs": {"json_object": False}},
+            {"structured_outputs": {"unknown": True}},
+            {"structured_outputs": {"disable_any_whitespace": True}},
+            {"structured_outputs": {"json_object": True, "disable_any_whitespace": 1}},
+            {"stream": True, "stream_options": []},
+            {"stream": True, "stream_options": {"include_usage": "true"}},
+            {"grammar": 'root ::= "yes"', "structured_outputs": {"grammar": 'root ::= "no"'}},
+            {"structured_outputs": {"regex": "^(yes|no)$"}}, {"guided_regex": "yes"},
+            {"grammar": 'root ::= "yes"', "guided_choice": ["yes"]},
+            {"grammar": 'root ::= "yes"', "strata_mcp": True},
+            {"grammar": 'root ::= "yes"', "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]},
+        ]
+        for fields in bad:
+            with self.subTest(fields=fields):
+                self.assertEqual(self.chat(response_format=None, **fields)[0], 400)
+        self.assertEqual(self.chat(grammar='root ::= "yes"')[0], 400)  # response_format conflict
+
+    def test_duplicate_grammar_and_usage_last(self):
+        seen = self.native_capture()
+        raw = 'root ::= "speak=false" | "speak=true;what=" [^;\\x0A]*'
+        self.engine.script = self.tok.encode("speak=false<|im_end|>", parse_special=True)
+        for grammar in (False, True):
+            fields = {"grammar": raw, "structured_outputs": {"grammar": raw, "disable_any_whitespace": True}} if grammar else {}
+            code, data = self.chat(response_format=None, stream=True,
+                                   stream_options={"include_usage": True},
+                                   chat_template_kwargs={"enable_thinking": False}, **fields)
+            self.assertEqual(code, 200, data)
+            chunks = [json.loads(line[6:]) for line in data.splitlines()
+                      if line.startswith("data: ") and line != "data: [DONE]"]
+            self.assertEqual(chunks[-1]["choices"], [])
+            self.assertGreater(chunks[-1]["usage"]["completion_tokens"], 0)
+            self.assertEqual(chunks[-2]["choices"][0]["finish_reason"], "stop")
+            self.assertNotIn("usage", chunks[-2])
+            self.assertTrue(data.endswith("data: [DONE]\n\n"))
+            self.assertEqual(seen[-1][1], raw if grammar else None)
+
+    def test_request_compact_overrides_config(self):
+        seen = self.native_capture()
+        self.engine.script = self.tok.encode('{"answer":4}<|im_end|>', parse_special=True)
+        for default, override in ((False, True), (True, False)):
+            self.svc.structured_compact = default
+            code, reply = self.chat(response_format=None, structured_outputs={
+                "json_object": True, "disable_any_whitespace": override},
+                stream=True, stream_options={"include_usage": True})
+            self.assertEqual(code, 200, reply)
+            self.assertEqual('space ::= ""' in seen[-1][1], override)
+            chunks = [json.loads(line[6:]) for line in reply.splitlines()
+                      if line.startswith("data: ") and line != "data: [DONE]"]
+            self.assertEqual(chunks[-1]["choices"], [])
+            self.assertIn("usage", chunks[-1])
+
+    def test_older_engine_keeps_validation_and_refuses_raw_grammar(self):
+        self.assertEqual(self.chat(response_format=None, grammar='root ::= "yes"')[0], 400)
+        seen = []
+        original = self.engine.generate
+        def generate(ids, max_new, sampling, cancel, embeddings=None):
+            seen.append(sampling)
+            yield from original(ids, max_new, sampling, cancel, embeddings)
+        self.engine.generate = generate
+        self.assertEqual(self.chat()[0], 200)
+        self.assertNotIn("_grammar_path", seen[0])
 
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess
