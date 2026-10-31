@@ -1363,6 +1363,15 @@ int main(int argc, char ** argv) {
                         const int sn = std::min(SB, B - s);
                         if (!cur_dense->attn_router_span(l, s, sn)) { ferr = cur_dense->last_error(); return false; }
                     }
+                    // STRATA_ROUTE_DUMP=<file> (measurement only): this layer's routing of the batch's columns - header
+                    // {layer, first position, n} (int32), then n*top_k expert ids (int32) and n*top_k weights (f32), token-major
+                    if (static FILE * rdump = std::getenv("STRATA_ROUTE_DUMP") ? std::fopen(std::getenv("STRATA_ROUTE_DUMP"), "wb") : nullptr; rdump) {
+                        const int32_t hdr[3] = { (int32_t) l, (int32_t) (pos0 + c0 + d0), (int32_t) (B - d0) };
+                        std::fwrite(hdr, sizeof hdr, 1, rdump);
+                        std::fwrite(cur_dense->batch_ids() + (size_t) d0 * top_k, sizeof(int32_t), (size_t) (B - d0) * top_k, rdump);
+                        std::fwrite(cur_dense->batch_wts() + (size_t) d0 * top_k, sizeof(float), (size_t) (B - d0) * top_k, rdump);
+                        std::fflush(rdump);
+                    }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4

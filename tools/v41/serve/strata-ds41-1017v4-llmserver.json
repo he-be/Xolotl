@@ -38,14 +38,14 @@
     "--vision"
   ],
   "cwd": "/root/xolotl",
-  "tokenizer": "/root/models/V41-XQ-1017-v3/tokenizer",
+  "tokenizer": "/root/models/V41-XQ-1017-v4/tokenizer",
   "model_name": "deepseek-v4.1-flash-1017-xq-v4",
   "log": "/tmp/strata-ds41.log",
   "port": 8150,
   "env": {
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "1,0",
-    "STRATA_SERVE_DSPARK": "/root/models/V41-XQ-1017-v3/V41-MTP-Vision-1017.Q2_K.gguf",
+    "STRATA_SERVE_DSPARK": "/root/models/V41-XQ-1017-v4/V41-MTP-Vision-1017.Q2_K.gguf",
     "STRATA_DENSE_REQUANT_CACHE": "/root/models/V41-XQ-1017-v4/cache",
     "DS41_MEMORY_MAX": "120G",
     "STRATA_SERVE_BATCH_MIN": "128"
@@ -60,7 +60,7 @@
   "vision": {
     "exe": "/root/xolotl/tools/v41/vision/ds41_vision.py",
     "python": "/root/xolotl/.venv/bin/python",
-    "mmproj": "/root/models/V41-XQ-1017-v3/V41-MTP-Vision-1017.Q2_K.gguf",
+    "mmproj": "/root/models/V41-XQ-1017-v4/V41-MTP-Vision-1017.Q2_K.gguf",
     "model": "/root/models/V41-XQ-1017-v4/V41-XQ-1017-v4.gguf",
     "reference_dir": "/root/models/dsv41-1017-inference",
     "threads": 8,
