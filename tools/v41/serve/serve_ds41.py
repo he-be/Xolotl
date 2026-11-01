@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import importlib.util
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -304,6 +305,12 @@ class Ds41Vision(_Vision):
 S.Vision = Ds41Vision
 
 # ---- tool calls: DSML
+# The merged server (serve/dsml.py, 2026-10-31 upstream merge) reads DSML itself: DsmlOutputParser translates the model's
+# DSML into the template form and feeds the base OutputParser, and to_dsml_force writes a forced call.  The patches below
+# (the pre-merge way: DSML tags as the base parser's call markers) must then stay OFF - with both on, the translated
+# `<tool_call><function=...>` text meets a parser that waits for `<｜DSML｜ invoke` and every call comes back as text
+# (2026-11-01, pi on the two-box IQ3_S: "tool使えなかった").  Without serve/dsml.py (an older server) they apply as before.
+_UPSTREAM_DSML = importlib.util.find_spec("serve.dsml") is not None
 CALLS_OPEN = f"<{E.dsml_token}{E.tool_calls_block_name}>"           # <｜DSML｜ calls>
 CALLS_CLOSE = f"</{E.dsml_token}{E.tool_calls_block_name}>"
 INVOKE_OPEN = f"<{E.dsml_token}{E.tool_call_tag_name}"               # <｜DSML｜ invoke   (name="X">)
@@ -342,13 +349,15 @@ def ds41_parse_tool_call(body: str, schema=None):
     return F.ToolCall(name=m.group(1), arguments=args)
 
 
-F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
+if not _UPSTREAM_DSML:
+    F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 # xolotl: the 0.1.44 parser treats a call opener as a call only when Qwen's `<function=` follows it (else it is
 # prose naming the format); this model's follower is DSML (` name="...">`), so with FUNC_START = "" that guard always passes -
 # the pre-0.1.44 behaviour.  Only the opt-in tool_call_recovery reads FUNC_START otherwise (off here).
-F.FUNC_START = ""
-F.call_end = ds41_call_end
-F.parse_tool_call = ds41_parse_tool_call
+if not _UPSTREAM_DSML:
+    F.FUNC_START = ""
+    F.call_end = ds41_call_end
+    F.parse_tool_call = ds41_parse_tool_call
 # frontend.forced_call writes the forced-call (tool_choice) prefix in Qwen's `<function=NAME>` shape; V4.1's
 # DSML puts the name in the call OPENER itself, so a forced call has to be written in that shape here.
 # The opening is exactly what DeepSeek's encoder writes before an assistant message's tool call (encode_messages:
@@ -376,9 +385,10 @@ def ds41_forced_call(tool_choice, tools):
     return None
 
 
-F.forced_call = ds41_forced_call
-if hasattr(S, "forced_call"):
-    S.forced_call = ds41_forced_call
+if not _UPSTREAM_DSML:
+    F.forced_call = ds41_forced_call
+    if hasattr(S, "forced_call"):
+        S.forced_call = ds41_forced_call
 _svc_prepare = S.Service.prepare
 
 
@@ -391,7 +401,8 @@ def _prepare_ds41(self, messages, tools, kwargs, max_new=None, force=None, **k):
     return _svc_prepare(self, messages, tools, kwargs, max_new, force=force, **k)
 
 
-S.Service.prepare = _prepare_ds41
+if not _UPSTREAM_DSML:
+    S.Service.prepare = _prepare_ds41
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
@@ -456,10 +467,11 @@ def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reaso
     return out
 
 
-F.OutputParser.__init__ = _op_init_ds41
-F.OutputParser.feed = _op_feed_ds41
-F.OutputParser.finish = _op_finish_ds41
-S.OutputParser = F.OutputParser
+if not _UPSTREAM_DSML:
+    F.OutputParser.__init__ = _op_init_ds41
+    F.OutputParser.feed = _op_feed_ds41
+    F.OutputParser.finish = _op_finish_ds41
+    S.OutputParser = F.OutputParser
 
 # ---- "parallel": N (#465's batch slots) on the DeepSeek-V4.1 engine.  ds41_generate --serve runs Strata's slot protocol
 # itself (BGEN / BADM / BT / BDONE / BSTOP / BYIELD: the server's generate_batched, unchanged) when started with
