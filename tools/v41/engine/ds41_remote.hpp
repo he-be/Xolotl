@@ -72,13 +72,16 @@ struct Ds41RemoteChunk {
     std::atomic<int64_t> req, done;
     std::atomic<int32_t> status;
     int32_t layer, n, n_ent;
+    int32_t has_w;   ///< 1: ent_w[cap_ent] (the top-k weights) follows ent_tok, and the reply is one weighted sum per token
+                     ///< (set by the segment's creator; the helper's own segment has 0, the bridge translates)
     static constexpr size_t kHead = 4096;
-    static size_t size_for(int64_t cap_tok, int64_t cap_ent, int64_t n_embd) {
-        return kHead + (size_t) cap_ent * 8 + 4096 + (size_t) (cap_tok + cap_ent) * (size_t) n_embd * 4;
+    static size_t size_for(int64_t cap_tok, int64_t cap_ent, int64_t n_embd, bool with_w = false) {
+        return kHead + (size_t) cap_ent * (with_w ? 12 : 8) + 4096 + (size_t) (cap_tok + cap_ent) * (size_t) n_embd * 4;
     }
     int32_t* ent_expert() { return (int32_t*) ((uint8_t*) this + kHead); }
     int32_t* ent_tok() { return ent_expert() + cap_ent; }
-    float* x() { return (float*) ((uint8_t*) this + ((kHead + (size_t) cap_ent * 8 + 4095) & ~(size_t) 4095)); }
+    float* ent_w() { return (float*) (ent_tok() + cap_ent); }   // only when has_w
+    float* x() { return (float*) ((uint8_t*) this + ((kHead + (size_t) cap_ent * (has_w ? 12 : 8) + 4095) & ~(size_t) 4095)); }
     float* out() { return x() + (size_t) cap_tok * (size_t) n_embd; }
 };
 

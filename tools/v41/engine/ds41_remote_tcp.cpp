@@ -33,6 +33,11 @@
 #endif
 #include "ds41_remote.hpp"
 
+#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
+#include <immintrin.h>
+#define DS41_HAVE_F16C 1   // hardware f16 <-> f32 (round to nearest even, as the scalar code): -mf16c / /arch:AVX2
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -78,13 +83,15 @@ struct Rep { int32_t status, n_ent, f16, pad; };
 
 double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+static constexpr size_t kPiece = (size_t) 4 << 20;
 bool send_all(sock_t s, const void* p, size_t n) {
     const char* c = (const char*) p;
     while (n > 0) {
+        // 4 MB pieces: one huge send/recv ran at 290-385 MB/s on the 5GbE, 4 MB loops at 610 (tcpbench.py, 2026-11-01)
 #ifdef _WIN32
-        const int k = send(s, c, (int) std::min<size_t>(n, 1 << 30), 0);
+        const int k = send(s, c, (int) std::min<size_t>(n, kPiece), 0);
 #else
-        const ssize_t k = send(s, c, n, MSG_NOSIGNAL);
+        const ssize_t k = send(s, c, std::min<size_t>(n, kPiece), MSG_NOSIGNAL);
 #endif
         if (k <= 0) return false;
         c += k;
@@ -96,9 +103,9 @@ bool recv_all(sock_t s, void* p, size_t n) {
     char* c = (char*) p;
     while (n > 0) {
 #ifdef _WIN32
-        const int k = recv(s, c, (int) std::min<size_t>(n, 1 << 30), 0);
+        const int k = recv(s, c, (int) std::min<size_t>(n, kPiece), 0);
 #else
-        const ssize_t k = recv(s, c, n, MSG_WAITALL);
+        const ssize_t k = recv(s, c, std::min<size_t>(n, kPiece), MSG_WAITALL);
 #endif
         if (k <= 0) return false;
         c += k;
@@ -148,23 +155,86 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
+static void cvt_to_f16(const float* f, uint16_t* h, size_t i0, size_t i1) {
+    size_t i = i0;
+#ifdef DS41_HAVE_F16C
+    for (; i + 8 <= i1; i += 8)
+        _mm_storeu_si128((__m128i*) (h + i), _mm256_cvtps_ph(_mm256_loadu_ps(f + i), _MM_FROUND_TO_NEAREST_INT));
+#endif
+    for (; i < i1; ++i) h[i] = f32_to_f16(f[i]);
+}
+static void cvt_to_f32(const uint16_t* h, float* f, size_t i0, size_t i1) {
+    size_t i = i0;
+#ifdef DS41_HAVE_F16C
+    for (; i + 8 <= i1; i += 8) _mm256_storeu_ps(f + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (h + i))));
+#endif
+    for (; i < i1; ++i) f[i] = f16_to_f32(h[i]);
+}
+static int cvt_threads(size_t n) {
+    static const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
+    return n > (1u << 20) ? std::min(8, hw) : 1;
+}
 void to_f16(const float* f, uint16_t* h, size_t n) {
-    const int nth = n > (1u << 20) ? 4 : 1;
+    const int nth = cvt_threads(n);
     std::vector<std::thread> th;
-    for (int q = 1; q < nth; ++q) th.emplace_back([=]() { for (size_t i = n * q / nth; i < n * (q + 1) / nth; ++i) h[i] = f32_to_f16(f[i]); });
-    for (size_t i = 0; i < n / nth; ++i) h[i] = f32_to_f16(f[i]);
+    for (int q = 1; q < nth; ++q) th.emplace_back([=]() { cvt_to_f16(f, h, n * q / nth, n * (q + 1) / nth); });
+    cvt_to_f16(f, h, 0, n / nth);
     for (auto& t : th) t.join();
 }
-void to_f32(const uint16_t* h, float* f, size_t n) {
-    const int nth = n > (1u << 20) ? 4 : 1;
+/// Helper side: the per-token weighted sums of the helper's per-entry rows, one row per token in the order the tokens
+/// first appear in the entries (the engine puts row q into the parts row of that token's first entry, weight 1).
+/// Returns the row count, -1 on a bad token id.
+static int token_sums(const int32_t* et, const float* ew, const float* out, int ne, int nt, int64_t H, std::vector<float>& csum) {
+    std::vector<int32_t> tokq((size_t) nt, -1), qtok;
+    qtok.reserve((size_t) ne);
+    for (int p = 0; p < ne; ++p) {
+        const int32_t t = et[p];
+        if (t < 0 || t >= nt) return -1;
+        if (tokq[(size_t) t] < 0) { tokq[(size_t) t] = (int32_t) qtok.size(); qtok.push_back(t); }
+    }
+    const int nq = (int) qtok.size();
+    std::vector<int32_t> start((size_t) nq + 1, 0), ord((size_t) ne);
+    for (int p = 0; p < ne; ++p) ++start[(size_t) tokq[(size_t) et[p]] + 1];
+    for (int q = 0; q < nq; ++q) start[(size_t) q + 1] += start[(size_t) q];
+    {
+        std::vector<int32_t> cur(start.begin(), start.end() - 1);
+        for (int p = 0; p < ne; ++p) ord[(size_t) cur[(size_t) tokq[(size_t) et[p]]]++] = p;
+    }
+    csum.resize((size_t) nq * (size_t) H);
+    auto work = [&](int q0, int q1) {
+        for (int q = q0; q < q1; ++q) {
+            float* d = csum.data() + (size_t) q * (size_t) H;
+            const int p0 = start[(size_t) q], p1 = start[(size_t) q + 1];
+            {
+                const float wgt = ew[ord[(size_t) p0]];
+                const float* src = out + (size_t) ord[(size_t) p0] * (size_t) H;
+                for (int64_t i = 0; i < H; ++i) d[i] = wgt * src[i];
+            }
+            for (int k = p0 + 1; k < p1; ++k) {
+                const float wgt = ew[ord[(size_t) k]];
+                const float* src = out + (size_t) ord[(size_t) k] * (size_t) H;
+                for (int64_t i = 0; i < H; ++i) d[i] += wgt * src[i];
+            }
+        }
+    };
+    const int nth = (int64_t) ne * H > (1 << 20) ? cvt_threads((size_t) ne * (size_t) H) : 1;
     std::vector<std::thread> th;
-    for (int q = 1; q < nth; ++q) th.emplace_back([=]() { for (size_t i = n * q / nth; i < n * (q + 1) / nth; ++i) f[i] = f16_to_f32(h[i]); });
-    for (size_t i = 0; i < n / nth; ++i) f[i] = f16_to_f32(h[i]);
+    for (int t = 1; t < nth; ++t) th.emplace_back([=]() { work(nq * t / nth, nq * (t + 1) / nth); });
+    work(0, nq / nth);
+    for (auto& t : th) t.join();
+    return nq;
+}
+
+void to_f32(const uint16_t* h, float* f, size_t n) {
+    const int nth = cvt_threads(n);
+    std::vector<std::thread> th;
+    for (int q = 1; q < nth; ++q) th.emplace_back([=]() { cvt_to_f32(h, f, n * q / nth, n * (q + 1) / nth); });
+    cvt_to_f32(h, f, 0, n / nth);
     for (auto& t : th) t.join();
 }
 
 struct Args {
-    bool helper_side = false, engine_side = false, f16 = false, chunk_f32 = false, no_chunk = false;
+    bool helper_side = false, engine_side = false, f16 = false, chunk_f32 = false, no_chunk = false, no_sums = false;
     std::string name = "ds41_remote", connect;
     int listen = 0;
 };
@@ -179,6 +249,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--connect") a.connect = next();
         else if (k == "--f16") a.f16 = true;
         else if (k == "--chunk-f32") a.chunk_f32 = true;   // prompt-chunk rows as f32 (default f16: half the bytes)
+        else if (k == "--no-sums") a.no_sums = true;   // engine side: the old reply (one row per entry) instead of per-token sums
         else if (k == "--no-chunk") a.no_chunk = true;     // do not carry the prompt-chunk segment
         else { std::fprintf(stderr, "ds41_remote_tcp: unknown argument %s\n", k.c_str()); return false; }
     }
@@ -283,6 +354,7 @@ int helper_side(const Args& a) {
     }
     std::vector<uint16_t> ch16;
     std::vector<uint8_t> creq;
+    std::vector<float> csum;
 
     std::vector<uint16_t> h16((size_t) std::max(Ds41RemoteShm::kMaxTok, Ds41RemoteShm::kMaxEnt) * (size_t) H);
     std::vector<uint8_t> reqbuf;
@@ -302,35 +374,48 @@ int helper_side(const Args& a) {
             Req rq;
             if (!recv_all(c, &rq, sizeof(rq))) break;
             if (rq.layer < 0) break;   // engine says goodbye
-            if (rq.kind == 2) {   // ---- a prompt chunk: into the helper's chunk segment, wait, rows back ----
+            if (rq.kind == 2) {   // ---- a prompt chunk: into the helper's chunk segment, wait, rows (or per-token sums) back ----
                 if (!C || rq.nt <= 0 || rq.nt > C->cap_tok || rq.n_ent <= 0 || rq.n_ent > C->cap_ent) {
                     std::fprintf(stderr, "ds41_remote_tcp: bad chunk request (rows %d entries %d)\n", rq.nt, rq.n_ent);
                     break;
                 }
+                const bool sums = rq.pad == 1;   // the request carries the weights: reply with one weighted row per token
+                const size_t eb = (size_t) rq.n_ent * (sums ? 12 : 8);
                 const size_t xb = rq.f16 ? (size_t) rq.nt * H * 2 : (size_t) rq.nt * H * 4;
-                creq.resize((size_t) rq.n_ent * 8 + xb);
+                creq.resize(eb + xb);
                 if (!recv_all(c, creq.data(), creq.size())) break;
-                const double ta = now_ms();
+                const double tr = now_ms();
                 std::memcpy(C->ent_expert(), creq.data(), (size_t) rq.n_ent * 4);
                 std::memcpy(C->ent_tok(), creq.data() + (size_t) rq.n_ent * 4, (size_t) rq.n_ent * 4);
-                if (rq.f16) to_f32((const uint16_t*) (creq.data() + (size_t) rq.n_ent * 8), C->x(), (size_t) rq.nt * H);
-                else std::memcpy(C->x(), creq.data() + (size_t) rq.n_ent * 8, xb);
+                const float* ew = sums ? (const float*) (creq.data() + (size_t) rq.n_ent * 8) : nullptr;
+                if (rq.f16) to_f32((const uint16_t*) (creq.data() + eb), C->x(), (size_t) rq.nt * H);
+                else std::memcpy(C->x(), creq.data() + eb, xb);
                 C->layer = rq.layer; C->n = rq.nt; C->n_ent = rq.n_ent;
+                const double ta = now_ms();
                 const int64_t cr = C->req.load() + 1;
                 C->req.store(cr, std::memory_order_release);
                 double ev = now_ms();
                 wait_change([&] { return C->done.load(std::memory_order_acquire) == cr; }, nullptr, ev);
-                Rep rp{C->status.load(std::memory_order_relaxed), rq.n_ent, rq.f16, 0};
+                int status = C->status.load(std::memory_order_relaxed), nout = rq.n_ent;
                 const double tb = now_ms();
+                double ts = tb;
+                if (sums && status == 0) {
+                    nout = token_sums(C->ent_tok(), ew, C->out(), rq.n_ent, rq.nt, H, csum);
+                    if (nout < 0) { status = 7; nout = 0; }
+                    ts = now_ms();
+                }
+                Rep rp{status, nout, rq.f16, sums ? 1 : 0};
+                double tc = ts;
                 if (!send_all(c, &rp, sizeof(rp))) break;
                 if (rp.status == 0) {
-                    const size_t ne = (size_t) rq.n_ent * H;
-                    if (rq.f16) { ch16.resize(ne); to_f16(C->out(), ch16.data(), ne); if (!send_all(c, ch16.data(), ne * 2)) break; }
-                    else if (!send_all(c, C->out(), ne * 4)) break;
+                    const float* src = sums ? csum.data() : C->out();
+                    const size_t no = (size_t) nout * H;
+                    if (rq.f16) { ch16.resize(no); to_f16(src, ch16.data(), no); tc = now_ms(); if (!send_all(c, ch16.data(), no * 2)) break; }
+                    else if (!send_all(c, src, no * 4)) break;
                 }
                 if (rq.nt >= 1024)
-                    std::fprintf(stderr, "ds41_remote_tcp: chunk layer %d: %d rows, %d entries: helper %.0f ms, rows out %.0f ms\n", rq.layer, rq.nt,
-                                 rq.n_ent, tb - ta, now_ms() - tb);
+                    std::fprintf(stderr, "ds41_remote_tcp: chunk layer %d: %d rows, %d entries: rows in cvt %.0f ms, helper %.0f ms, sums %.0f ms (%d rows), out cvt %.0f + send %.0f ms\n", rq.layer, rq.nt,
+                                 rq.n_ent, ta - tr, tb - ta, ts - tb, nout, tc - ts, now_ms() - tc);
                 continue;
             }
             if (rq.nt <= 0 || rq.nt > Ds41RemoteShm::kMaxTok || rq.n_ent <= 0 || rq.n_ent > Ds41RemoteShm::kMaxEnt) {
@@ -405,20 +490,23 @@ int engine_side(const Args& a) {
     Ds41RemoteChunk* C = nullptr;
     const bool cf16 = !a.chunk_f32;
     if (!a.no_chunk && hl.cap_tok > 0 && hl.cap_ent > 0) {
-        const size_t cb = Ds41RemoteChunk::size_for(hl.cap_tok, hl.cap_ent, H);
+        const size_t cb = Ds41RemoteChunk::size_for(hl.cap_tok, hl.cap_ent, H, !a.no_sums);
         if (cmap.open(a.name + "_chunk", true, err, cb)) {
             C = (Ds41RemoteChunk*) cmap.data();
             std::memset(C, 0, Ds41RemoteChunk::kHead);
+            C->has_w = a.no_sums ? 0 : 1;   // the engine writes the top-k weights, the helper side returns per-token sums
             C->bytes = (int64_t) cb; C->cap_tok = hl.cap_tok; C->cap_ent = hl.cap_ent; C->n_embd = H;
             C->req.store(0); C->done.store(0); C->status.store(0);
             C->magic = Ds41RemoteChunk::kMagic;
-            std::fprintf(stderr, "ds41_remote_tcp: prompt-chunk segment %s_chunk: %lld rows, %lld entries, %.0f MB (%s rows on the wire)\n",
-                         a.name.c_str(), (long long) hl.cap_tok, (long long) hl.cap_ent, cb / 1e6, cf16 ? "f16" : "f32");
+            std::fprintf(stderr, "ds41_remote_tcp: prompt-chunk segment %s_chunk: %lld rows, %lld entries, %.0f MB (%s rows on the wire, %s back)\n",
+                         a.name.c_str(), (long long) hl.cap_tok, (long long) hl.cap_ent, cb / 1e6, cf16 ? "f16" : "f32", a.no_sums ? "entry rows" : "per-token sums");
         } else std::fprintf(stderr, "ds41_remote_tcp: %s - prompts run without the helper\n", err.c_str());
     }
     std::vector<uint8_t> cbuf;
     std::vector<uint16_t> ch16;
     int64_t clast = C ? C->req.load() : 0;
+    int64_t cp_n = 0;
+    double cp_send = 0, cp_wait = 0, cp_recv = 0, cp_out = 0, cp_in = 0, cp_cvt = 0;
     S.ready.store(1, std::memory_order_release);
     std::fprintf(stderr, "ds41_remote_tcp: helper holds %lld experts (%.2f GiB); segment %s ready (%s rows)\n",
                  (long long) hl.held, hl.held_bytes / 1073741824.0, a.name.c_str(), f16 ? "f16" : "f32");
@@ -432,30 +520,61 @@ int engine_side(const Args& a) {
         int64_t r;
         bool chunk = false;
         wait_change([&] { chunk = C && C->req.load(std::memory_order_acquire) != clast; return chunk || (r = S.req.load(std::memory_order_acquire)) != last; }, &S.stop, ev);
-        if (chunk) {   // ---- a prompt chunk: header + entries + rows out, rows back ----
+        if (chunk) {   // ---- a prompt chunk: header + entries (+ weights) + rows out; entry rows or per-token sums back ----
             const int64_t cr = C->req.load(std::memory_order_acquire);
             const int n = (int) C->n, ne = C->n_ent, layer = C->layer;
             int status = 1;
             const double ta = now_ms();
             if (n > 0 && n <= C->cap_tok && ne > 0 && ne <= C->cap_ent && layer >= 0 && layer < hl.n_layers) {
+                const bool sums = C->has_w != 0;
+                const size_t eb = (size_t) ne * (sums ? 12 : 8);
                 const size_t xb = cf16 ? (size_t) n * H * 2 : (size_t) n * H * 4;
-                cbuf.resize(sizeof(Req) + (size_t) ne * 8 + xb);
-                Req rq{2, layer, n, ne, cf16 ? 1 : 0, 0};
+                cbuf.resize(sizeof(Req) + eb + xb);
+                Req rq{2, layer, n, ne, cf16 ? 1 : 0, sums ? 1 : 0};
                 std::memcpy(cbuf.data(), &rq, sizeof(rq));
                 std::memcpy(cbuf.data() + sizeof(Req), C->ent_expert(), (size_t) ne * 4);
                 std::memcpy(cbuf.data() + sizeof(Req) + (size_t) ne * 4, C->ent_tok(), (size_t) ne * 4);
-                if (cf16) to_f16(C->x(), (uint16_t*) (cbuf.data() + sizeof(Req) + (size_t) ne * 8), (size_t) n * H);
-                else std::memcpy(cbuf.data() + sizeof(Req) + (size_t) ne * 8, C->x(), xb);
+                if (sums) std::memcpy(cbuf.data() + sizeof(Req) + (size_t) ne * 8, C->ent_w(), (size_t) ne * 4);
+                const double t_c0 = now_ms();
+                if (cf16) to_f16(C->x(), (uint16_t*) (cbuf.data() + sizeof(Req) + eb), (size_t) n * H);
+                else std::memcpy(cbuf.data() + sizeof(Req) + eb, C->x(), xb);
                 Rep rp;
-                if (!send_all(c, cbuf.data(), cbuf.size()) || !recv_all(c, &rp, sizeof(rp))) { std::fprintf(stderr, "ds41_remote_tcp: connection lost\n"); S.ready.store(-1); return 1; }
+                const double t_s0 = now_ms();
+                cp_cvt += t_s0 - t_c0;
+                if (!send_all(c, cbuf.data(), cbuf.size())) { std::fprintf(stderr, "ds41_remote_tcp: connection lost\n"); S.ready.store(-1); return 1; }
+                const double t_s1 = now_ms();
+                if (!recv_all(c, &rp, sizeof(rp))) { std::fprintf(stderr, "ds41_remote_tcp: connection lost\n"); S.ready.store(-1); return 1; }
+                const double t_s2 = now_ms();
                 status = rp.status;
+                size_t ob = 0;
+                double t_w = t_s2;
                 if (status == 0) {
-                    const size_t no = (size_t) ne * H;
+                    const int nrow = rp.pad == 1 ? rp.n_ent : ne;   // per-token sums: one row per token with an entry here
+                    if (nrow < 0 || nrow > ne || (rp.pad == 1) != sums) { std::fprintf(stderr, "ds41_remote_tcp: bad chunk reply (%d rows, kind %d)\n", nrow, rp.pad); S.ready.store(-1); return 1; }
+                    const size_t no = (size_t) nrow * H;
                     if (rp.f16) {
                         ch16.resize(no);
                         if (!recv_all(c, ch16.data(), no * 2)) { std::fprintf(stderr, "ds41_remote_tcp: connection lost\n"); S.ready.store(-1); return 1; }
+                        t_w = now_ms();
                         to_f32(ch16.data(), C->out(), no);
-                    } else if (!recv_all(c, C->out(), no * 4)) { std::fprintf(stderr, "ds41_remote_tcp: connection lost\n"); S.ready.store(-1); return 1; }
+                        ob = no * 2;
+                    } else {
+                        if (!recv_all(c, C->out(), no * 4)) { std::fprintf(stderr, "ds41_remote_tcp: connection lost\n"); S.ready.store(-1); return 1; }
+                        t_w = now_ms();
+                        ob = no * 4;
+                    }
+                }
+                const double t_s3 = now_ms();
+                // chunk profile: where the round trip goes (the f16 conversions are inside send / recv)
+                cp_n++; cp_send += t_s1 - t_s0; cp_wait += t_s2 - t_s1; cp_recv += t_s3 - t_s2; cp_out += (double) cbuf.size(); cp_in += (double) ob;
+                if (n >= 1024)
+                    std::fprintf(stderr, "ds41_remote_tcp: chunk layer %d: %d rows, %d entries: cvt %.0f + send %.0f ms (%.1f MB = %.0f MB/s), helper+wait %.0f ms, recv %.0f ms (%.1f MB = %.0f MB/s) + cvt %.0f ms\n",
+                                 layer, n, ne, t_s0 - t_c0, t_s1 - t_s0, cbuf.size() / 1e6, cbuf.size() / 1e3 / std::max(0.01, t_s1 - t_s0), t_s2 - t_s1,
+                                 t_w - t_s2, ob / 1e6, ob / 1e3 / std::max(0.01, t_w - t_s2), t_s3 - t_w);
+                if (cp_n % 40 == 0) {
+                    std::fprintf(stderr, "ds41_remote_tcp: chunks %lld: per call cvt %.1f + send %.1f ms (%.2f MB), helper+wait %.1f ms, recv+cvt %.1f ms (%.2f MB)\n",
+                                 (long long) cp_n, cp_cvt / 40, cp_send / 40, cp_out / 40 / 1e6, cp_wait / 40, cp_recv / 40, cp_in / 40 / 1e6);
+                    cp_send = cp_wait = cp_recv = cp_out = cp_in = cp_cvt = 0;
                 }
             }
             C->status.store(status, std::memory_order_relaxed);

@@ -368,6 +368,10 @@ struct RemoteChunk {
     int nr = 0;                       ///< its entries
     std::vector<char> mask_e;         ///< the current layer: expert -> the helper computes it in this call
     std::vector<int32_t> rrow;        ///< entry i of the request -> parts row
+    bool sums = false;                ///< this call: the segment carries the weights and the reply is one row per token
+    int n_first = 0;                  ///< ... that many (tokens with an entry on the helper)
+    std::vector<int32_t> first_rows;  ///< reply row q -> the parts row of that token's first helper entry (weight 1 below)
+    std::vector<float> w2;            ///< the call's top-k weights with the helper's entries set to 1 (first) / 0 (the rest)
     int32_t* d_rrow = nullptr;
     int64_t d_rrow_cap = 0;
     int64_t calls = 0, entries = 0;
@@ -5116,10 +5120,11 @@ void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer, int rows) {
 /// STRATA_DS41_REMOTE prompt chunks: post the entries of the helper's experts that are not in VRAM (sorted by class,
 /// then expert, so the helper can cut them into contiguous pieces) and mark those experts for this call's passes.
 /// False = nothing posted (no entries, too many, or a chunk wider than the segment): the call runs as without it.
-bool remote_chunk_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* x_host) {
+bool remote_chunk_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host) {
     Gpu& gp = *im.gpu;
     RemoteChunk& rc = *gp.rchunk;
     rc.pending = false;
+    rc.sums = false;
     Ds41RemoteChunk& C = *rc.c;
     const int64_t NX = im.g.n_experts, K = im.g.top_k, NE = (int64_t) n * K, H = im.g.n_embd;
     if (n > C.cap_tok) return false;
@@ -5151,6 +5156,21 @@ bool remote_chunk_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids
         ee[p] = e;
         et[p] = (int32_t) (j / K);
         rc.rrow[(size_t) p] = (int32_t) j;
+    }
+    if (C.has_w) {   // per-token sums: the weights go along; the reply's row q lands in the first entry's parts row with weight 1
+        float* ew = C.ent_w();
+        rc.first_rows.clear();
+        rc.w2.assign(w, w + NE);
+        std::vector<char> seen((size_t) n, 0);
+        for (int64_t p = 0; p < nr; ++p) {
+            const int32_t j = rc.rrow[(size_t) p];
+            ew[p] = w[j];
+            const int32_t t = et[p];
+            if (!seen[(size_t) t]) { seen[(size_t) t] = 1; rc.first_rows.push_back(j); rc.w2[(size_t) j] = 1.0f; }
+            else rc.w2[(size_t) j] = 0.0f;   // its parts row keeps stale (finite) data: c_parts is zeroed at allocation
+        }
+        rc.n_first = (int) rc.first_rows.size();
+        rc.sums = true;
     }
     // the rows: a few threads (a 12288-row chunk is 200 MB)
     {
@@ -5195,13 +5215,15 @@ bool remote_chunk_collect(Ds41MoeImpl& im, int64_t layer) {
         return false;
     }
     rc.wait_ms += now_ms() - tw;
-    if (rc.nr > rc.d_rrow_cap) {
+    const int nrow = rc.sums ? rc.n_first : rc.nr;   // sums: one row per token, into its first entry's parts row
+    const int32_t* rows = rc.sums ? rc.first_rows.data() : rc.rrow.data();
+    if (nrow > rc.d_rrow_cap) {
         if (rc.d_rrow) cudaFree(rc.d_rrow);
-        rc.d_rrow_cap = std::max<int64_t>(rc.nr, 4096);
+        rc.d_rrow_cap = std::max<int64_t>(nrow, 4096);
         ck(cudaMalloc(&rc.d_rrow, sizeof(int32_t) * (size_t) rc.d_rrow_cap), "remote rows");
     }
-    ck(cudaMemcpyAsync(rc.d_rrow, rc.rrow.data(), sizeof(int32_t) * (size_t) rc.nr, cudaMemcpyHostToDevice, gp.s), "remote rows");
-    strata::kernels::scatter_rows_f32(rc.out_dev, (float*) gp.c_parts, rc.d_rrow, rc.nr, im.g.n_embd, gp.s);
+    ck(cudaMemcpyAsync(rc.d_rrow, rows, sizeof(int32_t) * (size_t) nrow, cudaMemcpyHostToDevice, gp.s), "remote rows");
+    strata::kernels::scatter_rows_f32(rc.out_dev, (float*) gp.c_parts, rc.d_rrow, nrow, im.g.n_embd, gp.s);
     ++rc.calls;
     rc.entries += rc.nr;
     static const bool rprof = std::getenv("STRATA_DS41_REMOTE_PROF") != nullptr;
@@ -5337,6 +5359,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
         ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
+        ck(cudaMemset(gp.c_parts, 0, (size_t) ne * (size_t) H * 4), "c_parts zero");   // remote sums leave rows with weight 0 unwritten
         ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
         // c_dst + r0 is the MMQ down product's `ids`, and MMQ reads up to 127 ids past a run's last entry: for the run
         // ending at entry ne that read went past the allocation - an MMU fault ("chunk sync: an illegal memory access",
@@ -5963,7 +5986,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     if (gp.rchunk && gp.rchunk->pending && !remote_chunk_collect(im, layer)) return false;
     // ---- outputs: the top-k mix on the card, n rows back ----
-    ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
+    const float* wsum = (gp.rchunk && gp.rchunk->sums) ? gp.rchunk->w2.data() : w;   // remote per-token sums: weight 1 / 0
+    ck(cudaMemcpyAsync(gp.c_w, wsum, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
     strata::kernels::weighted_rows_sum((const float*) gp.c_parts, (const float*) gp.c_w, (int) K, H, n,
                                        (float*) gp.c_out, gp.s);
     if (out_dev)   // straight into the caller's device tensor (no host round trip)
@@ -6060,7 +6084,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         return true;
     }
     const int64_t NE = (int64_t) n * im.g.top_k;
-    const bool rc = im.gpu->rchunk && remote_chunk_post(im, layer, n, ids, x);   // STRATA_DS41_REMOTE
+    const bool rc = im.gpu->rchunk && remote_chunk_post(im, layer, n, ids, w, x);   // STRATA_DS41_REMOTE
     std::vector<int> cl;
     for (int64_t j = 0; j < NE; ++j) {
         if (rc && im.gpu->rchunk->mask_e[(size_t) ids[j]]) continue;   // the helper's
