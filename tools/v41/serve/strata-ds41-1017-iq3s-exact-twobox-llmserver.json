@@ -24,7 +24,7 @@
     "--route-bias-remote",
     "0",
     "--arena-gib",
-    "110",
+    "107",
     "--tier-batch-pcie",
     "0.5",
     "--remote-reserve-gib",
@@ -34,7 +34,8 @@
     "--conversation-cache-mib",
     "512",
     "--prompt-batch",
-    "12288"
+    "12288",
+    "--vision"
   ],
   "cwd": "/root/xolotl",
   "tokenizer": "/root/models/V41-XQ-1017-v4/tokenizer",
@@ -63,5 +64,14 @@
   },
   "api_monitor": true,
   "reasoning_budget_tokens": 32768,
-  "arch": "deepseek41"
+  "arch": "deepseek41",
+  "vision": {
+    "exe": "/root/xolotl/tools/v41/vision/ds41_vision.py",
+    "python": "/root/xolotl/.venv/bin/python",
+    "mmproj": "/root/models/V41-XQ-1017-v4/V41-MTP-Vision-1017.Q2_K.gguf",
+    "model": "/root/models/unsloth-UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00001-of-00008.gguf",
+    "reference_dir": "/root/models/dsv41-1017-inference",
+    "threads": 8,
+    "gpu": false
+  }
 }
