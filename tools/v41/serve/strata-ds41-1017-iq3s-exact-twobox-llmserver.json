@@ -24,7 +24,7 @@
     "--route-bias-remote",
     "0",
     "--arena-gib",
-    "112",
+    "110",
     "--tier-batch-pcie",
     "0.5",
     "--remote-reserve-gib",
@@ -62,5 +62,6 @@
     "top_p": 1.0
   },
   "api_monitor": true,
-  "reasoning_budget_tokens": 32768
+  "reasoning_budget_tokens": 32768,
+  "arch": "deepseek41"
 }

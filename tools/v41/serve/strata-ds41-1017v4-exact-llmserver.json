@@ -69,5 +69,6 @@
     "reference_dir": "/root/models/dsv41-1017-inference",
     "threads": 8,
     "gpu": false
-  }
+  },
+  "arch": "deepseek41"
 }
