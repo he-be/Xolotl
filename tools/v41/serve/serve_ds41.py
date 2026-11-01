@@ -42,8 +42,9 @@ _Tok = ST.Tokenizer
 
 
 class Ds41Tokenizer(_Tok):
-    def __init__(self, tokens, merges, token_types=None, pre="joyai-llm", **k):
-        super().__init__(tokens, merges, token_types, pre="joyai-llm", **k)
+    def __init__(self, tokens, merges, token_types=None, pre="joyai-llm", special_ids=None, **k):
+        # the merged server passes (pre, special_ids) positionally: take both, keep V4.1's pre-split
+        super().__init__(tokens, merges, token_types, pre="joyai-llm", special_ids=special_ids, **k)
         self._literal = {i: t.encode("utf-8") for t, i in self.special_tokens.items()}
 
     def token_bytes(self, i: int) -> bytes:
