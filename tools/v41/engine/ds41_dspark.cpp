@@ -198,7 +198,17 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         w[s.name] = t;
     }
     wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, ggml_backend_get_default_buffer_type(be));
-    if (!wbuf) { e = "cannot allocate the DSpark weights on the backend"; return false; }
+    if (!wbuf) {
+        size_t need = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) need += ggml_nbytes(t);
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
+        char m[160];
+        std::snprintf(m, sizeof m, " (%.2f GiB of weights in %zu tensors, %.2f GiB free on the device)", need / 1073741824.0,
+                      src.size(), fr / 1073741824.0);
+        e = std::string("cannot allocate the DSpark weights on the backend") + m;
+        return false;
+    }
     // STRATA_DSPARK_STASH=1 (llm-server): STRATA_SERVE_DSPARK_EVICT frees the drafter for every long prompt and the
     // next open_cache() loads it again - re-reading the 5.7 GB sidecar and converting (3.9 s with the prefault, 8.4 s
     // without).  The loaded buffer is kept in host memory (~2.9 GB) once; a re-created drafter with the same sources

@@ -35,7 +35,9 @@
     "512",
     "--prompt-batch",
     "12288",
-    "--vision"
+    "--vision",
+    "--vram-margin",
+    "2.0"
   ],
   "cwd": "/root/xolotl-1103",
   "tokenizer": "/root/models/V41-XQ-1017-v4/tokenizer",
@@ -52,8 +54,7 @@
     "STRATA_SERVE_LOOKUP": "0",
     "STRATA_DSPARK_DEPTH": "5",
     "STRATA_DSPARK_KEEP": "/root/xolotl/tools/v41/serve/dspark_expert_counts_code.txt:64",
-    "MIMO_CHUNK_PROF": "1",
-    "STRATA_BUILD_DIR": "/root/xolotl-1103/build-xolotl-1103",
+    "STRATA_BUILD_DIR": "/root/xolotl-1103/build-xolotl-1103-fused",
     "STRATA_DS41_REMOTE_SKIP": "2000"
   },
   "allowed_hosts": "*",
