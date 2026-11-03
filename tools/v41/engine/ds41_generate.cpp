@@ -2585,7 +2585,15 @@ int main(int argc, char ** argv) {
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
-                    const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
+                    // the batch's fixed VRAM need: 4.3 GiB sizes a wide batch (less VRAM and a 1-2K turn splits into 512-column
+                    // sweeps that stream every expert again per sweep); a turn of <= STRATA_SERVE_KEEP_SMALL_TOK (512) new tokens
+                    // runs in one 512-column sweep anyway, so it lends only STRATA_SERVE_KEEP_SMALL_GIB (1.5) and more hot experts
+                    // stay (IQ1_M on llm-server: T(24) 0.85 -> 0.68 s, T(502) 3.62 -> 3.37 s; at 1.5 GiB T(1053) was 5.4 -> 7.4 s)
+                    static const double keep_big = std::getenv("STRATA_SERVE_KEEP_BASE_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_BASE_GIB")) : 4.3;
+                    static const double keep_small = std::getenv("STRATA_SERVE_KEEP_SMALL_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_SMALL_GIB")) : 1.5;
+                    static const int keep_small_tok = std::getenv("STRATA_SERVE_KEEP_SMALL_TOK") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_SMALL_TOK")) : 512;
+                    const double keep_base = dh <= keep_small_tok ? keep_small : keep_big;
+                    const double need = (keep_base * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
                                         a.vram_margin_gib * 1073741824.0;
                     std::string kerr;
                     int64_t g = 0; bool shrink_ok = true;

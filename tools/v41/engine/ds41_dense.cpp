@@ -1199,8 +1199,19 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     sel = ggml_view_2d(gc, IS.sel, K, gk, IS.sel->nb[1], (size_t) gc0 * IS.sel->nb[1]);
                     selm = ggml_view_2d(gc, IS.selm, K, gk, IS.selm->nb[1], (size_t) gc0 * IS.selm->nb[1]);
                 }
-                Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * gk)), f16), DH, K, gk);
-                Mc = ggml_cont(gc, selm);
+                // STRATA_ATTN_FOLD_PAD (default on): the flash-attn key pad rides in this gather (ids -> the spare row
+                // cmax[r], masked -inf): the keys are ONE concat below instead of two full [DH, M, k] copies
+                static const bool fold_pad = !(std::getenv("STRATA_ATTN_FOLD_PAD") && std::getenv("STRATA_ATTN_FOLD_PAD")[0] == '0');
+                const int64_t kpad = (!im.cpu && fold_pad && !merge_fa && (SWA + K) % 256) ? 256 - (SWA + K) % 256 : 0;
+                ggml_tensor * selx = ggml_cont(gc, sel);
+                ggml_tensor * selmx = ggml_cont(gc, selm);
+                if (kpad) {
+                    ggml_tensor * pid = ggml_cast(gc, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, kpad, gk), (float) im.cmax[r]), GGML_TYPE_I32);
+                    selx = ggml_concat(gc, selx, pid, 0);
+                    selmx = ggml_concat(gc, selmx, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, kpad, gk), NEG_INF), 0);
+                }
+                Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, selx, (K + kpad) * gk)), f16), DH, K + kpad, gk);
+                Mc = selmx;
                 // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
             }
         }
