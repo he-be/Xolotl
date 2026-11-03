@@ -3,6 +3,7 @@
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
+#include "strata/core/shared_bytes.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +25,7 @@ struct ConversationImageKey {
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
-    std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
+    SharedBytes gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // STRATA_CKPT_VRAM_SLOTS: the tag of the device copy of `gdn` (0: none).  Set by conversation_checkpoint_save, the
     // only writer of a checkpoint's GDN bytes besides a whole copy (which keeps them equal, so it keeps the tag).
@@ -49,7 +50,7 @@ struct ConversationCheckpoint {
 
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
-               gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
+               gdn.bytes() + ple.bytes() + tails.bytes() + dead.bytes() + block_pos.bytes() +
                stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
         return n;
@@ -237,6 +238,33 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+// A place worth checkpointing AFTER reading this request, not a reusable state.
+// A changed picture is a divergence at its first cell even when its pad tokens
+// compare equal. The image hash includes its grid as well as its content key.
+template<class Token>
+int64_t conversation_common_prefix(const std::vector<int32_t>& prior,
+        const std::vector<ConversationImageKey>& prior_images, const std::vector<Token>& prompt,
+        const std::vector<ConversationImageKey>& images) {
+    if (prompt.size() < 2) return 0;
+    const size_t limit = std::min(prior.size(), prompt.size() - 1);
+    size_t n = 0;
+    while (n < limit && prior[n] == prompt[n]) ++n;
+    const int64_t common = (int64_t) n;
+    size_t a = 0, b = 0;
+    while ((a < prior_images.size() && prior_images[a].start < common) ||
+           (b < images.size() && images[b].start < common)) {
+        const bool have_a = a < prior_images.size() && prior_images[a].start < common;
+        const bool have_b = b < images.size() && images[b].start < common;
+        if (!have_a) return std::max<int64_t>(0, images[b].start);
+        if (!have_b) return std::max<int64_t>(0, prior_images[a].start);
+        if (!(prior_images[a] == images[b]))
+            return std::max<int64_t>(0, std::min(prior_images[a].start, images[b].start));
+        ++a;
+        ++b;
+    }
+    return common;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -331,6 +359,20 @@ public:
                 if (conversation_covers(c, ids, images)) return true;
         }
         return false;
+    }
+
+    // Unlike best(), this may end inside a saved branch and conveys NO right to
+    // restore that position. The caller must actually read to it and save a new
+    // complete running-state checkpoint before any later request can reuse it.
+    template<class Token>
+    int64_t common_prefix(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images,
+            bool cvec, int64_t floor = 0) const {
+        int64_t common = 0;
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec || (int64_t) e.live.ids.size() <= std::max(common, floor)) continue;
+            common = std::max(common, conversation_common_prefix(e.live.ids, e.live.imgs, prompt, images));
+        }
+        return common > floor ? common : 0;
     }
 
     SavedConversation take(size_t index) {

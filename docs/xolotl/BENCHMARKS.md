@@ -87,6 +87,34 @@ including its two cheap misses) run one at a time, paired with the API's answers
 The quant reasons 3-12x longer than the API on one-shot problems, while on the Gauntlet both sides spend about the
 same tokens. Not yet separated: how much of that comes from the quantization, the abliteration or the routing bias.
 
+## DeepSeek-V4.1-Flash-1017 V4 (25 Oct)
+
+**V4 speed update (25 Oct, late): it's caught up, and prefill is way up.** On the coding tasks at the top of this page (21 HumanEval, 10
+tool calls, 3 agentic loops) V4 solved **21/21, 10/10, 3/3** and decoded at **25.7 tok/s** (29.0 with the newer
+conversation-seeded VRAM cache). On the **full HumanEval (all 164)** it got **162/164** (98.8%, greedy, 32K thinking budget,
+decoding at 40 tok/s across the run). Prefill on a fresh prompt is **289-297 tok/s at 8K and 395-409 at 20K** (dense half at
+Q8_0), up from 192 / 271 that morning, and decode is 21.7-21.8 / 22.6-24.5 tok/s after 8K / 20K prompts. Short follow-up messages got a lot quicker too: a 32-token
+message now takes ~3.9 s instead of ~7.4. With the default Q6_K re-quant prefill is 298-300 / 385-388 and decode
+23.5-23.9 / 25.3-25.6. It's all engine work, none of it costs quality: the route bias refreshing as you go, zero-copy NVMe reads,
+read-ahead per layer, MMQ for the experts staged from RAM, DSpark staying loaded when the prompt fits anyway, and short
+turns going through the prompt batch, and the VRAM cache reloading with this conversation's experts after each
+prompt. Pull the latest Xolotl (25 Oct or newer) and use
+`--rank v4/rank-1017-v4.bin --tier-batch-pcie 0.25`.
+
+**Coding speed depends on the kind of coding (2 Nov).** A user on a 3090 Ti + 128 GB asked why they see ~35 tok/s
+while coding when our tables say ~24. Same machine, same served settings (V4, Q6_K dense, arena 80 GiB, DSpark depth 4
+with prompt-lookup drafts), an 8K code prompt, 256 tokens out:
+
+| context | writing new code | repeating the code with comments added |
+|---|---|---|
+| 524K (as served) | 23.6 tok/s | **35.3 tok/s** |
+| 131K | 24.2 tok/s | 34.4 tok/s |
+| 131K + `STRATA_PRESTAGE_GIB=1.5` | 24.6 tok/s | 33.6 tok/s |
+
+Context size and prestaging barely move it. What moves it is the work: when the answer repeats or edits code that is
+already in the conversation (refactors, adding comments, patching a file), the prompt-lookup drafts get accepted far
+more often and decode goes up by about half. Writing new code from scratch stays around 24 tok/s. One probe per cell.
+
 ## Measuring it yourself
 
 ```bash

@@ -34,6 +34,7 @@ import hashlib
 import hmac
 import codecs
 import ctypes
+import itertools
 import json
 import math
 import os
@@ -49,6 +50,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -1057,6 +1059,11 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
     return {"elapsed_us": elapsed_us, "in_flight_us": in_flight_us}
 
 
+class _BatchCancelToken:
+    __slots__ = ("epoch",)
+    def __init__(self, epoch=0): self.epoch = epoch
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1152,15 +1159,30 @@ class StrataEngine:
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
+        self.cancel_owner_lock = getattr(self, "cancel_owner_lock", threading.RLock())
+        self._batch_cancel_epoch = 0
+        self._cancel_pipe_write = None
+        self._batch_cancel_enabled = (env or os.environ).get("STRATA_BATCH_CANCEL_PIPE") == "1"
+        cancel_read = None
+        cancel_spawn = {}
+        if os.name != "nt" and self._batch_cancel_enabled:
+            cancel_read, self._cancel_pipe_write = os.pipe()
+            os.set_blocking(self._cancel_pipe_write, False)
+            env = {**(env or os.environ), "STRATA_CANCEL_FD": str(cancel_read)}
+            cancel_spawn["pass_fds"] = (cancel_read,)
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
-                              **pin)
-        except OSError:                                  # nothing started: the narrator stops, the log handle goes back
+                              **cancel_spawn, **pin)
+        except BaseException:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
+            self._close_cancel_pipe()
             if log:
                 self.log.close()
             raise
+        finally:
+            if cancel_read is not None:
+                os.close(cancel_read)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -1189,6 +1211,7 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
+            self._close_cancel_pipe()
             if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
                 try:
                     self.proc.kill()
@@ -1290,7 +1313,12 @@ class StrataEngine:
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+        if self._batch_cancel_enabled:
+            with self.cancel_owner_lock:
+                self.gen = self.__dict__.get("gen", 0) + 1
+                self._slot_cancel_owners, self._slot_cancel_tokens = {}, {}
+        else:
+            self.gen = self.__dict__.get("gen", 0) + 1
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -1479,7 +1507,41 @@ class StrataEngine:
 
     _running_cancel = None
 
-    def stop_if_running(self, cancel) -> None:
+    def _close_cancel_pipe(self):
+        lock = getattr(self, "cancel_owner_lock", None)
+        with lock or contextlib.nullcontext():
+            fd = getattr(self, "_cancel_pipe_write", None)
+            self._cancel_pipe_write = None
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+
+    def _bstop_command(self, slot, owner=None):
+        epoch = getattr(owner[3], "epoch", 0) if owner is not None else 0
+        return f"BSTOP {slot} {epoch}" if epoch else f"BSTOP {slot}"
+
+    def _try_cancel_pipe(self, cancel, owner):
+        # Caller holds only the short owner lock, never the large stdin writer lock.
+        slot, born, proc, token = owner
+        fd = getattr(self, "_cancel_pipe_write", None)
+        if (not getattr(token,"epoch",0) or fd is None or
+                str((self.info or {}).get("batch_cancel_fd",0)) != "1"):
+            return False
+        message = (self._bstop_command(slot,owner)+"\n").encode("ascii")
+        assert len(message) <= 128  # atomic pipe write, far below PIPE_BUF
+        try:
+            while True:
+                try: written = os.write(fd,message); break
+                except InterruptedError: continue
+            if written != len(message):
+                self._close_cancel_pipe()  # never leave a partial frame for a later owner's message
+                return False
+        except (OSError, ValueError) as exc:  # closed/full/nonblocking channel: explicit epoch-tagged stdin fallback
+            if not isinstance(exc, BlockingIOError): self._close_cancel_pipe()
+            return False
+        return True
+
+    def _stop_if_running_legacy(self, cancel) -> None:
         """The client of the request the engine is running (its `cancel`) hung up: STOP now, from the watcher's thread -
         not at the request thread's next engine line (a token, or a prompt chunk 0.1-0.3 s later).  The request thread
         still drains to DONE as before."""
@@ -1507,8 +1569,53 @@ class StrataEngine:
                     self.proc.stdin.flush()
             except (OSError, AttributeError):
                 pass
+            return
+        # Wake only ownerless slot admission waiters. Release wlock before
+        # acquiring slot_cv; active and stale native owners returned above.
+        cv = getattr(self, "slot_cv", None)
+        if cv is not None and cancel.is_set():
+            with cv:
+                if cancel in getattr(self, "_slot_admission_waiters", ()):
+                    cv.notify_all()
 
-    def _send_owned_batch(self, text, cancel, slot, born):
+    def stop_if_running(self, cancel) -> None:
+        if not getattr(self, "_batch_cancel_enabled", False):
+            return self._stop_if_running_legacy(cancel)
+        lock = getattr(self,"cancel_owner_lock",None)
+        with lock or contextlib.nullcontext():
+            owner = getattr(self,"_slot_cancel_owners",{}).get(cancel)
+            if owner is not None:
+                slot,born,proc,token=owner
+                current=getattr(self,"_slot_cancel_tokens",{}).get(slot)
+                if (current is token and self.gen==born and self.proc is proc and self.can_stop and self.alive()):
+                    if self._try_cancel_pipe(cancel,owner): return
+                else: return
+        # Queued/lazy requests have no native owner. Never wait behind another
+        # request's large stdin write, and no writer lock exists before READY.
+        if owner is None and (self._running_cancel is not cancel or not self.can_stop or not self.alive()):
+            return
+        write_lock = getattr(self,"wlock",None)
+        if write_lock is None: return
+        # Fallback retains the old stdin serialization, but carries the exact epoch.
+        with write_lock:
+            with lock or contextlib.nullcontext():
+                owner=getattr(self,"_slot_cancel_owners",{}).get(cancel)
+                if owner is not None:
+                    slot,born,proc,token=owner
+                    if (getattr(self,"_slot_cancel_tokens",{}).get(slot) is token and
+                            self.gen==born and self.proc is proc and self.can_stop and self.alive()):
+                        try:
+                            proc.stdin.write(self._bstop_command(slot,owner)+"\n");proc.stdin.flush()
+                        except (OSError,AttributeError): pass
+                    return
+            if self._running_cancel is cancel and self.can_stop and self.alive():
+                try:
+                    self.proc.stdin.write("STOP\n");self.proc.stdin.flush()
+                except (OSError,AttributeError): pass
+
+
+
+    def _send_owned_batch_legacy(self, text, cancel, slot, born):
         """Publish a pinned slot owner and its BGEN atomically against watcher BSTOP.
 
         Q36's per-worker input accepts BSTOP during admission as well as decode.
@@ -1539,7 +1646,64 @@ class StrataEngine:
                 raise EngineDied("the engine stopped before this request was sent") from None
             return owner
 
-    def _forget_batch_owner(self, cancel, owner):
+    def _send_owned_batch(self, text, cancel, slot, born):
+        if not getattr(self, "_batch_cancel_enabled", False):
+            return self._send_owned_batch_legacy(text, cancel, slot, born)
+        """Publish a pinned slot owner and its BGEN atomically against watcher BSTOP.
+
+        Q36's per-worker input accepts BSTOP during admission as well as decode.
+        Other batch engines retain their existing admission cancellation protocol.
+        """
+        with self.wlock:
+            if cancel.is_set():
+                return None
+            if self.gen != born or not self.alive():
+                raise EngineDied("the engine changed before this request was sent")
+            epoch = 0
+            if self._batch_cancel_enabled and str((self.info or {}).get("batch_cancel_epoch",0)) == "1":
+                self._batch_cancel_epoch = getattr(self,"_batch_cancel_epoch",0) + 1
+                if self._batch_cancel_epoch >= 2**63: raise EngineDied("cancel epoch exhausted; restart the engine")
+                epoch = self._batch_cancel_epoch
+                parts=text.split(" ",3)
+                if len(parts)!=4: raise EngineDied("bad batch command for cancellation epoch")
+                text=" ".join(parts[:3])+f" cancel_epoch={epoch} "+parts[3]
+            owner = (slot, born, self.proc, _BatchCancelToken(epoch))
+            if str((self.info or {}).get("batch_pinned", 0)) == "1" or epoch:
+                if not hasattr(self, "_slot_cancel_owners"):
+                    self._slot_cancel_owners, self._slot_cancel_tokens = {}, {}
+                with getattr(self,"cancel_owner_lock",None) or contextlib.nullcontext():
+                    if self.gen != born or self.proc is not owner[2]:
+                        raise EngineDied("the engine changed during batch publication")
+                    if cancel.is_set(): return None
+                    self._slot_cancel_owners[cancel] = owner
+                    self._slot_cancel_tokens[slot] = owner[3]
+            try:
+                self.proc.stdin.write(text + "\n")
+                self.proc.stdin.flush()
+            except (OSError, AttributeError):
+                # The caller has not received owner yet, so undo publication here.
+                with getattr(self,"cancel_owner_lock",None) or contextlib.nullcontext():
+                    owners = getattr(self, "_slot_cancel_owners", {})
+                    tokens = getattr(self, "_slot_cancel_tokens", {})
+                    if owners.get(cancel) is owner: owners.pop(cancel, None)
+                    if tokens.get(slot) is owner[3]: tokens.pop(slot, None)
+                raise EngineDied("the engine stopped before this request was sent") from None
+            return owner
+
+    def _bind_active_batch_owner(self, cancel, owner):
+        if not getattr(self, "_batch_cancel_enabled", False): return
+        if owner is None: raise EngineDied("active batch slot has no admission owner")
+        slot,born,proc,token=owner
+        lock=getattr(self,"cancel_owner_lock",None)
+        with lock or contextlib.nullcontext():
+            if self.gen!=born or self.proc is not proc or not self.alive():
+                raise EngineDied("the engine changed before batch activation")
+            if not hasattr(self,"_slot_cancel_owners"):
+                self._slot_cancel_owners,self._slot_cancel_tokens={},{}
+            self._slot_cancel_owners[cancel]=owner;self._slot_cancel_tokens[slot]=token
+        if cancel.is_set(): self.stop_if_running(cancel)
+
+    def _forget_batch_owner_legacy(self, cancel, owner):
         if owner is None:
             return
         with self.wlock:
@@ -1549,6 +1713,15 @@ class StrataEngine:
                 owners.pop(cancel, None)
             if tokens.get(owner[0]) is owner[3]:
                 tokens.pop(owner[0], None)
+
+    def _forget_batch_owner(self, cancel, owner):
+        if not getattr(self, "_batch_cancel_enabled", False):
+            return self._forget_batch_owner_legacy(cancel, owner)
+        if owner is None: return
+        with getattr(self,"cancel_owner_lock",None) or contextlib.nullcontext():
+            owners=getattr(self,"_slot_cancel_owners",{});tokens=getattr(self,"_slot_cancel_tokens",{})
+            if owners.get(cancel) is owner: owners.pop(cancel,None)
+            if tokens.get(owner[0]) is owner[3]: tokens.pop(owner[0],None)
 
     HAVE_ADMISSION_WAIT_S = 300.0   # queued behind a legal long prefill, not a silent native HAVE reply
 
@@ -1664,6 +1837,55 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    def speak(self, ids, max_frames: int, keys: str, cancel: threading.Event, codes: list | None = None):
+        """local (Indra's Mirror): LFM3-Omni speech out - `GENA <max_frames> [keys] ids` (xolotl-lfm3; the prompt is the
+        model's "tts" template).  Yields 16-bit little-endian PCM chunks (24 kHz mono) as the engine makes them; `codes`
+        (a list) collects each frame's 12 audio codes when keys asks for codes=1.  The caller holds the FIFO.  A
+        consumer that stops early (or `cancel`) sends STOP and reads the request to its DONE."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
+        self._send(f"GENA {int(max_frames)}{keys} {','.join(str(int(t)) for t in ids)}")
+        done = False
+        silence = max(float(self.silence_s or 0), 120.0)
+        try:
+            while True:
+                try:
+                    line = self.lines.get(timeout=silence)
+                except queue.Empty:
+                    done = True
+                    raise self._silent(f"the engine said nothing for {silence:.0f} s while speaking") from None
+                if line is None:
+                    done = True
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                if line.startswith("A "):
+                    if cancel.is_set():
+                        return
+                    parts = line.split(" ", 2)
+                    yield base64.b64decode(parts[2]) if len(parts) == 3 else b""
+                elif line.startswith("C ") and codes is not None:
+                    codes.append([int(x) for x in line[2:].split(",")])
+                elif line.startswith("DONE"):
+                    done = True
+                    self._parse_done(line)
+                    return
+                elif line.startswith("ERR"):
+                    done = True
+                    raise ValueError(line[4:].strip())
+        finally:
+            if not done:                                  # stopped early: STOP, then read to DONE (bounded)
+                try:
+                    self._send("STOP")
+                except EngineDied:
+                    pass
+                deadline = time.monotonic() + silence
+                while time.monotonic() < deadline:
+                    try:
+                        line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
+                    except queue.Empty:
+                        break
+                    if line is None or line.startswith(("DONE", "ERR")):
+                        break
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1932,20 +2154,28 @@ class StrataEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, cancel_owner=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+            with self.slot_cv:
+                self.slot_claims.discard(slot)
             return
         try:
-            self._send(f"BSTOP {slot}")
+            self._send(self._bstop_command(slot,cancel_owner))
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
         releasing = self.slot_releasing
         histories = getattr(self, "slot_histories", None)
-        releasing.add(slot)
+        with self.slot_cv:
+            # #100: hand the slot from the request's claim to this BDONE wait in one step, before the wait can run.
+            # A reply that ended on its stop token has its BDONE queued already, so the wait frees the slot at once and
+            # the next request claims it; the caller used to drop "its" claim after this returned - the NEW owner's -
+            # and #1603's reaper then freed a slot that was decoding, so a third request got BGEN refusals and a 503.
+            releasing.add(slot)
+            self.slot_claims.discard(slot)
 
         def wait():
             end = time.monotonic() + 600.0
@@ -2278,9 +2508,17 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
-                                    wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
-                                    self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                if self.pick_slot(prompt) is None and not cancel.is_set():
+                                    # Membership and the cancel predicate share the condition lock.
+                                    # A watcher cannot notify between publication and wait's
+                                    # atomic release, so cancellation cannot lose its wakeup.
+                                    waiters = self.__dict__.setdefault("_slot_admission_waiters", set())
+                                    waiters.add(cancel)
+                                    try:
+                                        wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
+                                        self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                    finally:
+                                        waiters.discard(cancel)
                             if cancel.is_set():
                                 return
                             if not holding:
@@ -2403,6 +2641,8 @@ class StrataEngine:
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
+                    if cont and str((self.info or {}).get("batch_pinned", 0)) != "1":
+                        self._bind_active_batch_owner(cancel, cancel_owner)
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -2424,7 +2664,7 @@ class StrataEngine:
                         line = self.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
                         if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
+                            self._send(self._bstop_command(slot,cancel_owner))
                             stop_sent = True
                         yield None
                         continue
@@ -2437,15 +2677,18 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send(f"BSTOP {slot}")
+                                self._send(self._bstop_command(slot,cancel_owner))
                                 stop_sent = True
                             continue
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                            self._send(self._bstop_command(slot,cancel_owner))         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
+                        if getattr(self, "_batch_cancel_enabled", False):
+                            self._forget_batch_owner(cancel, cancel_owner)
+                            cancel_owner = None
                         phase = "none"
                         slot_completed = True
                         f = line.split()
@@ -2528,8 +2771,7 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    self._release_slot_when_done(slot, stream, cancel_owner)    # freed at its BDONE (it takes the claim)
                 else:
                     with self.slot_cv:
                         if self.gen == born and slot_completed:
@@ -2982,6 +3224,7 @@ class StrataEngine:
         a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
         EngineStuck when it still runs after all three."""
         if self.proc is None:
+            self._close_cancel_pipe()
             return
         deep_sleep.end(self)                             # a checkpointed engine cannot free its memory itself
         try:
@@ -3006,6 +3249,7 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                self._close_cancel_pipe()
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:
@@ -3361,12 +3605,22 @@ class Vision:
             return False
 
     @staticmethod
+    def is_av(data: bytes) -> bool:
+        """Audio (WAV, MP3, FLAC, Ogg) or video (MP4/MOV, WebM/MKV, AVI) by its first bytes: only an encoder whose
+        mmproj has an audio tower or reads video (LFM3-Omni's, `"vision": {"av": true}`) is sent these."""
+        return (data[:4] == b"RIFF" and data[8:12] in (b"WAVE", b"AVI ")) or data[:3] == b"ID3" or \
+            (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0) or data[:4] in (b"fLaC", b"OggS") or \
+            data[4:8] == b"ftyp" or data[:4] == b"\x1aE\xdf\xa3"
+
+    @staticmethod
     def normalize(data: bytes) -> bytes:
         """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
+            return data
+        if Vision.is_av(data):          # audio / video for an omni encoder (xolotl-lfm3-vision): mtmd reads it as it is
             return data
         try:
             import io
@@ -4487,11 +4741,17 @@ class Service:
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.voice_servers: dict = {}                    # local (Indra's Mirror): lazily-started ASR/TTS sidecars
+        self.speech_cfg: dict | None = None              # local: the engine speaks itself (LFM3-Omni, "speech" block)
+        self.asr_native: dict | None = None              # local: the model transcribes itself ("asr_native" block)
+        self.port = 0
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.hide_ids: set[int] = set()               # local: config "hide_tokens" - control tokens kept out of the reply text
+        self.thinking_model = True                    # local: config "thinking": false = a model that never thinks (LFM3-Omni):
+                                                      # its reply is content from the first token, whatever the request asks
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.structured_compact = False                 # config: no inter-token JSON whitespace
@@ -4515,6 +4775,7 @@ class Service:
         # the config's "preserve_thinking" (true / false): the template flag's default for requests that do not set it
         # in chat_template_kwargs; None leaves the template's own default
         self.preserve_thinking = None
+        self.add_vision_id = None                       # opt-in template default; each request's boolean flag wins
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -4669,14 +4930,25 @@ class Service:
             self.admission_reserved -= 1
             self.admission_changed.notify_all()
 
-    def note_client_disconnect(self, cancel: threading.Event) -> None:
+    def note_client_disconnect(self, cancel: threading.Event, signalled=False) -> None:
         """Cancel once; count only work that was still queued or active when the client left."""
+        if not getattr(self.engine, "_batch_cancel_enabled", False):
+            with self.status_lock:
+                if not cancel.is_set():
+                    request_id = getattr(cancel, "_strata_request_id", None)
+                    active = request_id in self.terminal_requests
+                    cancel.set()
+                    if active:
+                        self.client_disconnect_cancels += 1
+            return
         with self.status_lock:
-            if not cancel.is_set():
+            if signalled or not cancel.is_set():
                 request_id = getattr(cancel, "_strata_request_id", None)
                 active = request_id in self.terminal_requests
                 cancel.set()
-                if active:
+                counted=getattr(cancel,"_strata_disconnect_counted",False)
+                cancel._strata_disconnect_counted=True
+                if active and not counted:
                     self.client_disconnect_cancels += 1
 
     @contextlib.contextmanager
@@ -5081,6 +5353,46 @@ class Service:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
+
+    # local (Indra's Mirror): LFM3-Omni's own speech (the config's "speech" block) - the model's "tts" chat template
+    TTS_LANGS = {"ar": "Arabic", "da": "Danish", "de": "German", "el": "Greek", "en": "American English",
+                 "en-us": "American English", "en-gb": "British English", "fi": "Finnish", "fr": "French",
+                 "he": "Hebrew", "it": "Italian", "ja": "Japanese", "ko": "Korean", "nl": "Dutch", "pl": "Polish",
+                 "pt": "Portuguese", "es": "Spanish", "sv": "Swedish", "tr": "Turkish", "zh": "Chinese"}
+
+    def tts_ids(self, text: str, language: str | None = None, voice: str | None = None) -> list[int]:
+        """The prompt of LFM3-Omni's "tts" template (tokenizer.chat_template.tts): a system line naming the language
+        and voice, the text as the user turn, the assistant turn opened with <|audio_start|>.  A voice other than
+        female / male (an OpenAI name such as "alloy", a cloned-voice name) is the config's default voice."""
+        cfg = self.speech_cfg or {}
+        code = (language or cfg.get("language") or "en").lower()
+        lang = self.TTS_LANGS.get(code, language or "American English")
+        v = (voice or "").lower()
+        if v not in ("female", "male"):
+            v = str(cfg.get("voice") or "female").lower()
+        prompt = (f"<|startoftext|><|im_start|>system\nPerform TTS in {lang} using a {v} voice.<|im_end|>\n"
+                  f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think></think><|audio_start|>")
+        return self.tok.encode(prompt, parse_special=True)
+
+    def speak(self, text: str, language=None, voice=None, max_frames=None, sampling=None, cancel=None, codes=None):
+        """Yields 16-bit PCM chunks of `text` spoken by the engine (GENA), holding the FIFO for the whole utterance."""
+        if not hasattr(self.engine, "speak"):
+            raise ValueError("this engine cannot speak")
+        ids = self.tts_ids(text, language, voice)
+        cfg = self.speech_cfg or {}
+        frames = int(max_frames or cfg.get("max_frames", 1500))
+        keys = ""
+        for k in ("temperature", "top_k", "penalty_repeat", "penalty_last_n", "seed"):
+            if (sampling or {}).get(k) is not None:
+                keys += f" {k}={sampling[k]}"
+        if codes is not None:
+            keys += " codes=1"
+        cancel = cancel or threading.Event()
+        self.last_request_at = time.time()
+        with self.fifo:
+            self.ensure_loaded()
+            yield from self.engine.speak(ids, frames, keys, cancel, codes)
+        self.last_request_at = time.time()
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -5653,6 +5965,8 @@ class Service:
         kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
         if self.preserve_thinking is not None and "preserve_thinking" not in kwargs:
             kwargs = {**kwargs, "preserve_thinking": self.preserve_thinking}   # the config's default for the flag
+        if self.add_vision_id is not None and "add_vision_id" not in kwargs:
+            kwargs = {**kwargs, "add_vision_id": self.add_vision_id}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -5897,7 +6211,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
+        if force and (not self.thinking_model or kwargs.get("enable_thinking", True) is False):
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
@@ -6034,7 +6348,7 @@ class Service:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        return ids, self.thinking_model and kwargs.get("enable_thinking", True) is not False, max_new
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
@@ -6466,7 +6780,7 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                piece = detok.push(t)
+                                piece = detok.push(t) if t not in self.hide_ids else ""   # local: config "hide_tokens"
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -7749,11 +8063,21 @@ def make_handler(svc: Service):
                     except (OSError, ValueError):            # the socket was closed here: the request has ended
                         return
                     if gone and not done.is_set():
-                        self._note(outcome="disconnected")
-                        svc.note_client_disconnect(cancel)
+                        if not getattr(svc.engine, "_batch_cancel_enabled", False):
+                            self._note(outcome="disconnected")
+                            svc.note_client_disconnect(cancel)
+                            stopper = getattr(svc.engine, "stop_if_running", None)
+                            if stopper is not None:
+                                stopper(cancel)
+                            return
+                        newly_signalled = not cancel.is_set()
+                        cancel.set()  # critical signal precedes status/monitor accounting locks
                         stopper = getattr(svc.engine, "stop_if_running", None)
-                        if stopper is not None:
-                            stopper(cancel)
+                        try:
+                            if stopper is not None: stopper(cancel)
+                        finally:
+                            self._note(outcome="disconnected")
+                            svc.note_client_disconnect(cancel, signalled=newly_signalled)
                         return
                     done.wait(WATCH_CLIENT_S)                # bytes to read (not a hang-up): look again later
 
@@ -7845,6 +8169,122 @@ def make_handler(svc: Service):
             finally:
                 server.touch()
             self._raw(status, out, ctype)
+
+        def _speech_native(self):
+            """local (Indra's Mirror): POST /v1/audio/speech spoken by the engine itself (LFM3-Omni, GENA).  OpenAI body:
+            input, voice (female / male; other names = the config's voice), response_format wav (default) or pcm
+            (16-bit little-endian, 24 kHz mono, as OpenAI's), stream; also language / lang, seed, temperature,
+            max_frames.  pcm, and wav with "stream": true, are written as the frames are made."""
+            try:
+                req = json.loads(self._body() or b"{}")
+            except (ValueError, BadBody) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": f"bad JSON body: {e}"}})
+                return
+            text = req.get("input") or req.get("prompt") or ""
+            if not isinstance(text, str) or not text.strip():
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "\"input\" must be a non-empty string"}})
+                return
+            fmt = str(req.get("response_format") or "wav").lower()
+            if fmt not in ("wav", "pcm"):
+                self._json(400, {"error": {"type": "invalid_request_error",
+                                           "message": "response_format: this server makes wav or pcm"}})
+                return
+            sampling = {k: req.get(k) for k in ("temperature", "top_k", "seed")}
+            cancel = threading.Event()
+            chunks = svc.speak(text.strip(), req.get("language") or req.get("lang"), req.get("voice"),
+                               req.get("max_frames"), sampling, cancel)
+            stream = fmt == "pcm" or bool(req.get("stream"))
+            rate = 24000
+            def wav_header(n_bytes):
+                return (b"RIFF" + struct.pack("<I", (36 + n_bytes) & 0xFFFFFFFF) + b"WAVEfmt " +
+                        struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + b"data" + struct.pack("<I", n_bytes & 0xFFFFFFFF))
+            try:
+                if not stream:
+                    pcm = b"".join(chunks)
+                    self._raw(200, wav_header(len(pcm)) + pcm, "audio/wav")
+                    return
+                first = next(chunks, b"")                # an error before any audio is still an HTTP error
+                self.send_response(200)
+                self.send_header("Content-Type", f"audio/pcm;rate={rate};encoding=signed-int;bits=16" if fmt == "pcm" else "audio/wav")
+                self._cors()
+                self.end_headers()
+                if fmt == "wav":
+                    self.wfile.write(wav_header(0xFFFFFFFF - 36))
+                for c in itertools.chain([first], chunks):
+                    if c:
+                        self.wfile.write(c)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                cancel.set()
+                chunks.close()
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except EngineDied as e:
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+
+        def _asr_native(self):
+            """local (Indra's Mirror): POST /v1/audio/transcriptions by the model itself (LFM3-Omni: system "Perform ASR
+            in <language>.", the clip as input_audio) - a chat completion on this server.  multipart/form-data with
+            `file` (+ `language`, `prompt`, `response_format` json | text), or JSON {"file": base64, "format": "wav"}."""
+            try:
+                body = self._body()
+            except BadBody as e:
+                self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            ctype = self.headers.get("Content-Type", "")
+            fields: dict = {}
+            audio, fmt = b"", "wav"
+            if ctype.startswith("multipart/form-data"):
+                import email.parser, email.policy
+                msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                    b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body)
+                for part in msg.iter_parts():
+                    name = part.get_param("name", header="content-disposition")
+                    data = part.get_payload(decode=True) or b""
+                    if name == "file":
+                        audio = data
+                        fn = part.get_filename() or ""
+                        fmt = fn.rsplit(".", 1)[-1].lower() if "." in fn else "wav"
+                    elif name:
+                        fields[name] = data.decode("utf-8", "replace")
+            else:
+                try:
+                    j = json.loads(body or b"{}")
+                    audio = base64.b64decode(j.get("file") or "")
+                    fmt = j.get("format") or "wav"
+                    fields = {k: str(v) for k, v in j.items() if k not in ("file", "format")}
+                except (ValueError, TypeError) as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": f"bad body: {e}"}})
+                    return
+            if not audio:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "no audio (\"file\")"}})
+                return
+            cfg = svc.asr_native or {}
+            code = (fields.get("language") or cfg.get("language") or "en").lower()
+            lang = {"en": "English"}.get(code) or Service.TTS_LANGS.get(code, fields.get("language") or "English").replace("American ", "").replace("British ", "")
+            chat = {"model": svc.model, "temperature": 0, "max_tokens": int(cfg.get("max_tokens", 1024)), "stream": False,
+                    "messages": [{"role": "system", "content": f"Perform ASR in {lang}."},
+                                 {"role": "user", "content": [{"type": "input_audio", "input_audio": {
+                                     "data": base64.b64encode(audio).decode(), "format": fmt}}]}]}
+            try:
+                hdr = {"Content-Type": "application/json"}
+                if svc.api_key:
+                    hdr["Authorization"] = f"Bearer {svc.api_key}"
+                r = urllib.request.Request(f"http://127.0.0.1:{svc.port}/v1/chat/completions", data=json.dumps(chat).encode(),
+                                           headers=hdr, method="POST")
+                with urllib.request.urlopen(r, timeout=float(cfg.get("timeout_s", 300))) as resp:   # noqa: S310 - our own port
+                    out = json.loads(resp.read())
+                text = (out["choices"][0]["message"].get("content") or "").strip()
+            except urllib.error.HTTPError as e:
+                self._raw(e.code, e.read(), e.headers.get("Content-Type", "application/json"))
+                return
+            except (OSError, ValueError, KeyError, IndexError) as e:
+                self._json(502, {"error": {"type": "server_error", "message": f"transcription failed: {e}"}})
+                return
+            if (fields.get("response_format") or "json") == "text":
+                self._raw(200, text.encode(), "text/plain; charset=utf-8")
+            else:
+                self._json(200, {"text": text})
 
         def _authorized(self) -> bool:
             if not svc.api_key:
@@ -8274,6 +8714,12 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
             if path.startswith("/v1/") and self._foreign_page():
+                return
+            if path == "/v1/audio/speech" and svc.speech_cfg is not None:    # local: the engine speaks (LFM3-Omni)
+                self._speech_native()
+                return
+            if path == "/v1/audio/transcriptions" and svc.asr_native is not None:   # local: the model transcribes
+                self._asr_native()
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
                 self._audio(path)
@@ -10193,6 +10639,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             "Thinking about it.</think>\n\nHello from the mock engine."],
             cycle=getattr(a, "script_cycle", False),
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
+    # the model's image marker: the token its chat template writes after <|vision_start|> for each picture (Qwen's
+    # <|image_pad|>; LFM3's <|image|>), expanded to one token per encoder row
+    global IMAGE_PAD
+    IMAGE_PAD = cfg.get("image_pad") or IMAGE_PAD
+    if isinstance(cfg.get("vision"), dict) and cfg["vision"].get("av"):   # audio / video parts to the same encoder
+        from serve import frontend as _fe
+        _fe.IMAGE_PARTS = _fe.IMAGE_PARTS + _fe.AV_PARTS
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     if (cfg.get("arch") or "") == "deepseek41":
@@ -10205,6 +10658,16 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
+    for marker in cfg.get("hide_tokens") or ():        # local: control tokens that must not show in replies (LFM3's <|text_end|>)
+        got = tok.encode(str(marker), parse_special=True)
+        if len(got) == 1:
+            svc.hide_ids.add(int(got[0]))
+        else:
+            print(f"[strata] hide_tokens: {marker!r} is not one token - ignored")
+    if cfg.get("thinking") is False:                    # local: a non-reasoning model (LFM3-Omni)
+        svc.thinking_model = False
+    if cfg.get("bos_token"):                             # local: a template that opens with bos_token (LFM3)
+        svc.template.bos_token = str(cfg["bos_token"])
     svc.launch_attestation = launch_attestation
     svc.structured_compact = cfg.get("structured_compact") is True   # xolotl
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
@@ -10354,6 +10817,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.repeat_stop_tokens = rs
     if isinstance(cfg.get("preserve_thinking"), bool):
         svc.preserve_thinking = cfg["preserve_thinking"]
+    if isinstance(cfg.get("add_vision_id"), bool):
+        svc.add_vision_id = cfg["add_vision_id"]
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
@@ -10415,6 +10880,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if cfg.get("vision") and cfg["vision"].get("lazy"):    # local: lazy vision
         svc.start_lazy_vision(int(cfg["vision"].get("lazy_reserve_mib", 2400)),
                               float(cfg["vision"].get("lazy_idle_s", 300)))
+    svc.port = bound_port
+    if isinstance(cfg.get("speech"), dict):                # local: the engine's own speech (xolotl-lfm3 GENA)
+        svc.speech_cfg = cfg["speech"]
+    if isinstance(cfg.get("asr_native"), dict):            # local: the model's own transcription (LFM3-Omni)
+        svc.asr_native = cfg["asr_native"]
     voice_cfg = cfg.get("voice") or {}                     # local: the voice sidecar (ASR/TTS)
     if voice_cfg:
         servers = {kind: VoiceServer(kind, voice_cfg[kind]) for kind in ("asr", "tts")

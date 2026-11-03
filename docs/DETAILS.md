@@ -494,6 +494,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | Key | Default | Effect |
 | --- | --- | --- |
 | `reasoning_effort` | model default (high) | Level for requests that name none. The engine has no such option; `--reasoning-effort` in `"args"` is moved here with a note. A request's level and the web page's shared Chat settings win. |
+| `add_vision_id` | template default | `true` asks supporting templates to number pictures and videos, such as `Picture 1:`. OpenAI chat requests can override it with a boolean `chat_template_kwargs.add_vision_id`, including `false`. Labels become part of the rendered prompt and its prefix-cache identity; enabling them uses extra context positions. Absent or non-boolean config values leave the template default unchanged. |
 | `reasoning_budget_tokens` | `0` (no budget) | Caps the thinking at N tokens: the server ends it with a short wrap-up line and `</think>` and the model answers from there. The wrap-up counts as output tokens. A request's own `reasoning_budget_tokens` (or llama.cpp's `thinking_budget_tokens`) wins. |
 | `answer_room` | on | A request with thinking on, no budget and `max_tokens` of 1,024 or more gets one: thinking is wrapped up when a quarter of the cap (at least 512 tokens) is left. Requests without `max_tokens` get three quarters of the context. `false` turns it off. Clients should not cap the reply far below what the context allows. |
 | `reasoning_close_retry` | off | Closes the thinking once and continues when a reply ended inside its thinking with no answer and no tool call (#1053). |
@@ -787,6 +788,8 @@ system prompt with a billing header that changes on every request; the server pi
 | --- | --- |
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
 | `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
+| `--conversation-share-checkpoints` (opt-in) | Share completed immutable host checkpoint payloads while parking; single GPU, off by default. Live state and K/V still copy. |
+| `--prompt-cache-branch` (opt-in) | Learn one suffix-edit checkpoint after reading to the divergence; single GPU, off by default. |
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
@@ -795,6 +798,30 @@ system prompt with a billing header that changes on every request; the server pi
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
 | `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
+
+**Sharing completed checkpoint state (opt-in).** `--conversation-share-checkpoints` on a single GPU shares the
+already completed host payloads of recurrent/indexer checkpoints when parking a conversation, instead of copying
+the same immutable checkpoint chain for every branch. Token/image metadata, use stamps and pins remain independent.
+Ordinary checkpoint copies still copy their bytes; only this explicit capture option shares storage. A mutable
+access detaches before writing, so keeping a branch never changes an older checkpoint. A published payload remains
+immutable even after every other alias is released; reference counts never grant permission to write it. The cache budget
+charges the full payload capacity per alias, including its storage header, conservatively rather than discounting
+shared allocations. The newly captured live state and all positional K/V still use the normal copy path.
+Session file bytes and restore rules are unchanged. The option is off by default and does not enable token-based K/V-copy skipping.
+**Replaced suffixes inside a message (opt-in).** `--prompt-cache-branch` on a single GPU learns where a request
+diverged from a cached conversation, including edits inside the last user message. On the first edit the engine
+still restores an existing checkpoint and reads the intervening tokens. When that read reaches the common-prefix
+boundary, it saves a new complete running-state checkpoint there. A later edit at the same boundary can reuse it
+through the normal token/image checks, without replaying the unchanged gap from a coarse periodic checkpoint.
+Only one learned point is added per request, within the existing `--prompt-cache` count and conversation-cache
+budget; it does not create a dense checkpoint grid over the context. A shared prefix below 8,192 tokens or less
+than 64 tokens beyond an existing reusable checkpoint is left alone. A changed picture clamps the common prefix
+to that picture's first cell, even when its pad token IDs match. This does not reuse a recurrent state merely
+because tokens match: the new state is captured only after actually reading to that position, and its positional
+K/V is maintained by the existing cache rules. The option is off by default, is not applied to layer-split runs,
+and `strata_checkpoint: false` disables it for that request. It adds a prompt-read boundary, so floating-point
+rounding can differ from an unsplit read. `STRATA_CACHE_BRANCH_TRACE=1` logs the planned and saved token positions
+to stderr as `STRATA_CACHE_BRANCH` JSON records, without prompt content.
 
 The RAM figure the floor is checked against is the smallest of `MemAvailable`, the room under each cgroup limit visible to
 the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less clean inactive file cache) and the

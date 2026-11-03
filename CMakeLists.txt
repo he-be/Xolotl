@@ -177,6 +177,11 @@ option(STRATA_DENSE "Build strata-dense, the Qwen3.8-27B dense GGUF engine (CUDA
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
+  find_package(Threads REQUIRED)
+  add_executable(shared_bytes_test src/core/shared_bytes_test.cpp)
+  target_include_directories(shared_bytes_test PRIVATE include)
+  target_link_libraries(shared_bytes_test PRIVATE Threads::Threads)
+  add_test(NAME shared_bytes_test COMMAND shared_bytes_test)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
@@ -344,7 +349,7 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
   find_package(Threads REQUIRED)
-  foreach(q36_cpu_test IN ITEMS test_q36_cache_hub test_q36_cache_hub_concurrency test_q36_kv_vmm test_q36_resident_prefix test_q36_resident_verify test_q36_resident_provenance)
+  foreach(q36_cpu_test IN ITEMS test_q36_cache_hub test_q36_cache_hub_concurrency test_q36_kv_vmm test_q36_resident_prefix test_q36_resident_verify test_q36_resident_provenance test_q36_snapshot_owner)
     add_executable(${q36_cpu_test} tests/qwen35/${q36_cpu_test}.cpp)
     target_link_libraries(${q36_cpu_test} PRIVATE Threads::Threads)
     # These portable tests use assert(), including Release configurations.
@@ -1838,6 +1843,9 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(split_ring_test PRIVATE include)
   add_test(NAME split_ring_test COMMAND split_ring_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
+  add_executable(branch_boundary_test src/program/branch_boundary_test.cpp)
+  target_include_directories(branch_boundary_test PRIVATE include)
+  add_test(NAME branch_boundary_test COMMAND branch_boundary_test)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
@@ -2017,9 +2025,18 @@ if(STRATA_NATIVE_EXPERTS)
     execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${_xolotl_ggml_parent}
                             git apply --reverse --check ${_xolotl_ggml_patch} WORKING_DIRECTORY ${STRATA_GGML_DIR}
                     RESULT_VARIABLE _xolotl_patched OUTPUT_QUIET ERROR_QUIET)
+    # the check re-runs whenever the patch changes (a pull that updates it reconfigures the build), and a stale tree
+    # stops here with the fix instead of failing later on an op the old patch did not add
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_xolotl_ggml_patch})
     if(NOT _xolotl_patched EQUAL 0)
-      message(WARNING "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry tools/xolotl/ggml/xolotl-ggml.patch - "
-                      "the build may fail or differ (tools/xolotl/fetch-llama.sh makes a patched checkout)")
+      if(STRATA_GGML_ALLOW_UNPATCHED)
+        message(WARNING "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry the current tools/xolotl/ggml/xolotl-ggml.patch "
+                        "(STRATA_GGML_ALLOW_UNPATCHED=ON: building anyway; it may fail or differ)")
+      else()
+        message(FATAL_ERROR "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry the current tools/xolotl/ggml/xolotl-ggml.patch "
+                            "(an older patch, e.g. from before a pull). Fix: bash tools/xolotl/fetch-llama.sh ${STRATA_GGML_DIR} "
+                            "(or -DSTRATA_GGML_ALLOW_UNPATCHED=ON to build it as it is)")
+      endif()
     endif()
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
@@ -2973,4 +2990,12 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
+endif()
+
+# LFM3 / LFM3-Omni (Liquid AI) behind the serve protocol: llama.cpp's LFM3 graph on ggml-backend (CUDA + CPU fallback),
+# src/program/lfm3_main.cpp.  Needs the CUDA ggml backend (STRATA_GGML_CUDA) and strata_kernels' sampler.
+if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
+  add_executable(xolotl-lfm3 src/program/lfm3_main.cpp)
+  target_include_directories(xolotl-lfm3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-lfm3 PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
 endif()
