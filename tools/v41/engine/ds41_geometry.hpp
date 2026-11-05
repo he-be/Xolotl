@@ -654,8 +654,24 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             add(mapn, { NE }, ty::I32);
             if (tm->type != ty::I32 || tm->shape.size() != 1 || tm->shape[0] != NE) return mapn + ": bad shape/type";
             const int32_t * mv = reinterpret_cast<const int32_t *>(m.shard(si).tensor_data(*tm));
+            // overlay (STRATA_GGUF_OVERLAY): the map sits over the base file's stacked tensor, which keeps all NE
+            // experts at its type; experts mapped to that type use their own index in it, the rest the overlay's
+            const TensorInfo * ob = m.find(b + "ffn_" + roles[0] + "_exps.weight");
+            const int obt = ob ? (int) ob->type : -1;
+            if (ob) {
+                if (!k) {
+                    const TensorInfo * tu = m.find(b + "ffn_up_exps.weight");
+                    if (!tu || tu->type != ob->type) return b + "ffn_up_exps.weight: missing or not its gate's type";
+                }
+                for (const char * r : roles) {
+                    if (!r) continue;
+                    const std::string n = b + "ffn_" + r + "_exps.weight";
+                    add(n, k ? std::vector<uint64_t>{ FF, D, NE } : std::vector<uint64_t>{ D, FF, NE }, ob->type);
+                    (k ? X.down_t : (std::strcmp(r, "gate") ? X.up_t : X.gate_t))[obt] = n;
+                }
+            }
             std::map<int, int> count;
-            for (uint64_t e = 0; e < NE; ++e) { tv[e] = mv[e]; sv[e] = count[mv[e]]++; }
+            for (uint64_t e = 0; e < NE; ++e) { tv[e] = mv[e]; sv[e] = mv[e] == obt ? (int) e : count[mv[e]]++; }
             for (const auto & [t, n] : count) {
                 // MXFP4 = an expert kept exactly as trained (the checkpoint's own FP4 bytes)
                 if (t != (int) ty::Q2_0 && t != (int) ty::Q3_K && t != (int) ty::PTQ1_0 && t != (int) ty::MXFP4)

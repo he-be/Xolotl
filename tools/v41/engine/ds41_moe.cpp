@@ -504,17 +504,22 @@ struct Gpu {
     /// run_chunk's MMQ on PTQ1_0: the run's ternary matrices transcoded to Q2_0 here (ds41_transcode, lossless)
     void* m_tc = nullptr;
     size_t m_tc_cap = 0;
+    /// run_chunk's resident experts gathered (device to device) into SL-strided runs, so they go through MMQ too
+    /// (their cache slots are scattered: one MMVQ launch otherwise, which re-reads each expert per token block)
+    void* m_res = nullptr;
+    size_t m_res_cap = 0;
 #if defined(DS4_MOE_MMQ)
     /// Created once and never destroyed: a binary that also links ggml-cuda (mimo_generate's dense backend) resolves
     /// ~ggml_backend_cuda_context to ggml-cuda's real one, which segfaults on the context strata_mmq built.
     strata::prefill::mmq::Context* m_ctx = nullptr;
 #endif
     void free_mmq() {
-        for (void* p : {m_gu, m_h, m_xg, m_xu, m_xd, m_bnd, m_iota, m_tc})
+        for (void* p : {m_gu, m_h, m_xg, m_xu, m_xd, m_bnd, m_iota, m_tc, m_res})
             if (p) cudaFree(p);
-        m_gu = m_h = m_xg = m_xu = m_xd = m_bnd = m_iota = m_tc = nullptr;
+        m_gu = m_h = m_xg = m_xu = m_xd = m_bnd = m_iota = m_tc = m_res = nullptr;
         m_rows = 0;
         m_tc_cap = 0;
+        m_res_cap = 0;
     }
 
     void close() {
@@ -5857,6 +5862,41 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         run_p.push_back((unsigned long long) gp.cache->device_slot(slot_e[(size_t) e]));
         ent_hit += cnt[(size_t) e];
     }
+#if defined(DS4_MOE_MMQ)
+    // STRATA_RES_MMQ_MIN (default 256 tokens; 0 = off): a chunk at least this wide copies its resident experts into
+    // m_res (STRATA_RES_MMQ_GIB, default 0.5) SL apart and multiplies them with MMQ like the streamed ones.  The
+    // scattered cache slots kept them on MMVQ, whose cost grows with the expert's bytes x its tokens: hot MXFP4
+    // experts (2.4x the IQ bytes) made 64K-context turns +16-33% slower when the VRAM cache held them (11/5).
+    static const int64_t res_min = [] { const char* e = std::getenv("STRATA_RES_MMQ_MIN"); return e ? std::atoll(e) : 256; }();
+    if (use_mmq && res_min > 0 && n >= res_min && !run_e.empty()) {
+        static const size_t res_cap = [] {
+            const char* e = std::getenv("STRATA_RES_MMQ_GIB");
+            return (size_t) ((e ? std::atof(e) : 0.5) * 1073741824.0);
+        }();
+        if (!gp.m_res && !gp.m_res_cap) {
+            if (cudaMalloc(&gp.m_res, res_cap) == cudaSuccess) gp.m_res_cap = res_cap;
+            else { (void) cudaGetLastError(); gp.m_res = nullptr; gp.m_res_cap = 1; }   // 1: tried, stay on MMVQ
+        }
+        const size_t K = gp.m_res ? gp.m_res_cap / (size_t) SL : 0;
+        if (K > 0) {
+            std::vector<int32_t> es;
+            std::vector<unsigned long long> ps;
+            for (size_t q0 = 0; q0 < run_e.size(); q0 += K) {
+                const size_t q1 = std::min(run_e.size(), q0 + K);
+                es.assign(run_e.begin() + (std::ptrdiff_t) q0, run_e.begin() + (std::ptrdiff_t) q1);
+                ps.clear();
+                for (size_t q = q0; q < q1; ++q) {   // same stream as the launches: a batch reuses m_res after them
+                    uint8_t* d = (uint8_t*) gp.m_res + (q - q0) * (size_t) SL;
+                    ck(cudaMemcpyAsync(d, (const void*) run_p[q], (size_t) BL, cudaMemcpyDeviceToDevice, gp.s), "res gather");
+                    ps.push_back((unsigned long long) d);
+                }
+                launch(es, ps);
+            }
+            run_e.clear();
+            run_p.clear();
+        }
+    }
+#endif
     launch(run_e, run_p);
     in_resident = false;
 

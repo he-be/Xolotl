@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -590,6 +591,18 @@ public:
         if (paths.empty()) throw std::runtime_error("GGUF: a model needs at least one shard");
         for (const auto& p : paths) shards_.push_back(std::make_unique<GgufFile>(p));
         validate_split();
+        // STRATA_GGUF_OVERLAY=<file>: an extra shard appended to the model its `overlay.base` names (the metadata
+        // shard's file name; any other model opened in the process ignores it).  Its tensor names must be new.
+        if (const char* ov = std::getenv("STRATA_GGUF_OVERLAY"); ov && ov[0]) {
+            auto o = std::make_unique<GgufFile>(std::string(ov));
+            const MetaValue* b = o->get("overlay.base");
+            const std::string& p0 = shards_[0]->path();
+            const std::string base0 = p0.substr(p0.find_last_of("/\\") == std::string::npos ? 0 : p0.find_last_of("/\\") + 1);
+            if (b && b->s == base0) {
+                std::fprintf(stderr, "gguf overlay: %s over %s (%zu tensors)%c", ov, base0.c_str(), o->tensors().size(), 10);
+                shards_.push_back(std::move(o));
+            }
+        }
         for (size_t i = 0; i < shards_.size(); ++i)
             for (const auto& t : shards_[i]->tensors()) {
                 const auto ins = index_.emplace(t.name, std::make_pair(i, &t));
