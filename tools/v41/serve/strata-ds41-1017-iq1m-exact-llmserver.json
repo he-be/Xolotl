@@ -54,8 +54,9 @@
     "STRATA_SERVE_LOOKUP": "0",
     "STRATA_DSPARK_DEPTH": "5",
     "STRATA_DSPARK_KEEP": "/root/xolotl/tools/v41/serve/dspark_expert_counts_code.txt:64",
-    "STRATA_BUILD_DIR": "/root/xolotl-1103/build-xolotl-1103-fused",
-    "STRATA_DS41_REMOTE_SKIP": "2000"
+    "STRATA_BUILD_DIR": "/root/xolotl-1103/build-xolotl-1105",
+    "STRATA_DS41_REMOTE_SKIP": "2000",
+    "STRATA_GGUF_OVERLAY": "/root/models/mx-hot/IQ1_M-mx-Jq.gguf"
   },
   "allowed_hosts": "*",
   "sampling": {
