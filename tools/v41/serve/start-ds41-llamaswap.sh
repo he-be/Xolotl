@@ -5,7 +5,7 @@
 # DS41_VENV (default /root/xolotl/.venv, the first worktree's).
 C=$1; P=$2
 for i in $(seq 1 240); do pgrep -x strata >/dev/null || pgrep -x ds41_generate >/dev/null || break; sleep 0.5; done
-D=$(cd "$(dirname "$0")" && pwd)
+D=$(cd "$(dirname "$0")/../../.." && pwd)   # the worktree root (this script lives in tools/v41/serve/)
 PY=$D/.venv/bin/python
 [ -x "$PY" ] || PY=${DS41_VENV:-/root/xolotl/.venv}/bin/python
 cd "$D"

@@ -1,5 +1,5 @@
 {
-  "exe": "/root/xolotl-1103/tools/v41/serve/ds41-engine-llmserver.sh",
+  "exe": "/root/xolotl-1120/tools/v41/serve/ds41-engine-llmserver.sh",
   "args": [
     "-m",
     "/root/models/unsloth-UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf",
@@ -39,7 +39,7 @@
     "--vram-margin",
     "2.0"
   ],
-  "cwd": "/root/xolotl-1103",
+  "cwd": "/root/xolotl-1120",
   "tokenizer": "/root/models/V41-XQ-1017-v4/tokenizer",
   "model_name": "deepseek-v4.1-flash-1017-iq1m-exact",
   "log": "/tmp/strata-ds41-iq1m.log",
@@ -54,9 +54,20 @@
     "STRATA_SERVE_LOOKUP": "0",
     "STRATA_DSPARK_DEPTH": "5",
     "STRATA_DSPARK_KEEP": "/root/xolotl/tools/v41/serve/dspark_expert_counts_code.txt:64",
-    "STRATA_BUILD_DIR": "/root/xolotl-1103/build-xolotl-1105",
+    "STRATA_BUILD_DIR": "/root/xolotl-1120/build-xolotl-1120",
     "STRATA_DS41_REMOTE_SKIP": "2000",
-    "STRATA_GGUF_OVERLAY": "/root/models/mx-hot/IQ1_M-mx-Jq.gguf"
+    "STRATA_GGUF_OVERLAY": "/root/models/mx-hot/IQ1_M-mx-Jq.gguf",
+    "STRATA_ROUTE_FUSE": "1",
+    "STRATA_X_DEV": "1",
+    "STRATA_META_PULL": "1",
+    "STRATA_PF_HOSTWAIT": "1",
+    "STRATA_ATTN_TAIL": "3",
+    "STRATA_RB_HOOK": "1",
+    "STRATA_HIT_FAST": "3",
+    "STRATA_DENSE_ASYNC": "1",
+    "STRATA_PIN_RB": "1",
+    "STRATA_GRAPH_CONC": "7",
+    "STRATA_QKV_FUSE": "1"
   },
   "allowed_hosts": "*",
   "sampling": {
