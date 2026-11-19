@@ -48,6 +48,8 @@ struct Args {
     double vram_grow_keep = 0.0, vram_margin_gib = 1.0, pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
     int64_t ctx = 0;
+    int remote_device = -1;          // --remote-device N: a second card holds the experts ranked after the VRAM head (ds4 tier)
+    double remote_gib = 0.0;         // --remote-gib G: its expert budget (0 = its free memory less 1 GiB)
     float route_bias_file = 0.0f;   // --route-bias-file X: DECODE-only selection penalty -X on file-tier experts
                                     // (neither VRAM cache nor RAM arena) - soft, every expert stays reachable and keeps
                                     // its LoRA delta (unlike --skip-*), the ds41 decode recipe (route-bias-file 0.3)
@@ -95,6 +97,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--profile") a.profile = next();
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
+        else if (k == "--remote-device") a.remote_device = std::atoi(next().c_str());   // a second card's expert tier
+        else if (k == "--remote-gib") a.remote_gib = std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
@@ -191,7 +195,8 @@ int main(int argc, char ** argv) {
                              "       [--lora adapter.gguf] [--prefill-chunk N [--chunk-mmq] [--chunk-prestage]] [--allow-long-ctx]\n"
                              "       [--prune f [--prune-penalty X]] [--arena-adapt [--arena-admit HALF_LIFE_TOKENS]]\n"
                              "       [--skip-miss T] [--skip-file T] [--skip-file-prefill T] [--renorm-skip] [--arena-lazy] [--vram-grow KEEP_GIB]\n"
-                             "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n");
+                             "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n"
+                             "       [--remote-device N [--remote-gib G]] (a second card computes a static set of experts)\n");
         return 2;
     }
     std::vector<int> prompt = a.ids_csv.empty() ? std::vector<int>() : parse_csv(a.ids_csv);
@@ -312,6 +317,8 @@ int main(int argc, char ** argv) {
     mc.threads = a.threads;
     mc.arena_gib = a.arena_gib;
     mc.max_arena_gib = a.arena_gib;
+    mc.remote_device = a.remote_device;
+    mc.remote_gib = a.remote_gib;
     mc.cpu_only = a.experts == "cpu";
     mc.vram_lru = a.vram_lru;
     if (slot_gib_max > 0 && mc.vram_lru) {   // the elastic regrow re-admits in the seed's order: slots must not move
@@ -584,7 +591,14 @@ int main(int argc, char ** argv) {
         }
         std::string ferr;
         // the prompt ids[0, n) at positions pos0.. -> last_logits = the last one's
-        auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress) -> bool {
+        // snap_rel (0 < snap_rel < n): the dense state is snapshotted after the first snap_rel tokens (snap_taken = true)
+        bool snap_taken = false;
+        auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress, int snap_rel = -1) -> bool {
+            snap_taken = false;
+            auto snap_here = [&]() {
+                if (dense.snapshot()) snap_taken = true;
+                else std::fprintf(stderr, "serve: snapshot failed: %s\n", dense.last_error().c_str());
+            };
             // xolotl: with the elastic cache grown to its decode size (slot_gib_max > 0), the chunk path's staging
             // (2 x c_stage of >= 1 GiB) only fits after shrink_cache.  The shrink used to run only for prompts of
             // more than 256 tokens, so every shorter prompt - a short chat, a short follow-up turn - died at
@@ -593,6 +607,7 @@ int main(int argc, char ** argv) {
             if (NP <= 0 || (slot_gib_max > 0 && n <= 16)) {
                 for (int i = 0; i < n; ++i) {
                     if (!step(ids[i], pos0 + i)) { ferr = dense.last_error(); return false; }
+                    if (i + 1 == snap_rel) snap_here();
                     if ((i + 1) % 64 == 0 || i + 1 == n) progress(i + 1);
                 }
                 const float * lg = nullptr;
@@ -611,6 +626,7 @@ int main(int argc, char ** argv) {
             }
             for (int c0 = 0, m = 0; c0 < n; c0 += m) {
                 m = dense.safe_chunk(pos0 + c0, std::min(NP, n - c0));
+                if (snap_rel > c0 && snap_rel < c0 + m) m = snap_rel - c0;   // a chunk ends where the snapshot goes
                 if (!dense.begin_tokens(ids + c0, m)) { ferr = dense.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
                     const bool moe = G.routed(l);
@@ -623,6 +639,7 @@ int main(int argc, char ** argv) {
                     if (!dense.finish_layer_n(l, m, moe ? crouted.data() : nullptr)) { ferr = dense.last_error(); return false; }
                 }
                 if (c0 + m == n && !dense.logits_rows(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                if (c0 + m == snap_rel) snap_here();
                 progress(c0 + m);
             }
             tier.release_chunk();
@@ -694,11 +711,21 @@ int main(int argc, char ** argv) {
             tier.reset_stats();
             const double tp0 = now_ms();
             const int total = (int) ids.size();
+            // The snapshot goes before the prompt's last <|assistant|> (the generation prompt), not after it: a client
+            // that re-renders the end of the prompt - the turn after a cut-off or cancelled reply, a retry - then
+            // resumes there.  It used to sit at the very end, so a retry that differed 2 tokens before the end read
+            // a 26,357-token conversation again (52 s, 2026-11-09).  A follow-up reads those few tokens again.
+            // STRATA_GLM_SNAP_TOKEN: the tag's id (GLM-5's <|assistant|> = 154828; 0 = the end of the prompt, as before).
+            static const int snap_tok = [] { const char * e = std::getenv("STRATA_GLM_SNAP_TOKEN"); return e ? std::atoi(e) : 154828; }();
+            int snap_at = total;
+            if (snap_tok > 0)
+                for (int i = total - 1; i > reused; --i)
+                    if (ids[(size_t) i] == snap_tok) { snap_at = i; break; }
             const bool ok = feed(ids.data() + reused, total - reused, reused, [&](int done) {
                 const double ms = now_ms() - tp0;
                 std::printf("PP %d %d %.0f %.1f\n", reused + done, total, ms, 1000.0 * done / std::max(ms, 1e-9));
                 std::fflush(stdout);
-            });
+            }, snap_at < total ? snap_at - reused : -1);
             if (!ok) {
                 std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
@@ -708,7 +735,8 @@ int main(int argc, char ** argv) {
                 continue;
             }
             hist = ids;
-            if (dense.snapshot()) snap_len = (int) hist.size();
+            if (snap_at < total) snap_len = snap_taken ? snap_at : -1;
+            else if (dense.snapshot()) snap_len = (int) hist.size();
             else std::fprintf(stderr, "serve: snapshot failed: %s\n", dense.last_error().c_str());
             const double prompt_ms = now_ms() - tp0;
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused) in %.2f s = %.1f tok/s\n", total, reused,

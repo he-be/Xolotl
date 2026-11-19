@@ -34,6 +34,35 @@ tokens (within each engine's own run-to-run variation), the 27B's teacher-forced
 nats on average, and the server builds byte-identical engine prompts for every model.
 
 
+### The README's main table until 8 Nov 2026
+
+Same harness (21 HumanEval, 10 tool calls, 3 agentic loops, greedy, 32K thinking budget), one row per model as served
+then; the 1017 V4 row has its dense half at Q8_0. The README now leads with the Gauntlet v3-small instead, because
+every model scores 19-21/21, 10/10, 3/3 here. Hardware: the 4090 box with 90 GB DDR4 (110 GB since 1 Nov).
+
+| Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | **289-409 tok/s** | **25.7 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
+| **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| **[LFM3-Omni-2B](https://huggingface.co/IndrasMirror/LFM3-Omni-2B-XQ-Uncensored)** (XQ-6.0, omni) | 2B | **26,000-32,800 tok/s** | **~300 tok/s** | 13/21 | 9/10 | 0/3 | 32K |
+
+<sub>Decode = generation speed during those tasks. Prefill = a fresh 6K-17K-token prompt through the server
+(`tools/throughput.py`; Qwen3.8-Flash-Next: 3,430 / 3,005 tok/s at 6.5K / 16.7K, Qwen3.8-27B: 1,385 / 1,244 tok/s,
+DeepSeek-V4.1: 178 / 268 tok/s at 6.1K / 16.5K - its prompt batch is sized from free VRAM, ~6-9K tokens per sweep
+on a 24 GB card with the speculative-decode draft loaded).
+DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts (the default since 2026-10-17):
+187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
+(`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
+30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
+prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
+[below](#deepseek-v41-quant-vs-the-deepseek-api).
+LFM3-Omni-2B (2 Nov, `xolotl-lfm3`, alone on the card): a non-reasoning model, so thinking off; prefill 32,796 / 26,049
+tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speech out at 12x real time) - see
+[docs/LFM3.md](../LFM3.md). Its agentic 0/3 is the 2B model calling a tool the agent does not have.</sub>
+
 ## Prefill on a real prompt (`tools/throughput.py`)
 
 The prompt column above is HumanEval's short prompts (a few hundred new tokens each, where the fixed per-request
@@ -55,6 +84,69 @@ tokens and reloaded after them, 2.6-3.8 s: `STRATA_SERVE_DSPARK_EVICT`, 0 = keep
 lowers it further (10 GiB free: 190 tok/s at 16.5K). Its decode here follows a 6-16K context, so it is below the
 26.8 tok/s of the short HumanEval contexts. The Qwen3.8-Flash-Next row is a freshly started server; after an hour of agent work
 (the expert cache warm) the same probe gives 3,139 tok/s at 6K and 3,903 tok/s at 16.4K.
+
+## Speed log
+
+Engine speed-ups, newest first, each measured before/after on the same box (normally RTX 4090, Ryzen 7 5700X,
+110 GB RAM; other hardware is marked), the same prompt and settings, one change at a time. Hardware exceptions are
+stated in their rows. "Runs" = repeats per arm, with a second run of the old build as the noise control.
+
+| Date | Change | Model | Test | Before | After | Control (old build again) | Quality |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| 19 Nov | Keisawaakira's decode set in `ds41-engine.sh` (default on; `XOLOTL_KEIS_DECODE=0` = old). With `STRATA_RB_PROTECT` 7 of the 11 switches engage | DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q6_K, fast mode, served config | 8K prompt + 512 tokens / Gauntlet v3-small tasks 01+03 (one run against two 7 Nov runs) | 98.8 ms per verify pass (34.3 tok/s) / 39.6, 40.8 tok/s | **89.1 ms (37.4 tok/s, -10 %) / 42.7 tok/s (+5-8 %)** | baselines across one afternoon 96.1-103.8 ms per pass | short34 0.4651 / 88.61 % inside 0.4614-0.4653 / 88.42-88.65 %; 01 solved, 03 0.50 as before |
+| 14 Nov | `xolotl-dense`: 2-8 column GEMVs on the interleaved q8_1 copy + an RTX 4090 5-8 column table (default on; `STRATA_MMVQ_IL=0` = old) | Qwen3.8-27B XQ 13.7 GiB, DFlash2 k7, k8v4 | synthetic 2K prompt + 256, same binary, il / off / off / il | decode 181.8 / 190.2 tok/s | **decode 205.9 / 202.2 tok/s (+9.7 %)** | (off twice) | 512 greedy tokens identical on / off / plain / previous build; selftest ok |
+| 14 Nov | `xolotl-dense` takes `STRATA_B6_MMVQ_ROWS` from the card's default table (default on; `=0` = old) | Qwen3.8-27B XQ 13.7 GiB, DFlash2 k7, k8v4 | synthetic 2K prompt + 256, same binary, 4 rounds each, both orders | decode 167.1 / 177.4 / 169.8 / 170.7 tok/s | **decode 180.3 / 193.4 / 182.4 / 183.1 tok/s (+7.9 %)** | (off four times) | 512 greedy tokens identical on / off / plain / previous build; selftest ok |
+| 11 Nov | Manual `--pool-cores LIST --host-core first` (opt-in), 64 physical workers across 12 L3 domains on EPYC 9654 + RTX 5090 | DeepSeek-V4.1-Flash-1017 heretic Q3_K, same hybrid/MTP settings | same binary, 4 fresh ABBA processes, 4K / 16K / 32K prose + 8069-token code, 5120 output tokens per arm | decode 49.417 tok/s pooled | **decode 51.236 tok/s (+3.68%)** | OFF processes 48.700 / 50.155 tok/s. ON 51.465 / 51.010 | 44 HTTP requests and operational checks passed. 3 strict literal FAIL. Numerical/greedy parity unverified. Default host affinity inherited |
+| 11 Nov | Prompt ingest of the MTP draft block writes its K/V rows only (default on; `STRATA_DENSE_MTP_KV_ONLY=0` = old) | Qwen3.8-27B IQ3_S + MTP 3, k8v4 | synthetic 2K / 30K prompt, same binary, switch off / on, 2 rounds interleaved | read-in 1,646 / 1,067 tok/s | **read-in 1,972 / 1,394 tok/s (+19 / +29 %)** | 1,716 / 1,106 | same text and draft cycles (4 greedy answers) |
+| 10 Nov | Reopen uniform cache after explicit-slot release ([record](measurements/ds41-fixed-slots-reopen.json)) | DeepSeek-V4.1-Flash-1017, uniform Q3_K experts | RTX 5090 + EPYC 9654; `--slots 780`; ABBA, 2 prompts/group/process; prose 4K + 256 tokens / code 8K + 512 tokens | pooled decode 40.47 / 41.96 tok/s | **48.15 / 53.33 tok/s (+18.98 / +27.10%)** | A2: 40.10 / 41.14 tok/s | Greedy continuations differ; quality parity untested |
+| 8 Nov | CPU i-quant down rows: one decode for all of an expert's tokens (default on) + GLM CPU split 0.3 -> 0.4 | GLM-5.3-Flash Maya 512K | `kq_cpu_bench` 4 / 8 tokens an expert; tool-output turns on a 25K conversation | 4.47 / 8.23 ms an expert; +246 / +1,877 tokens 4.79 / 7.54 s (split 0.3) | **3.02 / 5.61 ms; 4.63 / 7.46 s** | | exact ppl chat 5.305 / code 3.617 (no split 5.516 / 3.624); 1 token unchanged |
+| 8 Nov | Prompt-chunk CPU split (`STRATA_CHUNK_CPU=1`, FRAC 0.3, served configs) | GLM-5.3-Flash Maya 512K | tool-output turns on a 25K conversation (+246 / +642 / +1,877 tokens) | 5.47 / 6.30 / 8.02 s | **4.79 / 5.89 / 7.54 s** | | exact ppl chat 5.516 -> 5.362, code 3.624 -> 3.600 |
+| 8 Nov | Prompt-chunk CPU split (`STRATA_CHUNK_CPU=1`, FRAC 0.5, served Q6 config) | DeepSeek-V4.1-Flash-1017 V4 XQ `--fast`, dense Q6_K | tool-output turns on a 30K conversation (+161 / +514 / +906 / +1,866 tokens) | 4.40 / 6.00 / 7.46 / 10.32 s | **3.83 / 5.47 / 7.01 / 9.80 s** | | short34: NLL 0.4889 -> 0.4924, top-1 87.15 -> 87.29 % |
+| 8 Nov | `--ngram-chain`: MTP proposal + n-gram continuation (up to 7 drafts) | Qwen3.8-27B IQ3_S + MTP, 200K k8v4 | rewrite a 140-line file, greedy, thinking off | decode 137.3 tok/s | **decode 173.0 tok/s (+26 %)** | | same text |
+| 8 Nov | the same | the same | new code / prose | 127.0 / 88.9 tok/s | **140.4 / 90.4 tok/s** | | same text |
+| 8 Nov | Verify attention over all columns in one launch + register RMS norm (default on) | Qwen3.8-27B IQ3_S + MTP 3 | synthetic 2K / 30K prompt + 256 tokens, 2 rounds each | decode 134.0 / 89.4 tok/s | **decode 144.0 / 98.2 tok/s (+7 / +10 %)** | 133.1 / 89.2 tok/s | MTP == plain text; selftest 0 bits off |
+| 8 Nov | MTP kept on with a presence / repetition penalty (thinking-off requests) | Qwen3.8-27B IQ3_S + MTP 3 | fresh 2K / 6K / 16K prompts, thinking off | decode 52.3 / 52.0 / 47.8 tok/s | **decode 105.3 / 110.7 / 102.7 tok/s** | 52.5 / 52.0 / 47.9 tok/s | same greedy text |
+| 7 Nov | Fast mode: 2-bit (Q2_K + imatrix) copy of the MXFP4 and Q3_K experts (`XOLOTL_SHADOW`, **opt-in, lossy**) | DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q6_K | Gauntlet v3-small, 2 runs each / 8K prompt + 512 tokens | decode 32.6 tok/s on the tasks / 26.1 on the probe | **41.1 tok/s (+26 %) / 33.0 (+27 %)** | | short34 top-1 87.01 -> 86.16 %; Gauntlet 8/12 in both modes ([XOLOTL_FAST](../XOLOTL_FAST.md)) |
+| 6 Nov | RTX 40 (sm_89) speed switches (`STRATA_SM89_PERF`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | decode 138.96 tok/s | **decode 150.21 tok/s (+8.1 %)** | 138.72 tok/s (-0.2 %) | bit-exact switches; the same text in every arm |
+| 6 Nov | Engram read-ahead + late shared expert (`STRATA_DS41_ENGRAM_AHEAD`, `STRATA_DS41_SHEXP_LATE`, default on) | DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q8_0 | 26,622-token prompt, 3 interleaved rounds | prefill 456 tok/s | **prefill 506 tok/s (+11.1 %)** | | identical: NLL 0.5152 / top-1 86.11 % vs the DeepSeek API both ways, logits bit-identical |
+| 6 Nov | the same | the same | 8K prompt + 512 tokens, 3 interleaved rounds | decode 25.74 tok/s | **decode 26.45 tok/s (+2.7 %)** | | the same text and expert counts in round 1 |
+| 6 Nov | IQ1_M experts on MMQ for prompts (`STRATA_MMQ_IQ1M`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | prefill 3,239 tok/s | **prefill 3,796 tok/s (+17.2 %)** | 3,281 tok/s (+1.3 %) | closer to Q8_0: prompt KL 0.224 -> 0.184 (20 prompts), top-1 90 % both |
+| 6 Nov | the same, recheck on the public build (default on vs `STRATA_MMQ_IQ1M=0`) | Qwen3.8-Flash-Next XQ 45 GB | the same, 2 runs | prefill 3,430 tok/s | **prefill 3,890 tok/s (+13.4 %)** | | |
+
+The 10 Nov row uses one RTX 5090 (32 GB) + EPYC 9654 and recovers a broken explicit `--slots 780` configuration:
+the control loses its cache; the fix reseeds 780 slots. Before/after pool both A/B processes, with three warmups per
+process excluded. This is not the default RTX 4090/AUTO profile or a Maya speed claim. Prefill falls 3.19 / 3.26%;
+median client first-token latency rises 4880 to 5039 / 7394 to 7674 ms with cache reopening/seeding work.
+Greedy continuations differ; broad quality was not tested. The [per-request record](measurements/ds41-fixed-slots-reopen.json)
+retains output hashes, native route/pass counts, individual rates and process ranges without request/output text.
+
+Decode for the IQ1_M rows: 130.8 / 124.5 / 127.1 tok/s (before / after / control), then 135.9 / 132.9 (before /
+after). The time per verify window was 3-4 % higher with it in both A/Bs, while a rerun of the old build alone moved 3 %:
+inside the noise of these runs, and the decode kernels are not the ones this change touches. Details:
+[CHANGELOG](CHANGELOG.md#iq1_m-prompts-on-mmq-6-nov).
+
+## Measured negatives
+
+Changes that were built behind an opt-in, measured, and did not earn their place, so they are not proposed as
+defaults. Recorded so the experiment is not repeated. The three DeepSeek-V4.1 verification prototypes below were
+built and screened by NektoDron (#127) on main at `c823766d7`, on one RTX 5090 (32 GB) + EPYC 9654, Q3_K target / FP8 Engram /
+MXFP4-BF16 DSpark, CPU64, native4 slots, one active request, 524288 context. **None is in the tree: there is no flag
+to set.** They were tried against a measured 19.3-21.7 ms per output versus 15.2-16.0 for Maya on the same 4K / 16K /
+32K and code-8K requests (`3acedc4`); the counter comparison also showed 3-8 % more physical target rows and 20-35 %
+more amortised generation time per row, so the gap was never one component's to close.
+
+| Change (issue) | Gate that passed | Screen that failed |
+| --- | --- | --- |
+| Bounded admission of repeated CPU misses into VRAM, independent of speculative prefetch (#127) | GPU copy/ownership at widths 1 / 2 / 8 / 16 | AUTO cache, 7 requests: prose4K 49.32 -> 46.67 tok/s, code8K 54.88 -> 49.43. A stricter 3-miss trial still lost to its fresh disabled control: 49.02 -> 46.27 and 58.12 -> 51.73 |
+| Bounded warm asynchronous dense/router handoff (#127) | 312 target-logit rows over 99 verify passes byte-identical and finite, rejected rows included; slots 0/1/2/3/0, widths 1-6 | 2,650 warm handoffs of 3,960 calls; normal-cache decode -5.6 % prose, +2.9 % code |
+| Compressor pair restored from saved window projections instead of refeeding the rejected draft through the trunk (#127) | accepted-pair and natural-pair copy / replay | the fresh OFF/OFF control itself diverges at slot reuse, first difference before that request's restore: unchanged-width state equivalence is not established, and it is not attributed to rounding. No-refeed mode was not enabled, so there is no speed figure |
+
+Earlier screens in the same effort, also negative and also absent from the tree: changing CPU worker count, the PCIe
+fraction, graph metadata capacity, Q8 small-window dispatch, and CPU-worker timing. These are ordered exploratory
+screens with individual runs retained in the issue, not statistical estimates. The one reproducible fault found
+along the way, uniform `--slots N` losing its cache after prompt release and not reopening it, is fixed (#130) and
+has its own speed-log row above; that gain applies to the broken explicit-slot configuration, not to AUTO or
+default serving.
 
 ## DeepSeek-V4.1 quant vs the DeepSeek API
 

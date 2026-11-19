@@ -1,4 +1,4 @@
-// src/program/dense_main.cpp - `strata-dense --serve --native <model.gguf> --context N`
+// src/program/dense_main.cpp - `xolotl-dense --serve --native <model.gguf> --context N`
 //
 // The prompt is read in chunks: through llama.cpp's MMQ int8 tensor-core kernels when the build has them
 // (--prompt-chunk N, the default path), otherwise NC tokens at a time through the FP32 GEMVs (--no-prefill).
@@ -11,6 +11,7 @@
 //   out   READY <context> stop                    ("stop": this engine honours STOP)
 //   in    GEN <max_new> [key=value ...] id,id,... (keys: temperature top_p top_k min_p penalty_last_n penalty_repeat
 //                                                  penalty_freq penalty_present seed score; unknown keys are skipped)
+//   in    GENI <max_new> [key=value ...] <embeddings file> id,id,...   (--vision only: images, see below)
 //   out   SCORE <id>:<lp> ... top=<id>:<lp>                   (score=ID,... only: /v1/decide, before the first T)
 //   out   PP <position> <prompt tokens> <ms> <tok/s>          every few dozen prompt tokens
 //   out   T <id>                                              one per generated token
@@ -22,14 +23,24 @@
 // resumed from the deepest conversation checkpoint at or before the token where the two prompts start to differ
 // (--ckpt N, pinned host RAM); with no such checkpoint the state is reset and the prompt is read again.
 //
+// The vision path (--vision), the same as the MoE engine's (generate.cpp): GENI names a file of strata-vision records
+// (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd float32) in prompt order; image k's rows replace the embeddings of
+// its run of <|image_pad|> tokens, and every rope reads (t, h, w) from the M-RoPE table (strata/kernels/mrope.hpp):
+// text t = h = w = p, image row j at t = p, h = p + y, w = p + x, the text after it at p + max(nx, ny).  The table
+// is the identity for text requests, so --vision changes nothing for them.  The conversation cache matches a picture
+// by its start cell, grid and key (img_keys=<hex>,... from the server, else the embeddings' hash).
+//
 // The prompt is read one token at a time (the same step as decoding).  Correct, and the simplest thing that can
 // be checked against llama.cpp; a batched prefill is the next optimisation, not a prerequisite.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/dense_model.hpp"
+#include "strata/core/dflash2.hpp"
+#include "strata/core/nv_defaults.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -48,12 +59,18 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 
 struct Lines {
     std::mutex m;
@@ -94,11 +111,21 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: strata-dense --serve --native <model.gguf> [--context N] [--kv fp16|int8|q4_0|k8v4] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
+                 "usage: xolotl-dense --serve --native <model.gguf> [--context N] [--kv fp16|int8|q4_0|k8v4] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
                  "                  [--prompt-chunk N | --no-prefill]\n"
-                 "       strata-dense --selftest | --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"
+                 "       xolotl-dense --selftest | --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
+                 "  --draft-vocab FILE: MTP drafts score only these token ids (int32 LE, a frequency shortlist such as\n"
+                 "                  data/packs/qwen3.8-27b/draft-vocab-65536.i32); verification keeps the full head (same output).\n"
+                 "  --vision: --serve takes GENI requests too (images; embeddings from strata-vision, the model's mmproj).\n"
+                 "  --layer-schedule S: run the physical layers in this order, e.g. 0-3,4-27,4-27,28-31 (repeats share\n"
+                 "                    weights, each gets its own KV / GDN state); default = the file's own loop, if any\n"
+                 "  --kv-resident N|auto: keep N KV cells per head of every attention layer in VRAM and the rest in pinned\n"
+                 "                  host RAM (one address range, read over PCIe only once the context passes N); auto = every\n"
+                 "                  cell that fits beside the weights.  Full attention reads every cell, so past N each token\n"
+                 "                  costs the spilled bytes over PCIe (about 1 ms per 24 MB).  0 = all in VRAM (the default).\n"
+                 "  --vram-reserve-mib N: leave N MiB of VRAM free for another program (the vision encoder) when budgeting.\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
                  "  the GEMVs (0 is the default; --no-prefill forces the old path).  The chunked path reads the KV\n"
                  "  cache in whatever format --kv picked.\n"
@@ -109,7 +136,7 @@ void usage() {
                  "                  before it, so N=6 also covers a divergence 32768 tokens back.\n");
 }
 
-// ---- `strata-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
+// ---- `xolotl-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
 uint16_t f32_to_f16_bits(float f) {          // round to nearest even; the test inputs stay well inside the range
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -467,6 +494,38 @@ int selftest() {
                     std::copy(o.begin(), o.end(), ref.begin() + (size_t) h * D);
                 }
                 report(f.name, compare(from_dev(dout, ref.size()), ref), 5e-3);
+                {   // xolotl: an 8-column window in one launch (dense_attn_decode_multi_fmt), crossing the 256-cell split
+                    // boundary: every column must be BITWISE what the same column gives alone, and close to the old kernel
+                    const int NW = 8, c0 = 252;
+                    auto qw = rnd((size_t) NW * H * D);
+                    float *dqw = to_dev(qw), *dow = nullptr, *do1 = nullptr, *dold = nullptr, *dscr8 = nullptr;
+                    cudaMalloc((void**) &dow, (size_t) NW * H * D * 4);
+                    cudaMalloc((void**) &do1, (size_t) H * D * 4);
+                    cudaMalloc((void**) &dold, (size_t) H * D * 4);
+                    cudaMalloc((void**) &dscr8, (size_t) NW * strata::kernels::dense_attn_scratch_bytes(H, D, max_ctx));
+                    strata::kernels::dense_attn_decode_multi_fmt(dqw, dk, dv, f.kf, f.vf, dow, dscr8, H, HK, D, c0, NW, max_ctx, scale, nullptr);
+                    const std::vector<float> win = from_dev(dow, (size_t) NW * H * D);
+                    double mism = 0, old_abs = 0;
+                    for (int c = 0; c < NW; ++c) {
+                        strata::kernels::dense_attn_decode_multi_fmt(dqw + (size_t) c * H * D, dk, dv, f.kf, f.vf, do1, dscr8, H, HK, D,
+                                                                     c0 + c, 1, max_ctx, scale, nullptr);
+                        strata::kernels::dense_attn_decode_fmt(dqw + (size_t) c * H * D, dk, dv, f.kf, f.vf, dold, dscr, H, HK, D,
+                                                               c0 + c, max_ctx, scale, nullptr);
+                        const std::vector<float> one = from_dev(do1, (size_t) H * D), old = from_dev(dold, (size_t) H * D);
+                        for (size_t i = 0; i < one.size(); ++i) {
+                            if (std::memcmp(&one[i], &win[(size_t) c * H * D + i], 4) != 0) ++mism;
+                            old_abs = std::max(old_abs, (double) std::fabs(one[i] - old[i]));
+                        }
+                    }
+                    char nm[80];
+                    Diff dm{}; dm.abs = mism;
+                    std::snprintf(nm, sizeof nm, "%s window x8 (bits off)", f.name);
+                    report(nm, dm, 0.5);
+                    Diff dd{}; dd.abs = old_abs;
+                    std::snprintf(nm, sizeof nm, "%s window vs old kernel", f.name);
+                    report(nm, dd, 1e-4);
+                    cudaFree(dqw); cudaFree(dow); cudaFree(do1); cudaFree(dold); cudaFree(dscr8);
+                }
                 cudaFree(dq); cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(dscr);
             }
         }
@@ -614,7 +673,7 @@ int selftest() {
 }
 
 
-// ---- `strata-dense --check <model.gguf> [--mtp]`: the model against ITSELF - the columns, the snapshot and the
+// ---- `xolotl-dense --check <model.gguf> [--mtp]`: the model against ITSELF - the columns, the snapshot and the
 // rollback must reproduce feeding the tokens one at a time.  Needs the GPU and the model, no reference engine.
 double max_abs_diff(const std::vector<float>& a, const std::vector<float>& b, bool* same) {
     double d = 0;
@@ -635,6 +694,71 @@ std::vector<float> read_logits(strata::core::DenseModel& m, int col) {
 }
 
 int argmax_of(const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); }
+
+// ---- xolotl `xolotl-dense --logits <model.gguf> <ids.txt> <out.tsv> [--kv K]`: teacher-forced log-probabilities for
+// a parity check against a reference (tools/sensenova/hf_ref_logits.py writes the same format).  ids.txt: whitespace-
+// separated token ids.  Every position goes through run() in kMaxCols columns with all logits; out.tsv has one row per
+// position: pos, argmax, then the 64 most likely `id:logp` (natural log).  Honours --layer-schedule via
+// XOLOTL_LAYER_SCHEDULE.
+int logits_model(const std::string& gguf, const std::string& ids_path, const std::string& out_path, const std::string& kv) {
+    using strata::core::Logits;
+    std::vector<int32_t> ids;
+    {
+        std::FILE* f = std::fopen(ids_path.c_str(), "r");
+        if (!f) { std::fprintf(stderr, "logits: cannot read %s\n", ids_path.c_str()); return 2; }
+        long long v = 0;
+        while (std::fscanf(f, "%lld", &v) == 1) ids.push_back((int32_t) v);
+        std::fclose(f);
+    }
+    if (ids.empty()) { std::fprintf(stderr, "logits: no ids\n"); return 2; }
+    strata::core::DenseModel m;
+    std::string err;
+    strata::core::DenseOptions opt;
+    opt.kv = kv;
+    if (!m.load(gguf, (int64_t) ids.size() + 64, err, opt)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    std::FILE* out = std::fopen(out_path.c_str(), "w");
+    if (!out) { std::fprintf(stderr, "logits: cannot write %s\n", out_path.c_str()); return 2; }
+    const int NC = strata::core::DenseModel::kMaxCols;
+    auto write_row = [&](size_t pos, const std::vector<float>& lg) {
+        double mx = -1e30;
+        for (float v : lg) mx = std::max(mx, (double) v);
+        double z = 0;
+        for (float v : lg) z += std::exp((double) v - mx);
+        const double lz = mx + std::log(z);
+        std::vector<int> idx(lg.size());
+        for (size_t k = 0; k < idx.size(); ++k) idx[k] = (int) k;
+        std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        std::fprintf(out, "%zu\t%d", pos, idx[0]);
+        for (int k = 0; k < 64; ++k) std::fprintf(out, "\t%d:%.6f", idx[k], (double) lg[idx[k]] - lz);
+        std::fprintf(out, "\n");
+    };
+    // XOLOTL_LOGITS_PREFILL=N: the batched MMQ prompt path instead of run().  Every N-th position p (p = N-1, 2N-1, ...)
+    // is a fresh prefill of ids[0..p] with Logits::Last, so the row is the prefill's own last hidden through the head
+    // (chunks of prefill_chunk() tokens, as served).  Compare against the reference by position (hf_ref_logits compare).
+    if (const char* ps = std::getenv("XOLOTL_LOGITS_PREFILL"); ps && std::atoi(ps) > 0) {
+        const size_t stride = (size_t) std::atoi(ps);
+        if (!m.prefill_setup(0, err)) { std::fprintf(stderr, "prefill_setup: %s\n", err.c_str()); return 1; }
+        size_t rows = 0;
+        for (size_t p = stride - 1; p < ids.size(); p += stride) {
+            m.reset();
+            if (!m.prefill(ids.data(), (int64_t) p + 1, Logits::Last, err)) { std::fprintf(stderr, "prefill: %s\n", err.c_str()); return 1; }
+            write_row(p, read_logits(m, 0));
+            ++rows;
+        }
+        std::fclose(out);
+        std::fprintf(stderr, "logits: %zu prefill positions (every %zu, chunk %lld) -> %s\n", rows, stride,
+                     (long long) m.prefill_chunk(), out_path.c_str());
+        return 0;
+    }
+    for (size_t at = 0; at < ids.size(); at += NC) {
+        const int n = (int) std::min<size_t>(NC, ids.size() - at);
+        if (!m.run(ids.data() + at, n, Logits::All, false, false, err)) { std::fprintf(stderr, "run: %s\n", err.c_str()); return 1; }
+        for (int j = 0; j < n; ++j) write_row(at + j, read_logits(m, j));
+    }
+    std::fclose(out);
+    std::fprintf(stderr, "logits: %zu positions -> %s\n", ids.size(), out_path.c_str());
+    return 0;
+}
 
 int check_model(const std::string& gguf, bool with_mtp, const std::string& kv) {
     using strata::core::Logits;
@@ -786,9 +910,53 @@ int check_model(const std::string& gguf, bool with_mtp, const std::string& kv) {
 
 }  // namespace
 
+// xolotl: the n-gram chain (NInfer's --ngram chain, in the style of llama.cpp ngram-mod): a pool maps a hash of the
+// last n tokens to the token that last followed them, over everything the conversation has consumed.  After the MTP
+// drafts, the proposal continues from the pool while it has an answer, so a round that reproduces code, JSON or a
+// tool call offers many more tokens.  The verification is unchanged: the text is exactly what single steps give.
+struct NgramPool {
+    int n = 8;
+    std::unordered_map<uint64_t, int32_t> next;
+    size_t indexed = 0;                              // tokens of `h` already in the pool
+    static uint64_t key(const int32_t* t, int n) {
+        uint64_t k = 1469598103934665603ull;         // FNV-1a over the token ids
+        for (int i = 0; i < n; ++i) { k ^= (uint32_t) t[i]; k *= 1099511628211ull; }
+        return k;
+    }
+    void reset() { next.clear(); indexed = 0; }
+    void update(const std::vector<int32_t>& h) {
+        if (h.size() < indexed) reset();
+        for (size_t i = std::max(indexed, (size_t) n); i < h.size(); ++i) next[key(&h[i - (size_t) n], n)] = h[i];
+        indexed = h.size();
+    }
+};
+
+// xolotl: the multi-column (verify window) MMVQ layout from the card's default table.  The other engines get it through
+// apply_nv_defaults; the rest of that table is MoE-engine switches, so the dense engine takes only STRATA_B6_MMVQ_ROWS
+// (bitwise the default exact layout; 4090, Qwen3.8-27B XQ, DFlash2 k7, 2K prompt, 4 interleaved rounds each order:
+// 184.8 vs 171.3 tok/s, +7.9 %).  A value the user set wins; STRATA_SM89_PERF=0 (etc.) leaves it off.
+static void dense_nv_defaults() {
+    int dev = 0;
+    cudaDeviceProp p{};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return;
+    for (const auto& kv : strata::core::nv_default_env(p.major, p.minor)) {
+        if (kv.first != "STRATA_B6_MMVQ_ROWS" || std::getenv(kv.first.c_str()) != nullptr) continue;
+        setenv(kv.first.c_str(), kv.second.c_str(), 0);
+        std::fprintf(stderr, "xolotl-dense: sm_%d%d default STRATA_B6_MMVQ_ROWS=%s (exact; set it to 0 to turn it off)\n",
+                     p.major, p.minor, kv.second.c_str());
+    }
+}
+
 int main(int argc, char** argv) {
+    dense_nv_defaults();
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") return selftest();
+        if (std::string(argv[i]) == "--logits") {
+            if (i + 3 >= argc) { std::fprintf(stderr, "usage: xolotl-dense --logits <model.gguf> <ids.txt> <out.tsv> [--kv K]\n"); return 2; }
+            std::string kv = "fp16";
+            for (int j = i + 4; j + 1 < argc; ++j) if (std::string(argv[j]) == "--kv") kv = argv[j + 1];
+            return logits_model(argv[i + 1], argv[i + 2], argv[i + 3], kv);
+        }
         if (std::string(argv[i]) == "--check") {
             bool mtp = false;
             std::string path, kv = "fp16";
@@ -798,7 +966,7 @@ int main(int argc, char** argv) {
                 else if (a == "--kv" && j + 1 < argc) kv = argv[++j];
                 else if (a != "--check" && a.rfind("--", 0) != 0) path = a;
             }
-            if (path.empty()) { std::fprintf(stderr, "usage: strata-dense --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"); return 2; }
+            if (path.empty()) { std::fprintf(stderr, "usage: xolotl-dense --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"); return 2; }
             return check_model(path, mtp, kv);
         }
     }
@@ -807,21 +975,44 @@ int main(int argc, char** argv) {
     bool serve = false, want_mtp = false, mtp_force = false;
     std::string kv_type = "fp16";
     int draft_max = 2, draft_min = 1;
+    bool ngram_on = false;                             // xolotl: --ngram-chain (MTP proposal + n-gram continuation)
+    int ngram_n = 8, ngram_max = 7, ngram_min = 3;     // match length, total drafts, extension needed to go wide
     float draft_p_min = 0.0f;
     // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
     long long prompt_chunk = 0;
     int n_ckpt = 4;                                    // conversation checkpoints (pinned host RAM, ~154 MiB each); 0 = off
+    std::string df2_pack;                              // xolotl: --dflash2 <pack>, the DFlash2 block drafter instead of MTP
+    std::string draft_vocab;                           // xolotl: --draft-vocab <file of int32 token ids>, MTP shortlist head
+    bool draft_max_set = false;
+    bool vision = false;                               // --vision: GENI requests (image embeddings + M-RoPE table)
+    long long kv_resident = 0;                         // --kv-resident N|auto: KV cells per head in VRAM (0 = all, -1 = auto)
+    std::string layer_schedule;                        // xolotl --layer-schedule "0-3,4-27,4-27,28-31" (empty = the file's)
+    int vram_reserve_mib = 0;                          // --vram-reserve-mib N: VRAM left for another program (the encoder)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "strata-dense: %s needs a value\n", what); std::exit(2); }
+            if (i + 1 >= argc) { std::fprintf(stderr, "xolotl-dense: %s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
         if (a == "--serve") serve = true;
         else if (a == "--mtp") want_mtp = true;
         else if (a == "--kv") kv_type = next("--kv");
         else if (a == "--mtp-force") mtp_force = true;
-        else if (a == "--draft-max" || a == "--spec-draft-n-max") draft_max = std::atoi(next("--draft-max"));
+        else if (a == "--draft-max" || a == "--spec-draft-n-max") { draft_max = std::atoi(next("--draft-max")); draft_max_set = true; }
+        else if (a == "--dflash2") df2_pack = next("--dflash2");
+        else if (a == "--ngram-chain") ngram_on = true;
+        else if (a == "--vision") vision = true;
+        else if (a == "--kv-resident") {
+            const std::string v = next("--kv-resident");
+            kv_resident = v == "auto" ? -1 : std::atoll(v.c_str());
+            if (kv_resident == 0 && v != "0") { std::fprintf(stderr, "xolotl-dense: --kv-resident takes a cell count or auto\n"); return 2; }
+        }
+        else if (a == "--layer-schedule") layer_schedule = next("--layer-schedule");
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::max(0, std::atoi(next("--vram-reserve-mib")));
+        else if (a == "--draft-vocab") draft_vocab = next("--draft-vocab");
+        else if (a == "--ngram-n") ngram_n = std::atoi(next("--ngram-n"));
+        else if (a == "--ngram-max") ngram_max = std::atoi(next("--ngram-max"));
+        else if (a == "--ngram-min") ngram_min = std::atoi(next("--ngram-min"));
         else if (a == "--draft-min" || a == "--spec-draft-n-min") draft_min = std::atoi(next("--draft-min"));
         else if (a == "--draft-p-min" || a == "--spec-draft-p-min") draft_p_min = std::strtof(next("--draft-p-min"), nullptr);
         else if (a == "--native" || a == "--model" || a == "--gguf") gguf = next("--native");
@@ -833,46 +1024,122 @@ int main(int argc, char** argv) {
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
     if (!serve || gguf.empty()) { usage(); return 2; }
+    if (!df2_pack.empty()) {
+        want_mtp = false;                              // the block drafter replaces MTP (one drafter, and the VRAM for it)
+        if (!draft_max_set) draft_max = strata::core::Dflash2Drafter::kDrafts;
+    }
     if (draft_max < 1 || draft_max > strata::core::DenseModel::kMaxCols - 1) {
-        std::fprintf(stderr, "strata-dense: --draft-max must be 1..%d\n", strata::core::DenseModel::kMaxCols - 1);
+        std::fprintf(stderr, "xolotl-dense: --draft-max must be 1..%d\n", strata::core::DenseModel::kMaxCols - 1);
         return 2;
     }
     if (draft_min < 1 || draft_min > draft_max) {
-        std::fprintf(stderr, "strata-dense: --draft-min must be 1..--draft-max (%d)\n", draft_max);
+        std::fprintf(stderr, "xolotl-dense: --draft-min must be 1..--draft-max (%d)\n", draft_max);
         return 2;
     }
-    if (!(draft_p_min >= 0.0f && draft_p_min <= 1.0f)) { std::fprintf(stderr, "strata-dense: --draft-p-min must be 0..1\n"); return 2; }
+    if (!(draft_p_min >= 0.0f && draft_p_min <= 1.0f)) { std::fprintf(stderr, "xolotl-dense: --draft-p-min must be 0..1\n"); return 2; }
 
     strata::core::DenseModel model;
     std::string err;
-    std::fprintf(stderr, "strata-dense: loading %s%s ...\n", gguf.c_str(), want_mtp ? " (with the MTP head)" : "");
+    // xolotl: the DFlash2 drafter loads first, so the model's VRAM budget sees what it took
+    strata::core::Dflash2Drafter df2;
+    const bool use_df2 = !df2_pack.empty();
+    if (use_df2) {
+        if (!df2.load(df2_pack, 0, err)) {
+            std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
+            std::printf("ERR %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "xolotl-dense: DFlash2 drafter %s (%.0f MiB of VRAM, taps after layers", df2_pack.c_str(), df2.vram_bytes() / 1048576.0);
+        for (int l : df2.tap_layers()) std::fprintf(stderr, " %d", l);
+        std::fprintf(stderr, ")\n");
+    }
+    std::fprintf(stderr, "xolotl-dense: loading %s%s ...\n", gguf.c_str(), want_mtp ? " (with the MTP head)" : "");
     strata::core::DenseOptions opt;
     opt.mtp = want_mtp;
     opt.mtp_force = mtp_force;
-    opt.draft_max = draft_max;
+    if (ngram_on) {
+        ngram_max = std::max(draft_max, std::min(ngram_max, strata::core::DenseModel::kMaxCols - 1));
+        if (ngram_n < 2) ngram_n = 2;
+    }
+    opt.draft_max = ngram_on ? ngram_max : draft_max;   // rollback snapshots for the widest window
     opt.kv = kv_type;
+    opt.kv_resident = kv_resident;
+    opt.vram_reserve_mib = vram_reserve_mib;
+    opt.layer_schedule = layer_schedule;
+    if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
+    // XOLOTL_TAP_DUMP=<file> (research only, off by default): every request appends its prompt's tap rows (the residual
+    // after each XOLOTL_TAP_LAYERS layer, e.g. 1,16,31,46,61) to the file, for offline drafter acceptance runs
+    const char* tap_dump = std::getenv("XOLOTL_TAP_DUMP");
+    if (tap_dump && !use_df2) {
+        const char* tl = std::getenv("XOLOTL_TAP_LAYERS");
+        for (const char* c = tl ? tl : "1,16,31,46,61"; *c;) {
+            char* e = nullptr;
+            opt.taps.push_back((int) std::strtol(c, &e, 10));
+            c = (*e == ',') ? e + 1 : e;
+            if (e == c && *c) break;
+        }
+    }
+    if (!draft_vocab.empty() && want_mtp) {
+        FILE* fv = std::fopen(draft_vocab.c_str(), "rb");
+        if (fv) {
+            int32_t id;
+            while (std::fread(&id, 4, 1, fv) == 1) opt.draft_vocab.push_back(id);
+            std::fclose(fv);
+        }
+        if (opt.draft_vocab.empty()) {
+            std::fprintf(stderr, "xolotl-dense: --draft-vocab %s: unreadable or empty (int32 token ids expected)\n", draft_vocab.c_str());
+            return 2;
+        }
+    }
     if (!model.load(gguf, context, err, opt)) {
-        std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
+        std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
         return 1;
     }
     const auto& cfg = model.config();
     const int n_vocab = cfg.n_vocab;
     constexpr int NC = strata::core::DenseModel::kMaxCols;
-    using strata::core::Logits;
-
     // Batched prompt processing: the prompt goes through MMQ in chunks instead of NC-token run() groups.  If the
     // build has no MMQ, or a weight's type is not one MMQ covers, or the scratch does not fit, this fails and the
-    // prompt loop below keeps using run() exactly as before.
+    // prompt loop below keeps using run() exactly as before.  It runs BEFORE the drafter's bind/prepare: the model's
+    // VRAM budget reserved this scratch, the drafter's graphs and logits were not budgeted, and allocated first they
+    // took the scratch's room (DFlash2 at 200K, 14 Nov: "prefill mmq: iota: out of memory" at startup).
     if (prompt_chunk >= 0) {
         std::string perr;
         if (!model.prefill_setup(prompt_chunk, perr))
-            std::fprintf(stderr, "strata-dense: prompt prefill off - %s\n", perr.c_str());
+            std::fprintf(stderr, "xolotl-dense: prompt prefill off - %s\n", perr.c_str());
     }
+    // the drafter shares the model's embedding (its block rows: the anchor's row, then the mask token's 7 times, staged
+    // in pinned memory the drafter's graphs copy from) and its output head
+    float* df2_stage = nullptr;
+    if (use_df2) {
+        const int E = cfg.n_embd;
+        if (df2.n_embd() != E || (int) df2.tap_layers().size() * E != model.n_taps() * E) {
+            std::printf("ERR the DFlash2 pack (width %d) is not for this model (width %d)\n", df2.n_embd(), E);
+            return 1;
+        }
+        if (cudaHostAlloc((void**) &df2_stage, (size_t) NC * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            std::printf("ERR cannot allocate the drafter's embedding stage\n");
+            return 1;
+        }
+        for (int r = 1; r < NC; ++r)
+            if (!model.embed_host(df2.mask_token(), df2_stage + (size_t) r * E, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+        auto embed = [df2_stage, E](const int32_t*, int n, float* out, cudaStream_t cs) {
+            cudaMemcpyAsync(out, df2_stage, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, cs);
+        };
+        if (!df2.bind_raw(embed, model.head_weights(), model.head_type(), model.head_rows(), {}, err) ||
+            !df2.prepare(model.run_taps(), err)) {
+            std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
+            std::printf("ERR %s\n", err.c_str());
+            return 1;
+        }
+    }
+    using strata::core::Logits;
+
     {
         std::string cerr;
-        if (!model.ckpt_init(n_ckpt, cerr)) std::fprintf(stderr, "strata-dense: checkpoints off - %s\n", cerr.c_str());
-        else if (model.ckpt_slots()) std::fprintf(stderr, "strata-dense: %d conversation checkpoints\n", model.ckpt_slots());
+        if (!model.ckpt_init(n_ckpt, cerr)) std::fprintf(stderr, "xolotl-dense: checkpoints off - %s\n", cerr.c_str());
+        else if (model.ckpt_slots()) std::fprintf(stderr, "xolotl-dense: %d conversation checkpoints\n", model.ckpt_slots());
     }
     // the ids that end an answer, from the model's own vocabulary
     std::vector<int32_t> stop_ids;
@@ -895,16 +1162,37 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
+    // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
+    // the identity until an image request.  The dense engine captures no CUDA graphs, so setting it here is enough.
+    constexpr int32_t kImagePad = 248056;              // <|image_pad|> (Qwen3.8 image_token_id)
+    int32_t* d_mrope = nullptr;
+    std::vector<int32_t> mrope_host;
+    if (vision) {
+        const int64_t cells = model.max_context() + 64;   // + the widest verify / draft window past the context
+        mrope_host.resize((size_t) cells * 3);
+        for (int64_t c = 0; c < cells; ++c)
+            mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+        if (cudaMalloc((void**) &d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
+            cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::printf("ERR cannot allocate the image position table\n");
+            return 1;
+        }
+        strata::kernels::mrope_table_set(d_mrope);
+        std::fprintf(stderr, "xolotl-dense: vision on (GENI requests, M-RoPE table of %lld cells, %.1f MiB)\n",
+                     (long long) cells, mrope_host.size() * 4 / 1048576.0);
+    }
+
+    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d dflash2=%d draft_max=%d draft_min=%d draft_p_min=%.2f vision=%d\n",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
                 (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
-                (long long) model.max_context(), model.kv_type().c_str(), model.has_mtp() ? 1 : 0, model.has_mtp() ? draft_max : 0,
-                model.has_mtp() ? draft_min : 0, (double) draft_p_min);
+                (long long) model.max_context(), model.kv_type().c_str(), model.has_mtp() ? 1 : 0, use_df2 ? 1 : 0,
+                (model.has_mtp() || use_df2) ? draft_max : 0, (model.has_mtp() || use_df2) ? draft_min : 0, (double) draft_p_min,
+                vision ? 1 : 0);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
+    std::fprintf(stderr, "xolotl-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
                  model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, model.kv_type().c_str(), (long long) model.max_context(),
-                 model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
+                 use_df2 ? ", DFlash2 speculative decoding on" : model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
 
     Lines in;
     std::thread reader([&] {
@@ -921,14 +1209,27 @@ int main(int argc, char** argv) {
     reader.detach();
 
     std::vector<int32_t> fed;                      // every token the state has consumed, in order
+    // the vision path: the pictures among `fed` (start cell, identity hash), the current request's, its rows
+    std::vector<std::pair<int64_t, uint64_t>> fed_imgs, req_imgs;
+    bool mrope_identity = true;
+    std::vector<float> img_rows;
+    std::vector<const float*> row_ptr;
+    NgramPool ngram;                               // xolotl: --ngram-chain
+    ngram.n = ngram_n;
     std::string line;
     while (in.pop(line)) {
         if (line == "QUIT") break;
         in.stop.store(false);                       // a STOP between requests is stale
-        if (line.rfind("GEN ", 0) != 0) { std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n"); std::fflush(stdout); continue; }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] <file> <id,id,...>\n");
+            std::fflush(stdout);
+            continue;
+        }
 
         char* endp = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+        std::vector<uint64_t> img_keys;            // #2228: img_keys=<hex>,... (GENI), each picture's key from the server
         strata::kernels::SamplerParams sp;
         sp.top_k = 20; sp.top_p = 1.0f; sp.temperature = 0.0f; sp.greedy = true;
         unsigned long long seed = 0;
@@ -956,19 +1257,120 @@ int main(int argc, char** argv) {
             else if (key == "penalty_freq") sp.penalty_freq = fv;
             else if (key == "penalty_present") sp.penalty_present = fv;
             else if (key == "seed") seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+            else if (key == "img_keys") {
+                for (const char* c = tok.c_str() + eq + 1; *c;) {
+                    char* e = nullptr;
+                    const unsigned long long v = std::strtoull(c, &e, 16);
+                    if (e == c) break;
+                    img_keys.push_back((uint64_t) v);
+                    c = (*e == ',') ? e + 1 : e;
+                }
+            }
             else if (key == "score") {
                 score_bad = !parse_ids(tok.c_str() + eq + 1, score_ids) || score_ids.size() > 64;
                 for (const int32_t id : score_ids) score_bad = score_bad || id >= n_vocab;
             }
         }
         if (score_bad) { std::printf("ERR score: expected 1-64 token ids below the vocabulary size\n"); std::fflush(stdout); continue; }
+        std::string emb_path;                      // GENI: the embeddings file, the first token without an '='
+        if (geni) {
+            while (*endp == ' ') ++endp;
+            char* gap = std::strchr(endp, ' ');
+            if (gap != nullptr) { emb_path.assign(endp, (size_t) (gap - endp)); endp = gap; }
+        }
         std::vector<int32_t> ids;
-        if (max_new < 1 || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
+        if (max_new < 1 || (geni && emb_path.empty()) || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
         if ((long long) ids.size() + 1 > model.max_context()) {
             std::printf("ERR the prompt (%zu tokens) does not fit the context (%lld)\n", ids.size(), (long long) model.max_context());
             std::fflush(stdout);
             continue;
         }
+        if (geni && !vision) { std::printf("ERR this engine was started without --vision\n"); std::fflush(stdout); continue; }
+        req_imgs.clear();
+        if (geni || !mrope_identity) {
+            // positions for every cell this request can reach (the identity again for a text request), and the
+            // image row of every image cell
+            const int64_t nn = (int64_t) ids.size();
+            const int64_t cells = (int64_t) mrope_host.size() / 3;
+            const int E = cfg.n_embd;
+            std::string ve;
+            row_ptr.assign((size_t) nn, nullptr);
+            auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
+                mrope_host[(size_t) c * 3] = (int32_t) t;
+                mrope_host[(size_t) c * 3 + 1] = (int32_t) h;
+                mrope_host[(size_t) c * 3 + 2] = (int32_t) w;
+            };
+            if (!geni) {
+                for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
+            } else {
+                struct Img { int64_t n, nx, ny; size_t off; };
+                std::vector<Img> imgs;
+                img_rows.clear();
+                std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+                if (!f) ve = "cannot open " + emb_path;
+                while (f && ve.empty()) {
+                    int32_t hdr[5];
+                    const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+                    if (got == 0) break;
+                    if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+                        (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != E) {
+                        ve = "bad embeddings file (expected strata-vision records of width " + std::to_string(E) + ")";
+                        break;
+                    }
+                    const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) E;
+                    img_rows.resize(off + cnt);
+                    if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+                    imgs.push_back({hdr[1], hdr[2], hdr[3], off});
+                }
+                if (f) std::fclose(f);
+                int64_t p = 0, i = 0;
+                size_t k = 0;
+                while (ve.empty() && i < nn) {
+                    if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
+                    if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
+                    const Img& im = imgs[k++];
+                    {   // what the conversation cache compares: a picture is its grid and its key (or its embeddings)
+                        const int64_t grid[3] = {im.n, im.nx, im.ny};
+                        uint64_t h = fnv1a(grid, sizeof grid);
+                        if (img_keys.size() == imgs.size()) h = fnv1a(&img_keys[k - 1], sizeof(uint64_t), h);
+                        else h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) E * sizeof(float), h);
+                        req_imgs.push_back({i, h});
+                    }
+                    for (int64_t j = 0; j < im.n && ve.empty(); ++j)
+                        if (i + j >= nn || ids[(size_t) (i + j)] != kImagePad)
+                            ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                                 " rows but fewer <|image_pad|> tokens";
+                    for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
+                        const int64_t y = j / im.nx, x = j % im.nx;
+                        put(i + j, p, p + y, p + x);
+                        row_ptr[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) E;
+                    }
+                    i += im.n;
+                    p += std::max(im.nx, im.ny);
+                }
+                if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more images than the prompt";
+                if (ve.empty() && nn > 0 && ids[(size_t) (nn - 1)] == kImagePad) ve = "the prompt cannot end in an image";
+                for (int64_t c = nn; ve.empty() && c < cells; ++c) put(c, p + (c - nn), p + (c - nn), p + (c - nn));
+            }
+            // the table is read by kernels already queued: wait for them before overwriting it
+            if (ve.empty() && !model.sync(err)) ve = err;
+            if (ve.empty() && cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                         cudaMemcpyHostToDevice) != cudaSuccess)
+                ve = "the image position upload failed";
+            if (!ve.empty()) {
+                // leave the table as the identity so the next text request is untouched
+                for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
+                cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                mrope_identity = true;
+                req_imgs.clear();
+                model.set_embd_rows(nullptr, 0);
+                std::printf("ERR %s\n", ve.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            mrope_identity = !geni;
+        }
+        model.set_embd_rows(geni ? row_ptr.data() : nullptr, geni ? (int64_t) row_ptr.size() : 0);
         sp.seed = seed;
 
         // ---- what of the state can be kept
@@ -976,6 +1378,16 @@ int main(int argc, char** argv) {
         {
             const size_t lim = std::min(fed.size(), ids.size());
             while (common < lim && fed[common] == ids[common]) ++common;
+            // a picture is a run of identical <|image_pad|> ids: the prompts also part at the first picture whose
+            // start cell or identity differs
+            for (size_t k = 0; k < std::max(fed_imgs.size(), req_imgs.size()); ++k) {
+                if (k < fed_imgs.size() && k < req_imgs.size() && fed_imgs[k] == req_imgs[k]) continue;
+                int64_t at = (int64_t) 1 << 62;
+                if (k < fed_imgs.size()) at = std::min(at, fed_imgs[k].first);
+                if (k < req_imgs.size()) at = std::min(at, req_imgs[k].first);
+                common = std::min(common, (size_t) at);
+                break;
+            }
         }
         size_t resume = 0;
         if (!fed.empty() && fed.size() < ids.size() && common == fed.size()) resume = fed.size();
@@ -995,14 +1407,14 @@ int main(int argc, char** argv) {
                         if (held != "none") held += ",";
                         held += std::to_string(model.ckpt_pos(k));
                     }
-                std::fprintf(stderr, "strata-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu, checkpoints hold %s%s\n",
+                std::fprintf(stderr, "xolotl-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu, checkpoints hold %s%s\n",
                              fed.size(), ids.size(), common, held.c_str(),
                              best >= 0 ? " (restoring one)" : " (none at or before that token: re-reading from 0)");
             }
             if (best >= 0 && model.ckpt_restore(best, err)) {
                 resume = (size_t) model.position();
                 fed.resize(resume);
-                std::fprintf(stderr, "strata-dense: checkpoint restored at token %zu, reading %zu\n", resume, ids.size() - resume);
+                std::fprintf(stderr, "xolotl-dense: checkpoint restored at token %zu, reading %zu\n", resume, ids.size() - resume);
             } else {
                 model.reset();
                 fed.clear();
@@ -1034,6 +1446,7 @@ int main(int argc, char** argv) {
         int64_t since_pp = 0;
         const bool use_pf = model.prefill_ready();
         const int64_t pf_step = model.prefill_chunk();      // STOP is checked between steps
+        model.draft_vocab_extend(ids.data(), (int64_t) ids.size());   // --draft-vocab: the prompt's own rare tokens
         // Where to save checkpoints.  A prompt that diverges from the one already read diverges in its tail - the
         // client re-renders or trims the last turns - but "the tail" is not the last 64 tokens: over the 24 diverges
         // logged by a 72k-token chat (strata-qwen3.8-27b.log) the divergence sat 143, 171, 226, 466, 1515 and 2738
@@ -1057,8 +1470,9 @@ int main(int argc, char** argv) {
             }
             if (slot < 0) slot = lo;
             std::string cerr;
-            if (!model.ckpt_save(slot, cerr)) std::fprintf(stderr, "strata-dense: checkpoint: %s\n", cerr.c_str());
+            if (!model.ckpt_save(slot, cerr)) std::fprintf(stderr, "xolotl-dense: checkpoint: %s\n", cerr.c_str());
         };
+        if (use_df2 && !use_pf) df2.reset();
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
             int64_t step = std::min<int64_t>(use_pf ? pf_step : (int64_t) NC, n - i);
             for (int64_t m : marks) if (m > i && m < i + step) { step = m - i; break; }   // stop exactly on a mark
@@ -1070,6 +1484,13 @@ int main(int argc, char** argv) {
                 const int chunk = (int) step;
                 ok = model.run(&ids[(size_t) i], chunk, last ? Logits::Last : Logits::None, model.has_mtp(), false, err) &&
                      (!model.has_mtp() || model.mtp_ingest(&ids[(size_t) i], chunk, (int) i, 0, err));
+                if (ok && use_df2) {   // the rows go to the drafter's ring; a prompt's last row waits for the first round
+                    const int ctx_rows = last ? chunk - 1 : chunk;
+                    ok = model.sync(err) && (ctx_rows < 1 || df2.context(model.run_taps(), ctx_rows, (int64_t) i, err));
+                    if (ok && last && chunk > 1)
+                        cudaMemcpy(const_cast<float*>(model.run_taps()), model.run_taps() + (size_t) (chunk - 1) * model.n_taps() * cfg.n_embd,
+                                   (size_t) model.n_taps() * cfg.n_embd * sizeof(float), cudaMemcpyDeviceToDevice);
+                }
             }
             if (!ok) {
                 fail(err);
@@ -1091,12 +1512,54 @@ int main(int argc, char** argv) {
                 since_pp = 0;
             }
         }
+        // the pictures the state now holds: those that start in what was read (cancelled: maybe part of one)
+        fed_imgs.clear();
+        for (const auto& im : req_imgs)
+            if ((size_t) im.first < fed.size()) fed_imgs.push_back(im);
         if (failed) continue;
-        if (!model.sync(err)) { fail(err); continue; }
+        if (!model.sync(err)) { fail(err); fed_imgs.clear(); continue; }
+        // xolotl DFlash2: a prefill wrote its rows into the model's tap ring; the drafter gets the rows read in this
+        // request (at most its 2048 window), all but the last, which becomes row 0 of the first round's new rows
+        int df2_pend = 0;
+        int64_t df2_pos0 = 0;
+        if (use_df2 && n > (int64_t) resume) {
+            const int64_t R = strata::core::DenseModel::kTapRing, W = (int64_t) model.n_taps() * cfg.n_embd;
+            bool ok = true;
+            if (use_pf) {
+                df2.reset();
+                for (int64_t q = std::max<int64_t>((int64_t) resume, n - R); ok && q < n - 1;) {
+                    const int64_t slot = q % R, len = std::min<int64_t>(n - 1 - q, R - slot);
+                    ok = df2.context(model.ring_taps() + (size_t) slot * W, len, q, err);
+                    q += len;
+                }
+                if (ok) ok = cudaMemcpy(const_cast<float*>(model.run_taps()), model.ring_taps() + (size_t) ((n - 1) % R) * W,
+                                        (size_t) W * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+            }
+            if (!ok) { fail(err.empty() ? "dflash2: context" : err); continue; }
+            df2_pend = 1;
+            df2_pos0 = n - 1;
+        }
+        if (tap_dump && !use_df2 && n > (int64_t) resume) {   // XOLOTL_TAP_DUMP: n0, rows, n_taps, n_embd, tokens, rows of floats
+            const int64_t R = strata::core::DenseModel::kTapRing, W = (int64_t) model.n_taps() * cfg.n_embd;
+            const int64_t q0 = std::max<int64_t>(0, n - R);   // rows below resume are in the ring from an earlier prefill of the same tokens (run prompts so)
+            std::vector<float> rows((size_t) (n - q0) * W);
+            for (int64_t q = q0; q < n; ++q)
+                cudaMemcpy(rows.data() + (size_t) (q - q0) * W, model.ring_taps() + (size_t) (q % R) * W, (size_t) W * 4, cudaMemcpyDeviceToHost);
+            if (std::FILE* tf = std::fopen(tap_dump, "ab")) {
+                const int32_t hdr[4] = {(int32_t) q0, (int32_t) (n - q0), model.n_taps(), cfg.n_embd};
+                std::fwrite(hdr, 4, 4, tf);
+                std::fwrite(ids.data() + q0, 4, (size_t) (n - q0), tf);
+                std::fwrite(rows.data(), 4, rows.size(), tf);
+                std::fclose(tf);
+                std::fprintf(stderr, "xolotl-dense: XOLOTL_TAP_DUMP %s: %lld rows from %lld\n", tap_dump, (long long) (n - q0), (long long) q0);
+            } else std::fprintf(stderr, "xolotl-dense: XOLOTL_TAP_DUMP: cannot write %s\n", tap_dump);
+        }
         const double prompt_ms = ms_since(t_prompt);
 
         // ---- decode
         long long produced = 0, drafts_offered = 0, drafts_accepted = 0;
+        long long ng_drafted = 0, ng_accepted = 0, ng_wide = 0;
+        if (ngram_on) ngram.reset();                // rebuilt from this request's tokens at its first draft
         const char* finish = "length";
         const auto t_dec = Clock::now();
         std::vector<int32_t> hist;                  // penalty window, most recent last
@@ -1104,7 +1567,11 @@ int main(int argc, char** argv) {
             const size_t take = std::min<size_t>((size_t) sp.penalty_last_n, fed.size());
             hist.assign(fed.end() - (std::ptrdiff_t) take, fed.end());
         }
-        const bool speculate = model.has_mtp() && sp.penalty_last_n == 0;   // penalties would need the window per draft
+        // A penalty changes only the sampling: each verified column is drawn after the previous ones were emitted, and emit()
+        // has already put them in the penalty window, so a speculative step draws exactly what single steps would.  (It
+        // used to switch speculation off whenever penalty_last_n > 0 - every thinking-off request, whose model-card
+        // sampling has presence_penalty 1.5, decoded without MTP: 48 instead of ~90 tok/s.)
+        const bool speculate = model.has_mtp() || use_df2;
 
         // one draw from device logits; the counter is the POSITION of the token drawn, so a seed gives the same text
         // whether a token comes from a single step or from a verified pair
@@ -1171,11 +1638,44 @@ int main(int argc, char** argv) {
             const int64_t p = model.position();
             const long long remaining = budget - produced;
             int32_t dr[NC];
-            int nd = 0;
+            int nd = 0, nd_mtp = 0;
             if (speculate && remaining >= 2 && p + 2 <= model.max_context()) {
-                const int cap = (int) std::min<long long>({(long long) draft_max, remaining - 1, model.max_context() - p - 1});
+                const int cap_all = (int) std::min<long long>({(long long) (ngram_on ? ngram_max : draft_max), remaining - 1,
+                                                                 model.max_context() - p - 1});
+                const int cap = std::min(cap_all, draft_max);
                 const auto t0 = Clock::now();
-                if (!model.mtp_draft(next, (int) p, cap, draft_p_min, dr, &nd, err)) { fail(err); failed = true; break; }
+                if (use_df2) {
+                    if (df2_pend > 0 && !model.embed_host(next, df2_stage, err)) { fail(err); failed = true; break; }
+                    if (df2_pend > 0) {   // the committed rows since the last round, then the block for `next` at p
+                        int32_t d7[strata::core::Dflash2Drafter::kDrafts];
+                        float pr[strata::core::Dflash2Drafter::kDrafts];
+                        if (!df2.draft(model.run_taps(), df2_pend, df2_pos0, next, d7, pr, err)) { fail(err); failed = true; break; }
+                        df2_pend = 0;
+                        for (nd = 0; nd < cap && nd < strata::core::Dflash2Drafter::kDrafts; ++nd) {
+                            if (nd > 0 && pr[nd] < draft_p_min) break;
+                            dr[nd] = d7[nd];
+                        }
+                    }
+                } else if (!model.mtp_draft(next, (int) p, cap, draft_p_min, dr, &nd, err)) { fail(err); failed = true; break; }
+                nd_mtp = nd;
+                if (ngram_on && cap_all > nd) {      // continue the proposal from the pool
+                    ngram.update(fed);
+                    const int N = ngram.n;
+                    int32_t tail[NC + 64];
+                    int tl = 0;
+                    const size_t from = fed.size() > (size_t) N ? fed.size() - (size_t) N : 0;
+                    for (size_t i = from; i < fed.size(); ++i) tail[tl++] = fed[i];
+                    tail[tl++] = next;
+                    for (int j = 0; j < nd; ++j) tail[tl++] = dr[j];
+                    int ext = nd;
+                    while (ext < cap_all && tl >= N) {
+                        const auto it = ngram.next.find(NgramPool::key(&tail[tl - N], N));
+                        if (it == ngram.next.end()) break;
+                        dr[ext++] = it->second;
+                        tail[tl++] = it->second;
+                    }
+                    if (ext - nd >= ngram_min) { ng_drafted += ext - nd; ++ng_wide; nd = ext; }
+                }
                 t_draft += ms_since(t0);
             }
             if (nd >= draft_min && nd >= 1) {
@@ -1184,7 +1684,7 @@ int main(int argc, char** argv) {
                 cols[0] = next;
                 for (int j = 0; j < nd; ++j) cols[j + 1] = dr[j];
                 const auto t1 = Clock::now();
-                if (!model.run(cols, nd + 1, Logits::All, true, true, err)) { fail(err); failed = true; break; }
+                if (!model.run(cols, nd + 1, Logits::All, model.has_mtp(), true, err)) { fail(err); failed = true; break; }
                 int a = 0;
                 int32_t y = -1;
                 for (int j = 0; j <= nd; ++j) {
@@ -1200,11 +1700,15 @@ int main(int argc, char** argv) {
                 emitted_spec += a + 1;
                 drafts_offered += nd;
                 drafts_accepted += a;
+                if (a > nd_mtp) ng_accepted += a - nd_mtp;
                 if (a < nd && !model.rollback(a, err)) { fail(err); failed = true; break; }
                 fed.push_back(next);
                 for (int j = 0; j < a; ++j) fed.push_back(dr[j]);
                 const auto t2 = Clock::now();
-                if (a >= 1) {                       // the MTP block learns the accepted positions with the trunk's own hidden states
+                if (use_df2) {                      // run() left columns 0..a's tap rows: the next round's new context
+                    df2_pend = a + 1;
+                    df2_pos0 = p;
+                } else if (a >= 1) {                // the MTP block learns the accepted positions with the trunk's own hidden states
                     if (!model.mtp_ingest(cols, a + 1, (int) p, 1, err)) { fail(err); failed = true; break; }
                 } else {
                     model.set_last_hidden(0);
@@ -1216,6 +1720,7 @@ int main(int argc, char** argv) {
                 if (!model.run(&next, 1, Logits::Last, model.has_mtp(), false, err) ||
                     (model.has_mtp() && !model.mtp_ingest(&next, 1, (int) p, 0, err))) { fail(err); failed = true; break; }
                 fed.push_back(next);
+                if (use_df2) { df2_pend = 1; df2_pos0 = p; }
                 int32_t y = -1;
                 if (!draw(model.logits_col(0), (uint64_t) (p + 1), y)) { fail(err); failed = true; break; }
                 t_plain += ms_since(t3);
@@ -1231,20 +1736,24 @@ int main(int argc, char** argv) {
         std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish,
                     drafts_accepted, drafts_offered, (long long) resume);
         std::fflush(stdout);
-        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s",
+        std::fprintf(stderr, "xolotl-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s",
                      (long long) n, resume, (long long) (n - (long long) resume), prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "");
         if (drafts_offered) std::fprintf(stderr, ", MTP drafts accepted %lld of %lld (%.0f%%)", drafts_accepted, drafts_offered,
                                          100.0 * (double) drafts_accepted / (double) drafts_offered);
         std::fprintf(stderr, "\n");
         if (cycles + plain_steps > 0 && model.has_mtp())    // where the decode time went, per step
-            std::fprintf(stderr, "strata-dense:   %lld speculative cycles (%.2f tokens each): draft %.1f ms, verify %.1f ms, "
+            std::fprintf(stderr, "xolotl-dense:   %lld speculative cycles (%.2f tokens each): draft %.1f ms, verify %.1f ms, "
                          "ingest %.1f ms per cycle; %lld plain steps at %.1f ms\n", cycles,
                          cycles ? (double) emitted_spec / (double) cycles : 0.0, cycles ? t_draft / (double) cycles : 0.0,
                          cycles ? t_verify / (double) cycles : 0.0, cycles ? t_ingest / (double) cycles : 0.0, plain_steps,
                          plain_steps ? t_plain / (double) plain_steps : 0.0);
+            if (ngram_on)
+                std::fprintf(stderr, "xolotl-dense:   n-gram chain: %lld drafted, %lld accepted, %lld wide rounds\n",
+                             ng_drafted, ng_accepted, ng_wide);
     }
     cudaFree(d_next);
     cudaFree(d_hist);
+    if (d_mrope) { strata::kernels::mrope_table_set(nullptr); cudaFree(d_mrope); }
     return 0;
 }

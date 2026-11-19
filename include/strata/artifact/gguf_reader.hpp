@@ -122,6 +122,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 43:   // llama.cpp PR #30817 (DeepSeek-V4.1): MXFP8, gather-only (never reaches ggml here)
+        return "MXFP8";
     // Agention's llama.cpp fork: the APR trellis expert types (docs/GYRO.md)
     case 143:   // (Strata-DS4 fork: PTQ1_0, V4.1 routed experts - the same id upstream reads as APR's PTQ1_0)
         return "PTQ1_0";
@@ -262,6 +264,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 43:   // MXFP8: one E8M0 scale + 32 E4M3 codes (the Engram tables of Unsloth's DeepSeek-V4.1 UD-Q8_K_XL)
+        elems = 32;
+        bytes = 33;
         return true;
     // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7);
     // PTQ1_0 = 26 B of base-3 digits + fp16 scale
@@ -434,6 +440,15 @@ public:
     uint64_t file_size() const { return size_; }
     uint64_t alignment() const { return alignment_; }
     const std::string& path() const { return path_; }
+    /// The view's pages this process touched leave its working set (xolotl, DeepSeek-V4.1's STRATA_DROP_MMAP: once the
+    /// dense weights are on the card, the ~8 GiB of file pages their copies read need not count as the process's
+    /// memory).  Windows: VirtualUnlock on the unlocked view removes them from the working set; they stay cached as
+    /// standby (available) memory and a later read faults them back.  Elsewhere a no-op (the page cache reclaims them).
+    void release_resident() const {
+#ifdef _WIN32
+        if (base_) VirtualUnlock((LPVOID) base_, (SIZE_T) size_);
+#endif
+    }
 
     const TensorInfo* find(const std::string& name) const {
         for (const auto& t : tensors_)
@@ -742,8 +757,6 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     const Key keys[] = {
         {"block_count", &core::ModelGeometry::n_layers, true},
         {"embedding_length", &core::ModelGeometry::n_embd, true},
-        {"expert_count", &core::ModelGeometry::n_expert, true},
-        {"expert_used_count", &core::ModelGeometry::n_expert_used, true},
         {"attention.head_count", &core::ModelGeometry::n_head, true},
         {"attention.head_count_kv", &core::ModelGeometry::n_head_kv, true},
         {"full_attention_interval", &core::ModelGeometry::qsa_interval, false},
@@ -763,6 +776,39 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     };
     for (const Key& k : keys)
         if (!read_int(k.key, g.*k.field, k.required)) return err;
+    // THE ROUTED-EXPERT KEYS ARE OPTIONAL: a dense file (Route B) carries neither, or a zero expert_count.  It reads
+    // its FFN width from `feed_forward_length` instead of `expert_feed_forward_length`, and has no top-k.  A file that
+    // does carry them is read exactly as before (a positive count, a top-k of 1..count).
+    {
+        if (!f.get(p + "expert_count")) g.n_expert = 0;
+        if (!f.get(p + "expert_used_count")) g.n_expert_used = 0;
+        auto read_count = [&](const char* key, int64_t& out) {
+            const MetaValue* v = f.get(p + key);
+            if (!v) return true;
+            if (!v->is_num() || v->type == MetaType::F32 || v->type == MetaType::F64 || v->type == MetaType::BOOL) {
+                err = p + key + " is not an integer";
+                return false;
+            }
+            out = (int64_t) v->u;
+            if (out < 0) {
+                err = p + key + " = " + std::to_string(out) + ", it must not be negative";
+                return false;
+            }
+            return true;
+        };
+        if (!read_count("expert_count", g.n_expert) || !read_count("expert_used_count", g.n_expert_used)) return err;
+    }
+    const bool dense = g.n_expert == 0;
+    if (dense) {
+        g.n_expert_used = 0;
+        // the dense FFN's width.  Only for a dense file: a MoE file's FFN width is the expert width above.
+        if (const MetaValue* v = f.get(p + "feed_forward_length")) {
+            if (!v->is_num() || v->type == MetaType::F32 || v->type == MetaType::F64 || v->type == MetaType::BOOL)
+                return p + "feed_forward_length is not an integer";
+            if ((int64_t) v->u <= 0) return p + "feed_forward_length must be positive";
+            g.n_ff = (int64_t) v->u;
+        }
+    }
     // An in-file MTP block (llama.cpp's NextN layout: the "-NextN" / "MTP" GGUFs) is counted in block_count and stored
     // after the trunk as blk.<trunk>.*.  The engine runs the trunk; its draft head is --mtp, so the block is left out.
     if (const MetaValue* v = f.get(p + "nextn_predict_layers")) {
@@ -803,7 +849,8 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
         return p + "ssm.inner_size = " + std::to_string(g.ssm_value_dim) + ", but ssm.state_size x ssm.time_step_rank = " +
                std::to_string(g.ssm_state_size * g.ssm_v_heads) + ": the GDN kernels take square heads";
     g.ssm_conv_channels = 2 * g.ssm_state_size * g.ssm_k_heads + g.ssm_value_dim;
-    if (g.n_expert_used > g.n_expert || g.n_expert_used > 64)
+    if (g.n_ff <= 0) return p + "feed_forward_length must be positive";
+    if (!dense && (g.n_expert_used > g.n_expert || g.n_expert_used > 64))
         return p + "expert_used_count = " + std::to_string(g.n_expert_used) + ", the router takes 1.." +
                std::to_string(std::min<int64_t>(g.n_expert, 64)) + " of " + std::to_string(g.n_expert) + " experts";
     if (g.n_rot > g.head_dim || g.n_rot > g.idx_key_dim || g.n_rot % 2)
@@ -873,12 +920,18 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
         {"attention.indexer.top_k", &core::ModelGeometry::idx_top_k},
         {"hyper_connection.count", &core::ModelGeometry::hc},
         {"hyper_connection.low_rank", &core::ModelGeometry::hc_lr},
-        {"expert_feed_forward_length", &core::ModelGeometry::n_ff},
     };
     for (const Pin& pin : pins)
         if (g.*pin.field != c.*pin.field)
             return std::string("qwen4exp.") + pin.key + " = " + std::to_string(g.*pin.field) +
                    ", the kernels are compiled for " + std::to_string(c.*pin.field);
+    // (hyper_connection.low_rank stays pinned here: the prompt path is a hand-written N=2560/HC=4/LR=320 fast path
+    // whose init refuses any other geometry fatally - see docs/qwen4/NINFER_PORT_GAPS.md §1/§6.)
+    // a dense FFN's width is a run-time matrix dimension (the GEMVs take it as an argument); a routed expert's is the
+    // shared/grouped expert kernel's contract and stays pinned.
+    if (g.has_experts() && g.n_ff != c.n_ff)
+        return "qwen4exp.expert_feed_forward_length = " + std::to_string(g.n_ff) + ", the kernels are compiled for " +
+               std::to_string(c.n_ff);
     // one constant in the norm kernels; the files carry it as an f32, so compare at f32 precision
     if (std::abs(g.rms_eps - c.rms_eps) > 1e-6 * c.rms_eps) {
         char buf[160];

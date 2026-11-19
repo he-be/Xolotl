@@ -18,13 +18,16 @@ On top of that, per model:
 - **DeepSeek-V4.1-Flash** - its own GSQ quantisation (every expert gets its format from calibration: ternary PTQ1_0,
   Q2_0 or Q3_K), the Engram n-gram memory read from disk, **DSpark speculative decoding** with exact speculative
   sampling and confidence-gated verify, a **bit-exact 4-bit KV cache** (`--kv-fp4`) for 512K context, and selection-only
-  routing biases that keep every expert reachable. Full write-up: **[docs/DEEPSEEK_V41.md](../DEEPSEEK_V41.md)**.
+  routing biases that keep every expert reachable. Opt-in extras: **fast mode** reads a 2-bit (Q2_K) copy of the
+  biggest experts from a sidecar file (+27 % decode, short34 top-1 87.0 -> 86.2 %;
+  [docs/XOLOTL_FAST.md](../XOLOTL_FAST.md)), and **Xolotl Direct** has the NVMe drive write file-tier experts straight
+  into VRAM ([docs/XOLOTL_DIRECT.md](../XOLOTL_DIRECT.md)). Full write-up: **[docs/DEEPSEEK_V41.md](../DEEPSEEK_V41.md)**.
 - **GLM-5.3-Flash** - KDA + MLA hybrid attention, 288 experts top-8, the abliteration LoRA applied to the dense half
   **and** the routed experts on every path (GPU, MMQ prompt chunks, CPU pool), soft pruning (every expert stays
   reachable), an elastic expert cache that lends its VRAM to long prompts. Details: [docs/glm](../glm).
 - **Qwen3.8-Flash-Next** - upstream Strata 0.1.44: MTP speculative decoding, int8 KV, image input with an encoder that
   starts on the first picture and gives its VRAM back when idle. Details: [README.strata.md](../../README.strata.md).
-- **Qwen3.8-27B** - native GGUF dense engine (`strata-dense`): MMQ prompt prefill, MTP speculative decoding (draft 3),
+- **Qwen3.8-27B** - native GGUF dense engine (`xolotl-dense`, built on Mirko Perrone's dense port): MMQ prompt prefill, MTP speculative decoding (draft 3),
   int8-K / int4-V cache (`k8v4`) for 200K context.
 
 Every model is served by the same Python server with each model's own chat template and tool-call format (Qwen

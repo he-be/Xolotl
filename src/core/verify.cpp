@@ -1,4 +1,5 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
+#include "strata/kernels/expert_keep.hpp"
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -2066,6 +2067,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                strata::kernels::expert_keep_apply(logits_ + tb * NE, n, NE, l, cs);   // STRATA_EXPERT_KEEP
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -3270,7 +3272,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
@@ -3488,19 +3490,21 @@ void Verifier::set_plan_slot(int grp) {
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
-void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
-#if defined(_WIN32)
-    volatile long* f = (volatile long*) flag;
-    long cur = *f;
-    while ((uint32_t) cur < value) {
-        const long prev = _InterlockedCompareExchange(f, (long) value, cur);
-        if (prev == cur) break;
-        cur = prev;
+void Verifier::raise_flag(uint32_t* flag, uint32_t value) { strata::core::flag_raise_max(flag, value); }
+
+// Flag B for layer `want - 1`, behind every copy queued on the copy stream (PR #5096, @AlanJager).  The counter only
+// rises and the graph waits for "flag B >= layer + 1", so raising it on the spot for a layer with nothing to copy
+// releases an earlier layer (or the other token group of a split window) whose uploads are still in flight.
+void Verifier::raise_flag_b_ordered(uint32_t want) {
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    const cudaError_t e = strata::core::raise_flag_b_ordered(copy_used_, copy_, &fs, h_flagB_, want);
+    if (e != cudaSuccess) {
+        // The flag was not raised: the consumers must not be released to staging that is still being written.
+        std::fprintf(stderr, "strata DMA: ordered flag B completion failed: %s\n", cudaGetErrorString(e));
+        std::fflush(stderr);
+        release_gpu_waits(5000);
+        std::abort();
     }
-#else
-    uint32_t cur = __atomic_load_n((uint32_t*) flag, __ATOMIC_SEQ_CST);
-    while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
-#endif
 }
 
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
@@ -3509,7 +3513,7 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_flag_b_ordered(want); return; }   // an empty plan stays behind the copies already queued
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
@@ -3528,10 +3532,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
             std::abort();
         }
     }
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
-    fs.value = want;
-    cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+    v->raise_flag_b_ordered(want);   // copy_used_ is set: the host function runs after this group's uploads
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -4463,7 +4464,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -4608,7 +4609,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
@@ -4747,6 +4748,31 @@ bool Verifier::copy_logits(int t, float* host) const {
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+
+bool Verifier::resample_logits(int row, const float* logits, int64_t position, int slot,
+                              int32_t& out, std::string& err) {
+    if (next_) return next_->resample_logits(row, logits, position, slot, out, err);
+    const OnDevice on_device(device_);
+    if (!logits || row < 0 || row >= last_t_ || !head_logits_) {
+        err = "verify: constrained row unavailable"; return false;
+    }
+    auto sp = slot >= 0 ? slot_sp_.at((size_t) slot) : sampling_;
+    sp.counter = (uint64_t) position;
+    const int32_t* history = slot < 0 && hist_d_ ? hist_d_ + (size_t) row * hist_len_ : nullptr;
+    const int history_len = history ? hist_len_ : 0;
+    if (slot >= 0) sp.penalty_last_n = 0; // same policy as sample_rows
+    float* target = head_logits_ + (size_t) row * n_vocab_;
+    if (cudaMemcpyAsync(target, logits, (size_t) n_vocab_ * sizeof(float), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = "verify: constrained logits upload failed"; return false;
+    }
+    strata::kernels::sample_tokens(target, 1, (int) n_vocab_, history, history_len, sp, m_out_ + row, cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: constrained sampling failed"; return false;
+    }
+    out = ((volatile int32_t*) h_out_)[row];
+    return true;
 }
 
 
@@ -4961,7 +4987,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;

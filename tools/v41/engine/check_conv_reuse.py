@@ -9,13 +9,15 @@ prefill of the same prompt as closely as the batch-shape noise of a known-good c
   check_conv_reuse.py --bin build/ds41_generate --model M.gguf --engram A:B --tokenizer tokenizer.json \
       --scenario park_partial [--ref-bin B2] [--tail 20]
 
-The prompts are token runs of the repo's README.md / HANDOFF.md / howto_eng.md (--tokenizer: the model's
+The prompts are token runs of the repo's README.md / docs/history/HANDOFF-2026-10-18.md / docs/dense/HOWTO.md (--tokenizer: the model's
 tokenizer.json, or DS41_TOKENIZER_JSON).
 
 Scenarios: park_partial (the STRATA_SERVE_PARK_PARTIAL resume 20 positions back, then 8 back), park16 (a partial
 resume 8 back, within the window ring, then 21 back), engram_hist (a side request longer than the parked
 conversation's end overwrites the Engram history), single (one growing text dialogue, a regenerate and a re-render),
-abc (three conversations interleaved, two sharing a system prompt: the conversation pool), image (a dialogue with
+abc (three conversations interleaved, two sharing a system prompt: the conversation pool), interrupt (a reply
+interrupted past its prompt, then the prompt's last 3 tokens re-rendered: a partial resume below the newest pool
+boundary must beat the older boundary), image (a dialogue with
 synthetic SVE1 image rows and img_keys, a text side request, and the same tokens with another picture).
 """
 import argparse
@@ -143,7 +145,7 @@ def build_steps(sc, out, tokenizer_json):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[3]
-    texts = corpus([root / "README.md", root / "HANDOFF.md", root / "howto_eng.md"], tokenizer_json)
+    texts = corpus([root / "README.md", root / "docs/history/HANDOFF-2026-10-18.md", root / "docs/dense/HOWTO.md"], tokenizer_json)
     T = [t for t in texts if len(t) >= 1000]
     if len(T) < 3:
         raise SystemExit("corpus too short")
@@ -180,6 +182,18 @@ def build_steps(sc, out, tokenizer_json):
             h = h + B[i * 30 + 20:(i + 1) * 30]   # the "assistant reply" as the client re-renders it
         steps.append(("regen", list(steps[-1][1]), 3, "", None))
         steps.append(("re-render 12 back", steps[-1][1][:-12] + C[:16], 3, "", None))
+    elif sc == "interrupt":
+        # xolotl 2026-11-08 (a real 64K agent session): a reply interrupted past its prompt, then the client re-renders
+        # the last 3 tokens of that prompt.  The pool holds a boundary at the end of turn 1's prompt and (switch save)
+        # one at the end of turn 2's; the request diverges 3 tokens before the latter.  Expected: resume at
+        # (len(p2) - 3) & ~1, a partial resume 4 below that boundary - before the ConvMatch::resume fix it resumed at
+        # the end of turn 1 (here 40 tokens back; in the session 10,593).  Run with --conversation-cache-min-tokens 64.
+        # A step's ids may be a function of the results so far: a client sends the model's own reply back.
+        p1 = BOS + A[:239]
+        p2 = lambda res: p1 + res[0]["tokens"] + A[239:259] + B[:20]   # continues turn 1 + its reply: a turn save
+        p3 = lambda res: res[1]["ids"][:-3] + C[:20]                   # turn 2's prompt, its last 3 re-rendered
+        steps = [("turn 1", p1, 2, "", None), ("turn 2 (its reply runs 12 past the prompt)", p2, 12, "", None),
+                 ("interrupt: re-render 3 back (expect resume (len(turn 2) - 3) & ~1)", p3, 2, "", None)]
     elif sc == "abc":
         sys_p = BOS + A[:119]
         convs = {"A": sys_p + B[:60], "B": sys_p + C[:60], "C": BOS + C[300:420]}
@@ -229,13 +243,16 @@ def main():
     ap.add_argument("--vision", action="store_true")
     ap.add_argument("--no-ref", action="store_true", help="skip the fresh engine (decisions only)")
     ap.add_argument("--ref-all", action="store_true", help="a fresh reference for every step, not only the reused ones")
+    ap.add_argument("--gpu", action="store_true", help="CUDA backend + GPU experts (pass the arena etc. via --extra); "
+                    "batch shapes differ between reuse and fresh, so judge by KL / top-1, not bitexact")
     ap.add_argument("--tail", type=int, default=0, help="STRATA_SERVE_DUMP_TAIL: compare the last N prompt rows too")
     a = ap.parse_args()
     if not a.tokenizer:
         ap.error("--tokenizer (or DS41_TOKENIZER_JSON) is required")
     out = Path(a.out or tempfile.mkdtemp(prefix="ds41-reuse-"))
     out.mkdir(parents=True, exist_ok=True)
-    common = ["-m", a.model, "--engram", a.engram, "--backend", "cpu", "--experts", "cpu", "--arena-gib", "0",
+    dev = ["--backend", "cuda", "--experts", "gpu"] if a.gpu else ["--backend", "cpu", "--experts", "cpu", "--arena-gib", "0"]
+    common = ["-m", a.model, "--engram", a.engram, *dev,
               "--ctx", "8192", "--threads", str(a.threads), "--prompt-batch", "512", "--prefill-chunk", "64",
               "--stop", "1"] + (["--vision"] if a.vision else []) + (a.extra.split() if a.extra else [])
     env = dict(kv.split("=", 1) for kv in a.env)
@@ -244,11 +261,15 @@ def main():
     env.update(tail_env)
     sc = a.scenario
     steps = build_steps(sc, out, a.tokenizer)
-    eng = Engine(a.bin, common, env, out, "test")
+    eng = Engine(a.bin, common, env, out, "test", cpu=not a.gpu)
     res = []
     try:
-        for label, ids, mx, keys, emb in steps:
+        for k, (label, ids, mx, keys, emb) in enumerate(steps):
+            if callable(ids):
+                ids = ids(res)
+                steps[k] = (label, ids, mx, keys, emb)
             r = eng.gen(ids, mx, keys, emb)
+            r["ids"] = ids
             res.append(r)
             print(f"[test] {label}: prompt {len(ids)} resume {r['resume']} tokens {r['tokens']} {r['sec']:.1f} s", flush=True)
     finally:
@@ -258,7 +279,7 @@ def main():
         summary["steps"].append({"label": label, "prompt": len(ids), "resume": r["resume"], "tokens": r["tokens"],
                                  "sec": round(r["sec"], 1)})
     if not a.no_ref:
-        ref = Engine(a.ref_bin or a.bin, common, {"STRATA_SERVE_PARK": "0", **tail_env}, out, "fresh")
+        ref = Engine(a.ref_bin or a.bin, common, {"STRATA_SERVE_PARK": "0", **tail_env}, out, "fresh", cpu=not a.gpu)
         try:
             for (label, ids, mx, keys, emb), r, st in zip(steps, res, summary["steps"]):
                 if r["resume"] == 0 and not a.ref_all:

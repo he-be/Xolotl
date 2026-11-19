@@ -51,10 +51,31 @@ namespace strata::core
         int n_embd = 0, n_ff = 0, n_vocab = 0;
         int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
         int ssm_d_conv = 0, ssm_state = 0, ssm_k_heads = 0, ssm_v_heads = 0;
+        /// Hyper-connections (the Flash-Next / Qwen4 gated residual): `hc` residual streams of `n_embd` and the
+        /// rank of their down/up bottleneck. 0 = the plain pre-norm residual (Qwen3.8-27B, architecture qwen35).
+        int hc = 0, hc_lr = 0;
+        /// xolotl: the layer schedule.  plan[s] is the physical layer execution slot s runs; every slot has its own
+        /// KV cache / GDN state and shares its physical layer's weights.  A looped file (`<arch>.loop.{start,end,
+        /// count}`, SenseNova-Loop) runs [start, end) `count` times; --layer-schedule overrides it for any file.
+        /// Empty plan = 0..n_layer-1, the plain model.
+        std::vector<int> plan;
+        int n_slot() const { return plan.empty() ? n_layer : (int) plan.size(); }
+        int phys(int slot) const { return plan.empty() ? slot : plan[(size_t) slot]; }
+        /// xolotl: manifold-constrained hyper-connections (SenseNova-Loop): `mhc_streams` residual streams on the
+        /// physical layers [mhc_start, mhc_end).  Each visit of mhc_start expands the hidden state into the streams and
+        /// each visit of mhc_end - 1 averages them back, so a loop pass starts and ends with one vector.  0 = none.
+        int mhc_streams = 0, mhc_start = 0, mhc_end = 0, mhc_iters = 20;
+        bool mhc_fixed_identity = false;
+        float mhc_pre_scale = 1.0f;
+        bool has_mhc() const { return mhc_streams > 0; }
+        int mhc_rows() const { return 2 * mhc_streams + (mhc_fixed_identity ? 0 : mhc_streams * mhc_streams); }
+        bool mhc_layer(int physical) const { return has_mhc() && physical >= mhc_start && physical < mhc_end; }
         float rms_eps = 1e-6f, rope_base = 1e7f;
         int32_t eos_id = -1; ///< tokenizer.ggml.eos_token_id: the id that ends an answer
         int conv_channels() const { return 2 * ssm_state * ssm_k_heads + ssm_state * ssm_v_heads; }
         int value_dim() const { return ssm_state * ssm_v_heads; }
+        int hc_dim() const { return hc * n_embd; }
+        bool has_hc() const { return hc > 0; }
     };
 
     enum class Logits
@@ -73,6 +94,23 @@ namespace strata::core
         /// "q4_0" (4-bit after a Hadamard rotation, about 28%) or "k8v4" (int8 keys, 4-bit values, about 40%).
         /// "f16", "q8_0" and "q4" are accepted too.  The 4-bit formats need head_dim 256.
         std::string kv = "fp16";
+        /// xolotl: rollback snapshots (draft_max of them) without the MTP block, for an external drafter (DFlash2).
+        bool spec_snapshots = false;
+        /// xolotl: layers whose output rows run() and prefill() copy for an external drafter (DFlash2: its
+        /// target_layer_ids, e.g. 5,19,33,47,61); empty = off.  See run_taps() / ring_taps().
+        std::vector<int> taps;
+        /// xolotl: MTP drafts score only these token ids (a frequency shortlist, NInfer's --lm-head-draft): the
+        /// head rows are copied once into a smaller matrix, so each draft step reads a fraction of the 248K-row head.
+        /// Verification keeps the full head, so the output is unchanged; a draft outside the list is just rejected.
+        /// Empty = drafts use the full head.
+        std::vector<int32_t> draft_vocab;
+        int draft_vocab_extra = 16384;  ///< rows kept free after the shortlist for draft_vocab_extend()
+        int64_t kv_resident = 0;        ///< cells per KV head kept in VRAM, the rest in host RAM (0 = all in VRAM, -1 = auto: what fits)
+        int vram_reserve_mib = 0;       ///< VRAM left free for another program (the vision encoder) when budgeting
+        /// xolotl: --layer-schedule "0-3,4-27,4-27,28-31": the physical layers to run, in order, overriding the file's
+        /// own loop.  Repeated layers share weights (no extra VRAM for them) and get their own KV / GDN state.  Lets
+        /// any dense file run a repeated-layer schedule without a merged copy.  Empty = the file's schedule.
+        std::string layer_schedule;
     };
 
     class DenseModel
@@ -173,8 +211,32 @@ namespace strata::core
         /// block's own output (llama.cpp does the same for a single head).  Drafting stops early at the first token
         /// whose probability is below `p_min` (that token is not returned).  Greedy.  *n_out receives the count.
         bool mtp_draft(int32_t token, int pos, int max_n, float p_min, int32_t *out, int *n_out, std::string &err);
+        /// xolotl: adds the tokens of `tokens` (a request's prompt) that the --draft-vocab shortlist lacks to the
+        /// drafts' head, newest first, up to DenseOptions::draft_vocab_extra rows; replaces the previous request's.
+        /// No-op without a shortlist.  Drafts only: verification is untouched.
+        void draft_vocab_extend(const int32_t *tokens, int64_t n);
         /// Makes column `col` of the last run() the "last hidden" (used after a rollback).
         void set_last_hidden(int col);
+
+        // ---- xolotl: an external drafter's inputs (DenseOptions::taps)
+        static constexpr int kTapRing = 2048;
+        int n_taps() const;
+        /// Device [kMaxCols][n_taps * n_embd]: the tap layers' output rows of the last run() (column j = row j).
+        const float *run_taps() const;
+        /// Device [kTapRing][n_taps * n_embd]: prefill() writes the row of position p at p % kTapRing (the last
+        /// kTapRing rows of every prompt chunk).
+        const float *ring_taps() const;
+        /// The token's embedding row (n_embd floats) on the host, dequantized from the model file.
+        bool embed_host(int32_t token, float *out, std::string &err) const;
+        /// The vision path (--vision): rows[c] is the n_embd-float embedding of cell c (an image row from strata-vision)
+        /// or nullptr (the cell's token goes through the embedding table as usual), for cells 0..n-1.  run() and
+        /// prefill() read it; the MTP drafter keeps the table row of the token (<|image_pad|>), as strata's does.  The
+        /// array and the rows must stay alive while they are set; nullptr (the default) turns it off.
+        void set_embd_rows(const float *const *rows, int64_t n);
+        /// The output head as native_mmvq reads it: weights (device or mapped), type, rows (= n_vocab).
+        const void *head_weights() const;
+        int head_type() const;
+        int64_t head_rows() const;
 
     private:
         struct Impl;

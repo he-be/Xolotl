@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/dense_bench.py - measure `strata-dense` without the HTTP server.
+"""tools/dense_bench.py - measure `xolotl-dense` without the HTTP server.
 
 WHY.  Tuning the dense decode needs a number that comes back the same way every time.  Going through
 serve/server.py adds the chat template, the sampler defaults and a websocket, and it can only be run by whoever
@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
-EXE = "strata-dense.exe" if os.name == "nt" else "strata-dense"
+EXE = "xolotl-dense.exe" if os.name == "nt" else "xolotl-dense"
 
 # A prompt with real structure: the model has to read it, and its length is easy to control.  Repeated with
 # variation so the prompt is not one giant n-gram the drafter could memorize.
@@ -168,6 +168,9 @@ def run_once(exe: Path, args: list[str], prompt: list[int], max_new: int, env: d
     prof = [l for l in err if "speculative cycles" in l]
     if prof:
         rec["cycle_line"] = prof[-1]
+    pl = [l for l in err if "xolotl-dense prof:" in l]   # STRATA_DENSE_PROF=1: the last 8-pass breakdown
+    if pl:
+        rec["prof_line"] = pl[-1].strip()
     proc.stdin.write("QUIT\n")
     proc.stdin.flush()
     try:
@@ -197,6 +200,7 @@ def main() -> int:
     ap.add_argument("--env", action="append", default=[], help="NAME=VALUE for the engine (STRATA_DENSE_PROF=1)")
     ap.add_argument("--json", default="", help="write the records here")
     ap.add_argument("--timeout", type=float, default=1200.0)
+    ap.add_argument("--engine-arg", action="append", default=[], help="extra engine argument (repeat), e.g. --engine-arg=--dflash2")
     a = ap.parse_args()
 
     gguf = Path(a.gguf)
@@ -222,6 +226,7 @@ def main() -> int:
         args += ["--no-prefill"]
     elif a.prompt_chunk:
         args += ["--prompt-chunk", str(a.prompt_chunk)]
+    args += a.engine_arg
 
     env = dict(os.environ)
     for e in a.env:
@@ -241,6 +246,8 @@ def main() -> int:
               f"{rec['decode_ms'] / 1000:5.1f} s){acc}", flush=True)
         if "cycle_line" in rec:
             print(f"    {rec['cycle_line']}", flush=True)
+        if "prof_line" in rec:
+            print(f"    {rec['prof_line']}", flush=True)
 
     decodes = [r["decode_tok_s"] for r in records]
     pps = [r["pp_tok_s"] for r in records]

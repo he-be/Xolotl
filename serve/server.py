@@ -40,6 +40,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import select
 import signal
 import socket
@@ -75,7 +76,7 @@ from strata_control import tls  # noqa: E402
 tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
 from strata_control import hipblaslt_tuning  # noqa: E402
 from strata_control import vision_reader  # noqa: E402
-from serve.ds_pictures import DsPictures  # noqa: E402
+from serve.ds_pictures import PICTURE_FORMATS, DsPictures  # noqa: E402
 from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
 from strata_control import user_args  # noqa: E402
@@ -249,7 +250,9 @@ REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
-# low-effort instruction in place of the xhigh one.  Both off by default.
+# low-effort instruction in place of the xhigh one (Qwen prompts only: it needs their effort sentence); "wrap" closes
+# the thinking the way the thinking budget does and lets the model answer (any model family; once a reply).  All off
+# by default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
@@ -319,6 +322,10 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
+# #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
+# it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
+# for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
+STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "60") or 0)
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
@@ -452,6 +459,11 @@ class EngineNonFinite(ValueError):
     engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
     request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
+
+
+class EngineGrammarStarved(ValueError):
+    """The request's grammar has no next token. Its terminal marker was consumed;
+    the engine and unrelated slots remain usable. Never retry as a numerical fault."""
 
 
 class SessionRefused(ValueError):
@@ -1183,10 +1195,13 @@ class StrataEngine:
         finally:
             if cancel_read is not None:
                 os.close(cancel_read)
+        # THIS start's process, captured once (#4792): a restart()/close() on another thread sets self.proc to None, and
+        # the cleanup below then read None.stdin - a recoverable engine abort became an AttributeError and a 400
+        proc = self.proc
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
-        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
+        threading.Thread(target=self._ready_pump, args=(proc, ready_q), daemon=True).start()
         ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
         timed_out = False
         while True:
@@ -1214,21 +1229,21 @@ class StrataEngine:
             self._close_cancel_pipe()
             if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
                 try:
-                    self.proc.kill()
+                    proc.kill()
                 except OSError:
                     pass
             try:                                        # its pipes and our handle on its log (the log stays)
-                self.proc.wait(timeout=5)
-                self.proc.stdin.close()
-                self.proc.stdout.close()
+                proc.wait(timeout=5)
+                proc.stdin.close()
+                proc.stdout.close()
                 if log:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
             if not timed_out and _attempt < START_RETRIES and \
-                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, self.proc.returncode):
+                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
-                exit_words = engine_exit_words(self.proc.returncode)
+                exit_words = engine_exit_words(proc.returncode)
                 if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
                     print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
                           f"another engine exited, whose GPU queues were still being released"
@@ -1246,7 +1261,7 @@ class StrataEngine:
                    "the engine exited before it was ready")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
-            note = "" if timed_out else start_exit_note(self.proc.returncode, exe)
+            note = "" if timed_out else start_exit_note(proc.returncode, exe)   # THIS start's process (#4792)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
             if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
@@ -1888,7 +1903,25 @@ class StrataEngine:
                         break
 
     @staticmethod
-    def sampling_keys(sampling: dict) -> str:
+    def _swallow_trailing_done(lines_q, wait: float = 0.3) -> None:
+        """A request that ends on `ERR ...` is over, but an engine that also prints the request's `DONE` after it (the DeepSeek
+        engine did, after its NaN stop) would hand that DONE to the NEXT request as its own: 0 tokens at once, and every answer
+        after it one request late.  So a short wait for a trailing DONE (or ERR) of the same request, taken off the queue and
+        dropped, before the request is reported failed and the FIFO released.  An engine that prints only the ERR costs the wait."""
+        end = time.monotonic() + wait
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            try:
+                late = lines_q.get(timeout=left)
+            except queue.Empty:
+                return
+            if late is None or late.startswith(("DONE", "ERR")):
+                return
+
+    @staticmethod
+    def sampling_keys(sampling: dict, *, grammar_replay: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -1983,6 +2016,12 @@ class StrataEngine:
             after = sampling.get("_grammar_after")
             if after is not None:
                 keys += f" grammar_after={int(after)}"
+            replay = sampling.get("_grammar_prefix")
+            if grammar_replay and replay:
+                if (not isinstance(replay, (list, tuple)) or
+                        not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in replay)):
+                    raise ValueError("grammar replay must contain emitted token IDs")
+                keys += " grammar_prefix=" + ",".join(str(t) for t in replay)
         # logprobs: the engine writes an `LP` line after each `T` line (an engine without them ignores
         # the key, so an older engine answers exactly as it did).  Absent = no LP lines at all.
         k = top_logprobs(sampling)
@@ -2135,18 +2174,24 @@ class StrataEngine:
                 if sep and key in names and value.isdigit():
                     self.last = {**self.last, names[key]: int(value)}
 
-    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
+    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0, cancel=None, born=None):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
         and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
         wait takes over."""
         if slot >= len(self.slot_q):
             return None
+        q = self.slot_q[slot]  # a restart must not redirect this drain to its successor's queue
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
+            if (cancel is not None and cancel.is_set()) or (born is not None and self.gen != born):
+                return None
             try:
-                line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
+                timeout = max(0.05, end - time.monotonic())
+                line = q.get(timeout=min(timeout, WATCH_CLIENT_S) if cancel is not None else timeout)
             except queue.Empty:
+                if cancel is not None:
+                    continue
                 return None
             if line is None:
                 return None
@@ -2196,7 +2241,7 @@ class StrataEngine:
                         tail = []
                 if line.startswith("BDONE "):
                     completed = True
-                    if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
+                    if line.split()[3:4] in (["nonfinite"], ["grammar"]):   # invalidated request state
                         tail = []
                     break
             held[slot] = tail[:-1] if completed and stream and tail else []
@@ -2364,7 +2409,16 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        replay_grammar = str((self.info or {}).get("grammar_replay", 0)) == "1"
+        keys = self.sampling_keys(sampling or {}, grammar_replay=replay_grammar)
+        def leg_keys():
+            # Only outputs of this request enter the parser. The prompt may have
+            # image expansion or a different cached representation, so no prompt
+            # position is used to infer where the constrained answer began.
+            if replay_grammar and (sampling or {}).get("_grammar_path") is not None and out:
+                prefix = list((sampling or {}).get("_grammar_prefix") or ()) + out
+                return self.sampling_keys({**(sampling or {}), "_grammar_prefix": prefix}, grammar_replay=True)
+            return keys
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2407,7 +2461,8 @@ class StrataEngine:
                 # request. Replaying generated text as a fresh GEN/BGEN prompt
                 # would restart that state, so this capability pins the owner.
                 if alone and left > 1 and str((self.info or {}).get("batch_pinned", 0)) != "1":
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    current_keys = leg_keys()
+                    head = f"GENI {left}{current_keys} {embeddings}" if embeddings else f"GEN {left}{current_keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
@@ -2450,6 +2505,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if self._done_finish() == "grammar":
+                        raise EngineGrammarStarved("the grammar permits no next token")
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
@@ -2540,7 +2597,8 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    current_keys = leg_keys()
+                    head = f"BGENI {slot} {left}{current_keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{current_keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
                             "started": time.time(), "first_token": None}
@@ -2647,6 +2705,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if not cont and self._done_finish() == "grammar":
+                        raise EngineGrammarStarved("the grammar permits no next token")
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
@@ -2695,6 +2755,9 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        if f[3:4] == ["grammar"]:
+                            self.slot_held[slot] = []
+                            raise EngineGrammarStarved("the grammar permits no next token")
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2718,30 +2781,37 @@ class StrataEngine:
                             break
                         return
         finally:
-            # Unpublish before a slot can be freed/reused. An old watcher cannot stop its successor.
-            self._forget_batch_owner(cancel, cancel_owner)
+            # EOS can precede request-owned native capture and BDONE. Keep its
+            # watcher owner while draining that work, then revoke before reuse.
+            eos_wait = phase in ("slot", "admit") and slot is not None and out and out[-1] in EOS_IDS and self.gen == born
+            if not eos_wait:
+                self._forget_batch_owner(cancel, cancel_owner)
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
-            try:
-                if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
-                    phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
-                if phase in ("solo", "admit") and self._ctl_erred:
-                    phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
-                if phase == "solo":
-                    self._send("STOP")
-                    self._drain_control("DONE", born=born)
-                elif phase == "admit":
-                    line = self._drain_control("BADM", born=born)
-                    if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
-                        phase = "slot"
-            except EngineDied:
-                pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
-                if bd is not None:
-                    self._apply_bdone(bd.split())
-                    bdone_in = True
+            try:
+                try:
+                    if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
+                        phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
+                    if phase in ("solo", "admit") and self._ctl_erred:
+                        phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
+                    if phase == "solo":
+                        self._send("STOP")
+                        self._drain_control("DONE", born=born)
+                    elif phase == "admit":
+                        line = self._drain_control("BADM", born=born)
+                        if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
+                            phase = "slot"
+                except EngineDied:
+                    pass
+                if eos_wait and phase == "slot":
+                    bd = self._bdone_after_eos(slot, cancel=cancel, born=born)  # (#1869) keep the slot leg's figures
+                    if bd is not None:
+                        self._apply_bdone(bd.split())
+                        bdone_in = True
+            finally:
+                if eos_wait:
+                    self._forget_batch_owner(cancel, cancel_owner)
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
@@ -2913,8 +2983,9 @@ class StrataEngine:
         self.lp_lines = LPLines(cancel)
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        keys = self.sampling_keys(sampling or {}, grammar_replay=str((self.info or {}).get("grammar_replay", 0)) == "1")
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{keys}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -3016,6 +3087,8 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    if self.last.get("finish") == "grammar":
+                        raise EngineGrammarStarved("the grammar permits no next token")
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
@@ -3027,10 +3100,11 @@ class StrataEngine:
                         print("[strata] the engine no longer holds a picture sent by reference: sending the rows",
                               flush=True)
                         embeddings = refill()
-                        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}"
+                        head = f"GENI {int(max_new)}{keys} {embeddings}"
                         self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
                         continue
                     done = True
+                    self._swallow_trailing_done(self.lines)  # an engine that ended the request on ERR may still print its DONE
                     raise ValueError(line[4:].strip())
         finally:
             with getattr(self, "wlock", None) or contextlib.nullcontext():
@@ -3404,6 +3478,8 @@ class Vision:
         args = self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
+        self.persistence_requested = bool((env if env is not None else os.environ).get("STRATA_PREFIX_CACHE_DIR"))
+        self.persistent_images = False  # enabled only after an eager reader is bound before native startup
         # AMD: the GPU reader (strata-vision-hip) has the CPU reader (strata-vision, same program, no GPU runtime) to
         # fall back on when it does not start; _start switches to it by itself
         cpu = vision_reader.cpu_fallback(cfg)
@@ -3459,6 +3535,71 @@ class Vision:
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
         return args
+
+    def persistence_namespace(self) -> str:
+        """Resolve the actual reader before a native HAVE may bypass encoding.
+
+        Its configured GPU reader can fall back to a CPU reader. The selected
+        executable, options and loaded library inventory, rather than only the
+        originally configured pair, therefore belong to the image identity.
+        Inputs must remain immutable while this reader is running.
+        """
+        if not self.persistence_requested:
+            return ""
+        if not self.alive():
+            if self.on_start is not None:
+                self.on_start()
+            self._start()
+        args, _, env = self.spawn
+        files = {str(Path(__file__).resolve()), str(Path(vision_reader.__file__).resolve())}
+        # Optional normalization code can change a UUID's pixels without changing
+        # the UUID. Include its installed implementation, without decoding a picture.
+        from importlib.util import find_spec
+        pillow = find_spec("PIL")
+        if pillow and pillow.origin:
+            package = Path(pillow.origin).resolve().parent
+            files.update(str(p.resolve()) for p in package.iterdir()
+                         if p.is_file() and (p.suffix == ".py" or ".so" in p.name))
+            libraries = package.parent / "pillow.libs"
+            if libraries.is_dir():
+                files.update(str(p.resolve()) for p in libraries.iterdir() if p.is_file())
+        for i in (0, 2, 4):
+            path = shutil.which(args[i], path=(env or os.environ).get("PATH")) if i == 0 else args[i]
+            if not path:
+                raise ValueError("persistent image identity requires a resolved reader")
+            original = Path(path)
+            files.add(str(original.resolve(strict=True)))
+            # Keep the configured spelling: HF snapshot shards can be symlinks
+            # to opaque blob names, while the loader finds siblings by shard name.
+            split = re.fullmatch(r"(.*-)\d{5}-of-(\d{5})(\.gguf)", original.name)
+            if i != 0 and split:
+                count = int(split[2])
+                if not 1 <= count <= 4096:
+                    raise ValueError("persistent image reader split inventory is not bounded")
+                for part in range(1, count + 1):
+                    files.add(str((original.parent / f"{split[1]}{part:05d}-of-{count:05d}{split[3]}").resolve(strict=True)))
+        # Persistent native storage is Linux-only. Refuse unbound image reuse
+        # when the actual loaded implementation cannot be inspected.
+        proc = Path("/proc") / str(self.proc.pid)
+        files.add(str((proc / "exe").resolve(strict=True)))
+        for line in (proc / "maps").read_text().splitlines():
+            if "/" not in line:
+                continue
+            path = line[line.index("/"):]
+            if ".so" in path:
+                if path.endswith(" (deleted)"):
+                    raise ValueError("persistent image reader inventory changed; restart the reader")
+                files.add(str(Path(path).resolve(strict=True)))
+        inventory = []
+        for name in sorted(files):
+            stat = Path(name).stat()
+            inventory.append((name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        effective = {k: v for k, v in (env or os.environ).items()
+                     if (k.startswith(("STRATA_", "XOLOTL_", "CUDA_", "HIP_", "GGML_", "ROCR_", "OMP_", "MKL_", "OPENBLAS_"))
+                         or k in ("LD_LIBRARY_PATH", "PATH", "NVIDIA_TF32_OVERRIDE", "CUBLAS_WORKSPACE_CONFIG"))
+                     and not k.startswith("STRATA_PREFIX_CACHE_") and not (k.endswith("_LOG") or "_LOG_" in k)}
+        identity = json.dumps(["vision-pipeline-v1", args, effective, inventory], sort_keys=True).encode()
+        return hashlib.sha256(identity).hexdigest()
 
     def _ensure_dir(self):
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder while the encoder is unloaded; the next
@@ -3599,7 +3740,7 @@ class Vision:
         try:
             import io
             from PIL import Image
-            with Image.open(io.BytesIO(data)) as im:
+            with Image.open(io.BytesIO(data), formats=PICTURE_FORMATS) as im:
                 return im.getexif().get(0x0112, 1) not in (None, 0, 1)
         except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
             return False
@@ -3629,7 +3770,7 @@ class Vision:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
@@ -4342,6 +4483,29 @@ def deepseek_slot_env(env: dict, cfg: dict) -> None:
         env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
 
 
+def bind_persistent_vision(env: dict, vision) -> None:
+    """Only an already selected eager reader can bind native disk image state.
+
+    Lazy, elastic and direct native callers remain unbound. Their normal image
+    path still works, but Qwen3.6 does not restore/publish image state on disk.
+    """
+    env.pop("STRATA_PREFIX_CACHE_VISION_ID", None)
+    vision.persistent_images = False
+    if env.get("STRATA_PREFIX_CACHE_DIR") and vision.alive():
+        try:
+            identity = vision.persistence_namespace()
+            if not re.fullmatch(r"[0-9a-f]{64}", identity):
+                raise ValueError("reader identity unavailable")
+        except (OSError, ValueError) as error:
+            print(f"[strata] persistent image state disabled: reader identity unavailable ({type(error).__name__})", flush=True)
+            return
+        env["STRATA_PREFIX_CACHE_VISION_ID"] = "frontend-vision-pipeline-v1:" + identity
+        vision.persistent_images = True
+        print(f"[strata] persistent image producer bound: {identity}", flush=True)
+    elif env.get("STRATA_PREFIX_CACHE_DIR"):
+        print("[strata] persistent image state disabled: reader was not started before native startup", flush=True)
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -4383,6 +4547,9 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         auto = hip_auto_devices(cfg, env)
         if auto:
             env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in auto)
+    # The native side rejects persisted image state from an unbound embedding
+    # producer. Runtime-specific reader identity is carried by the picture keys.
+    env.pop("STRATA_PREFIX_CACHE_VISION_ID", None)
     return env
 
 
@@ -4745,6 +4912,10 @@ class Service:
         self.asr_native: dict | None = None              # local: the model transcribes itself ("asr_native" block)
         self.port = 0
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        # the thinking of the latest replies, by their answer's text, each beside the end of the prompt it answered
+        # (_restore_reasoning)
+        self.recent_reasoning: collections.OrderedDict[str, list[tuple[str, str]]] = collections.OrderedDict()
+        self.reasoning_mu = threading.Lock()          # recent_reasoning: written by the generating thread, read by request threads
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
@@ -4853,8 +5024,10 @@ class Service:
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.repeat_wrap_up = True                       # ... unless the model is thinking: then the thinking is closed
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
+        self.keep_cut_tool_calls = False                  # opt-in: a whole OpenAI answer keeps a call cut at the token limit (openai_collect)
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
@@ -4882,10 +5055,25 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        elif family == "muse-glimmer":
+            # Muse Glimmer (local): its turn is messages to channels (to=self reasoning, to=user answer, to=<tool> ATEM
+            # calls) ending in <|eot|>; serve/atem.py reads them as the Qwen form and holds Glimmer's spelling of the
+            # markers the server writes into the engine's input
+            from serve import atem
+            sid = getattr(self.tok, "special_ids", None) or {}
+            self.stop_ids = {int(sid[k]) for k in ("eot", "eos") if sid.get(k) is not None} or self.stop_ids
+            self.parser_cls = atem.AtemOutputParser
+            self._force_text = atem.to_atem_force
+            self.reasoning_close_text = atem.REASONING_CLOSE
+            self.reasoning_wrap_up_text = atem.REASONING_WRAP_UP
+            self.answer_open_text = atem.ANSWER_OPEN
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
     _force_text = None
+    reasoning_close_text = None      # a family's spelling of REASONING_CLOSE / REASONING_WRAP_UP (Muse Glimmer)
+    reasoning_wrap_up_text = None
+    answer_open_text = None          # thinking off: appended to the prompt so the reply is the answer (Muse Glimmer)
 
     def force_text(self, force):
         """forced_call's opening of the call the reply must make, in this model's spelling."""
@@ -5969,6 +6157,9 @@ class Service:
             kwargs = {**kwargs, "add_vision_id": self.add_vision_id}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
+        if self.family == "muse-glimmer" and effort and "reasoning_strength" not in kwargs:
+            # Glimmer's template: "Reasoning strength: low|medium|high." (the effort table's xhigh is its high)
+            kwargs = {**kwargs, "reasoning_strength": "high" if effort in ("xhigh", "max") else effort}
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -6084,6 +6275,19 @@ class Service:
             encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                        else [self.vision.encode(src) for src in images])
             return encoded, [None] * len(encoded)
+        namespace = ""
+        if getattr(self.vision, "persistent_images", False):
+            for idx, (src, uid) in enumerate(zip(images, image_ids)):
+                if src is None and uid not in self.image_ids:
+                    raise ImageCacheMiss(f"Cache miss for image at index {idx} but data is not provided.")
+            self._vision_up()
+            namespace = self.vision.persistence_namespace()
+            if namespace != getattr(self, "_persistent_image_namespace", None):
+                self.image_ids.clear()
+                self._raw_keys.clear()
+                self._persistent_image_namespace = namespace
+        def picture_key(key):
+            return hashlib.sha256(("vision-pipeline-v1\0" + namespace + "\0" + key).encode()).hexdigest()[:32] if namespace else key
         # vLLM's multimodal uuid: a picture with a uuid is that uuid (its cache key), data or not; one the server holds
         # by its uuid is not read again (the data, when sent too, is ignored, as vLLM ignores it); an unknown uuid
         # without data is vLLM's "Cache miss" 400.  A picture without a uuid is its normalized bytes' hash.
@@ -6102,7 +6306,7 @@ class Service:
                     raise ImageCacheMiss(f"Cache miss for image at index {idx} but data is not provided.")
                 raw = src if isinstance(src, bytes) else Vision.load(src)
                 data = Vision.normalize(raw)
-                key = hashlib.sha256(("uuid\0" + uid).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                key = picture_key(hashlib.sha256(("uuid\0" + uid).encode("utf-8", "surrogatepass")).hexdigest()[:32])
                 self.image_ids[uid] = key
                 self.image_ids.move_to_end(uid)
                 while len(self.image_ids) > self.IMAGE_IDS_MAX:
@@ -6118,7 +6322,7 @@ class Service:
             key = self._raw_keys.get(memo)       # a picture sent again as the same bytes: no decode, no hash
             if key is None or not by_reference:   # (a refill re-reads every picture)
                 data = Vision.normalize(raw)
-                key = Vision.key_of(data)
+                key = picture_key(Vision.key_of(data))
                 self._raw_keys[memo] = key
                 while len(self._raw_keys) > self.IMAGE_IDS_MAX:
                     self._raw_keys.popitem(last=False)
@@ -6210,9 +6414,12 @@ class Service:
                     else:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
+        self._restore_reasoning(messages, log=kwargs.get("enable_thinking") is not False)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and (not self.thinking_model or kwargs.get("enable_thinking", True) is False):
             ids = ids + self.tok.encode(force, parse_special=True)
+        elif self.answer_open_text and self.thinking_model and kwargs.get("enable_thinking", True) is False:
+            ids = ids + self.tok.encode(self.answer_open_text, parse_special=True)   # Muse Glimmer: straight to the answer
         self.embeddings.path = None
         self.embeddings.keys = None
         self.embeddings.refill = None
@@ -6495,14 +6702,110 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    @staticmethod
+    def _answer_key(content, calls=()) -> str:
+        """An assistant turn's answer text and its tool calls (name and arguments), as the reply wrote them or as a
+        client sends them back; a tool-call turn often has no text."""
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+        text = content.strip() if isinstance(content, str) else ""
+        norm = []
+        for c in calls or ():
+            if hasattr(c, "name") and hasattr(c, "arguments"):   # the reply's own ToolCall
+                name, args = c.name, c.arguments
+            elif isinstance(c, dict):
+                f = c.get("function") if isinstance(c.get("function"), dict) else c
+                name, args = f.get("name"), f.get("arguments")
+            else:
+                continue
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    pass
+            norm.append([name, args])
+        return text + ("\n\0" + json.dumps(norm, sort_keys=True, ensure_ascii=False) if norm else "")
+
+    def _remember_reasoning(self, ids, thinking, content, calls, reasoning):
+        """A finished reply's thinking, kept by its answer for _restore_reasoning, with the decoded end of its prompt."""
+        key = self._answer_key(content, calls)
+        if key and not reasoning and thinking:
+            print(f"[strata] reasoning not remembered: the reply ({len(key)} chars) had no thinking", flush=True)
+        if not key or not reasoning:
+            return
+        end = self.tok.decode(ids[-160:])
+        with self.reasoning_mu:
+            written = self.recent_reasoning.setdefault(key, [])
+            written.append((end, reasoning))
+            del written[:-32]
+            self.recent_reasoning.move_to_end(key)
+            # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
+            # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
+            while len(self.recent_reasoning) > 4096:
+                self.recent_reasoning.popitem(last=False)
+
+    def _restore_reasoning(self, messages, log=True):
+        """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the
+        thinking this server wrote for that answer.  The template keeps a turn's thinking (preserve_thinking), so
+        without it the prompt left the conversation cache at that turn and the whole answer was read again (~800
+        tokens, 3-4 s on a streamed arena); with it the prompt is what the model wrote."""
+        with self.reasoning_mu:
+            self._restore_reasoning_locked(messages, log)
+
+    def _restore_reasoning_locked(self, messages, log):
+        if not self.recent_reasoning:
+            return
+        for i, m in enumerate(messages):
+            if m.get("role") != "assistant" or (m.get("reasoning_content") or "").strip():
+                continue
+            key = self._answer_key(m.get("content"), m.get("tool_calls"))
+            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None)
+            if r:
+                m["reasoning_content"] = r
+                self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
+            elif log and key and m is messages[-2 if len(messages) > 1 else -1]:
+                # only the turn before the new message is reported; a request with thinking off is quiet (its replies
+                # have no thinking to restore)
+                best = max(self.recent_reasoning, key=lambda k: len(os.path.commonprefix([k, key])))
+                n = len(os.path.commonprefix([best, key]))
+                print(f"[strata] reasoning not restored: the previous answer ({len(key)} chars) matches none of the "
+                      f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}", flush=True)
+
+    @staticmethod
+    def _reasoning_for(written, before):
+        """The thinking of the reply that wrote this turn: among the replies with this answer, the one whose prompt
+        ended with the message this turn follows.  No such reply, none: another turn's thinking would change this
+        turn's text from one request to the next, and every request would leave the conversation cache there."""
+        if not written or before is None:
+            return None
+        text = before.get("content")
+        if isinstance(text, list):
+            text = "".join(p.get("text", "") for p in text if isinstance(p, dict) and p.get("type") == "text")
+        tail = text.strip()[-48:] if isinstance(text, str) else ""
+        if not tail:
+            return None
+        for ctx, r in reversed(written):   # only the template's turn markers may follow it
+            at = ctx.rfind(tail)
+            if at >= 0 and len(ctx) - at - len(tail) <= 80:
+                return r
+        return None
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        reasoning, content, calls = [], [], []
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            for item in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only):
+                if item[0] == "event" and item[1].kind in ("reasoning", "content"):
+                    (reasoning if item[1].kind == "reasoning" else content).append(item[1].text or "")
+                elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
+                    calls.append(item[1].call)
+                elif item[0] == "done":
+                    self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
+                yield item
         finally:
             if ka is not None:
                 ka.release()
@@ -6517,6 +6820,19 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # (local rb25) A request without a seed - OpenAI clients send none - gets a new one, as with OpenAI, llama.cpp
+        # and vLLM.  The engine seeds its generator once at its start and otherwise goes on from the previous request's
+        # draws, so the first sampled reply after every start was the same reply, however often it was tried.  A seed
+        # from the request, the config's sampling.seed or the shared settings still wins (one seed for every request
+        # keeps A/B runs deterministic); a random one is printed, and "seed": N repeats that reply on the same build,
+        # prompt and routing.  Every pass of this request (a budget's continuation, a retry) uses the same seed.
+        seed = (sampling or {}).get("seed")
+        if not (isinstance(seed, int) and not isinstance(seed, bool) and seed > 0):
+            sampling = {**(sampling or {}), "seed": secrets.randbelow(2 ** 31 - 1) + 1}
+            t = sampling.get("temperature")
+            if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) > 0.0:
+                print(f"[strata] seed {sampling['seed']} (random; send \"seed\": {sampling['seed']} to repeat this reply)",
+                      flush=True)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -6548,6 +6864,7 @@ class Service:
                                  declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        repeat_wrapped = False                          # the thinking was closed once after a repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -6579,6 +6896,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        loop_wrap = False                               # "wrap": this pass ended on a passage loop, close the thinking
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -6727,7 +7045,11 @@ class Service:
                             segment_sampling = {**(sampling or {}), "_grammar_path": grammar_path}
                             # An injected reasoning close is in raw_ids as well. A new
                             # native segment then starts with the grammar already active.
-                            if grammar_trigger is not None and grammar_trigger not in raw_ids:
+                            if str((getattr(self.engine, "info", {}) or {}).get("grammar_replay", 0)) == "1":
+                                segment_sampling["_grammar_prefix"] = list(raw_ids)
+                                if grammar_trigger is not None:
+                                    segment_sampling["_grammar_after"] = grammar_trigger
+                            elif grammar_trigger is not None and grammar_trigger not in raw_ids:
                                 segment_sampling["_grammar_after"] = grammar_trigger
                         gen = self.engine.generate(prompt, max_new - n, segment_sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, segment_sampling, cancel)
@@ -6809,7 +7131,12 @@ class Service:
                                         if self.reasoning_loop_recovery == "stop":
                                             looped = True        # #728: end the reply here, as for a repeated token
                                             break
-                                        if not emb:              # "recover": not for a request with pictures
+                                        if self.reasoning_loop_recovery == "wrap":
+                                            if not answered and not cancel.is_set():
+                                                recovery_count += 1      # once a reply
+                                                loop_wrap = wrap = True
+                                                break
+                                        elif not emb:            # "recover": not for a request with pictures
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
@@ -6904,7 +7231,7 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(self.reasoning_close_text or REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -6919,6 +7246,21 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        # A one-token run while the model is still thinking (GLM-5.3-Flash at 18,361 thinking tokens: 'Dot'
+                        # 256 times) used to end the reply with no answer after ten minutes.  Once a reply, the run is
+                        # dropped from what the engine continues from and the thinking is closed as the budget closes it,
+                        # so the model answers.  "repeat_wrap_up": false in the config ends it as "length" as before.
+                        repeat_wrap = False
+                        if (repeated and self.repeat_wrap_up and not repeat_wrapped and parser.state == "reasoning"
+                                and not cancel.is_set() and not answered):
+                            k = min(run_len, len(seg))
+                            print(f"[strata] the thinking repeated one token ({self.tok.decode([run_tok])!r}) {run_len} "
+                                  f"times in a row at {n} tokens: dropping the run and closing the thinking so the model "
+                                  "answers (repeat_wrap_up)", flush=True)
+                            del seg[len(seg) - k:]
+                            del raw_ids[len(raw_ids) - k:]
+                            repeat_wrapped, repeated, wrap, repeat_wrap = True, False, True, True
+                            run_tok, run_len = None, 0
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -6928,14 +7270,20 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (self.reasoning_wrap_up_text or REASONING_WRAP_UP) + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and loop_wrap:
+                            loop_wrap = False
+                            st["reasoning_recoveries"] = recovery_count
+                            print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) "
+                                  f"at {n} tokens: closing the thinking so the model answers (reasoning_loop_recovery: "
+                                  "\"wrap\")", flush=True)
+                        elif wrap and not repeat_wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -7587,7 +7935,10 @@ def openai_stream_usage(chunks):
         chunks.close()
 
 
-def openai_collect(chunks) -> dict:
+def openai_collect(chunks, keep_cut: bool = False) -> dict:
+    """The streamed chunks as one chat.completion.  keep_cut (the config's "keep_cut_tool_calls", opt-in): a call the
+    output ended inside at the token limit (finish_reason "length") stays in tool_calls with its arguments as far as
+    they got - never valid JSON - as a streaming client sees it; by default it is left out (#211)."""
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
     lps = {}                                       # "content" / "reasoning_content" -> logprob entries
     for c in chunks:
@@ -7609,7 +7960,8 @@ def openai_collect(chunks) -> dict:
             cur["function"]["arguments"] += fn.get("arguments") or ""
         last = c
     calls = [by_index[i] for i in sorted(by_index)]
-    if last["choices"][0]["finish_reason"] != "tool_calls":
+    finish = last["choices"][0]["finish_reason"]
+    if finish != "tool_calls" and not (keep_cut and finish == "length"):
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning).strip() and "".join(reasoning).strip() == "".join(content).strip():
@@ -8045,6 +8397,7 @@ def make_handler(svc: Service):
             was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
+            self.watch_lock = threading.Lock()
             self.cancel_event = cancel
             with svc.status_lock:
                 svc.active_cancels.add(cancel)
@@ -8062,23 +8415,26 @@ def make_handler(svc: Service):
                         gone = True
                     except (OSError, ValueError):            # the socket was closed here: the request has ended
                         return
-                    if gone and not done.is_set():
-                        if not getattr(svc.engine, "_batch_cancel_enabled", False):
-                            self._note(outcome="disconnected")
-                            svc.note_client_disconnect(cancel)
+                    if gone:
+                        with self.watch_lock:
+                            if done.is_set():
+                                return
+                            if not getattr(svc.engine, "_batch_cancel_enabled", False):
+                                self._note(outcome="disconnected")
+                                svc.note_client_disconnect(cancel)
+                                stopper = getattr(svc.engine, "stop_if_running", None)
+                                if stopper is not None:
+                                    stopper(cancel)
+                                return
+                            newly_signalled = not cancel.is_set()
+                            cancel.set()  # critical signal precedes status/monitor accounting locks
                             stopper = getattr(svc.engine, "stop_if_running", None)
-                            if stopper is not None:
-                                stopper(cancel)
+                            try:
+                                if stopper is not None: stopper(cancel)
+                            finally:
+                                self._note(outcome="disconnected")
+                                svc.note_client_disconnect(cancel, signalled=newly_signalled)
                             return
-                        newly_signalled = not cancel.is_set()
-                        cancel.set()  # critical signal precedes status/monitor accounting locks
-                        stopper = getattr(svc.engine, "stop_if_running", None)
-                        try:
-                            if stopper is not None: stopper(cancel)
-                        finally:
-                            self._note(outcome="disconnected")
-                            svc.note_client_disconnect(cancel, signalled=newly_signalled)
-                        return
                     done.wait(WATCH_CLIENT_S)                # bytes to read (not a hang-up): look again later
 
             threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
@@ -8128,6 +8484,12 @@ def make_handler(svc: Service):
                         if key in obj:
                             self.record[key] = obj[key]
             body = json.dumps(obj, ensure_ascii=False).encode()
+            # Generation is complete: a client may close as soon as it reads the final byte.
+            # Retire its watcher before delivery, serialized with an EOF decision already in flight.
+            # Actual send failures still reach do_POST's OSError/disconnected path.
+            if self.watch_done is not None:
+                with self.watch_lock:
+                    self.watch_done.set()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             for k, v in (headers or {}).items():
@@ -9124,6 +9486,11 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
+            if STREAM_WRITE_TIMEOUT_S > 0:
+                try:
+                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write ends as OSError: disconnected
+                except OSError:
+                    pass
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
@@ -9276,7 +9643,7 @@ def make_handler(svc: Service):
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect(chunks, keep_cut=svc.keep_cut_tool_calls))
             if (req.get("stream_options") or {}).get("include_usage") is True:
                 chunks = openai_stream_usage(chunks)
             self._sse()
@@ -10207,6 +10574,10 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # Muse Glimmer 30B (local): above temperature 0.6 it stops writing the ATEM tool-call markup (Mal's llama.cpp wrapper
+    # notes: 1.0 skips it, 0.6 / top_p 0.9 / top_k 20 gives clean calls)
+    "muse-glimmer": {"thinking": {"temperature": 0.6, "top_p": 0.9, "top_k": 20},
+                     "instruct": {"temperature": 0.6, "top_p": 0.9, "top_k": 20}},
 }
 
 
@@ -10282,6 +10653,15 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     return recovery
+
+
+def keep_cut_tool_calls_setting(cfg: dict) -> bool:
+    """The config's "keep_cut_tool_calls" (see openai_collect's keep_cut): off when the config does not name it.  Anything
+    but true or false stops the start."""
+    keep = cfg.get("keep_cut_tool_calls", False)
+    if not isinstance(keep, bool):
+        raise SystemExit(f"[strata] config \"keep_cut_tool_calls\" must be true or false, not {keep!r}")
+    return keep
 
 
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
@@ -10573,6 +10953,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       "encoder's GPU, or the first picture may not get it", flush=True)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
+            bind_persistent_vision(env, vision)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -10641,8 +11022,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's image marker: the token its chat template writes after <|vision_start|> for each picture (Qwen's
     # <|image_pad|>; LFM3's <|image|>), expanded to one token per encoder row
-    global IMAGE_PAD
+    global IMAGE_PAD, VISION_START
     IMAGE_PAD = cfg.get("image_pad") or IMAGE_PAD
+    VISION_START = cfg.get("vision_start") or VISION_START   # local: the token before each picture's marker (Muse Glimmer: <|image_start|>)
     if isinstance(cfg.get("vision"), dict) and cfg["vision"].get("av"):   # audio / video parts to the same encoder
         from serve import frontend as _fe
         _fe.IMAGE_PARTS = _fe.IMAGE_PARTS + _fe.AV_PARTS
@@ -10682,7 +11064,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
@@ -10806,6 +11188,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    svc.keep_cut_tool_calls = keep_cut_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
@@ -10815,6 +11198,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    rw = cfg.get("repeat_wrap_up", True)   # a one-token run inside the thinking closes it (false: end as "length")
+    if not isinstance(rw, bool):
+        raise SystemExit(f"[strata] config \"repeat_wrap_up\" must be true or false, not {rw!r}")
+    svc.repeat_wrap_up = rw
     if isinstance(cfg.get("preserve_thinking"), bool):
         svc.preserve_thinking = cfg["preserve_thinking"]
     if isinstance(cfg.get("add_vision_id"), bool):
@@ -10830,11 +11217,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
+    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true) | "wrap"
     if recovery is True:
         recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+    if recovery is not False and recovery not in ("stop", "recover", "wrap"):
+        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\", \"recover\" or \"wrap\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)

@@ -16,6 +16,7 @@
 #if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
 #include "moe_mmq_tab.hpp"   // declarations only: the tab kernels live in the per-type mmq-tab-*.cu TUs
 #endif
+#include "strata/prefill/moe_iq4_w4a8.hpp"
 
 #include <cstdint>
 #include "strata/prefill/mmq_kq_abi.hpp"
@@ -322,6 +323,8 @@ bool tab_has_type(int) { return false; }
 void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 // the same unit's MXFP4: Q8_1 activations on every card (its FP4 x FP4 instance wants FP4 rows, see there)
 void run_mxfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+// mmq_mxfp4_w4a8.cu: that int8 instance's tile width from the int8 config table (this unit sees the FP4 MMA's table)
+int64_t mxfp4_w4a8_j_best(int64_t max_rows, int64_t w_rows);
 // mmq_nvfp4_w4a4.cu (the one unit built for 12xa): FP4 x FP4 and its activation quantizer, if this card runs it
 bool w4a4_available();
 void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
@@ -341,6 +344,18 @@ Nvfp4Mode nvfp4_mode() {
     }();
     return m;
 }
+
+#if defined(STRATA_MMQ_IQ1M)
+// IQ1_M experts take MMQ for prompts (default on; STRATA_MMQ_IQ1M=0 restores the FP16 path / pf_wmma; Basalt 86b1e97f4,
+// the overlay in cmake/strata_ggml_iq1m_overlay.cmake).  The int8 tile holds the weights exactly; the activations are rounded to q8_1 as on every MMQ layer,
+// so the prompt's numerics on those layers change against the FP16 path / pf_wmma they ran on (Basalt: last-row KL
+// 0.00005-0.0018, top-1 the same).  On QFN45 against its Q8_0 parent it lands closer than the FP16 path (prompt-path KL
+// mean 0.224 -> 0.184, 20 prompts) and prefills 17 % faster on the 4090.  Decode is unchanged.
+static bool iq1m_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_IQ1M"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+#endif
 
 bool supported(int t) {
     switch ((ggml_type) t) {
@@ -370,6 +385,10 @@ bool supported(int t) {
         case GGML_TYPE_MXFP4:   // mmq_nvfp4_w4a8.cu, not the generated list
             return true;
 #endif
+#if defined(STRATA_MMQ_IQ1M)
+        case GGML_TYPE_IQ1_M:
+            return iq1m_on();
+#endif
         default:
             return false;
     }
@@ -385,7 +404,7 @@ bool fits(int t, int64_t w_rows) {
         const int cc = info.devices[id].cc;
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
-        for (int J = 8; J <= 128 && !any; J += 8) {
+        for (int J = 8; J <= kMmqTileColsMax && !any; J += kMmqTileColsStep) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
             any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
         }
@@ -500,6 +519,17 @@ Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
+#if !defined(GGML_USE_HIP)
+    // STRATA_IQ4_W4A8=1 (opt-in; =2: the IQ4_NL down products only): IQ4_XS / IQ4_NL products through the pipelined int8
+    // kernel of moe_iq4_w4a8.cu where it gives MMQ's tiling-mode bits (sm_80..sm_88, no stream-k split); it declines
+    // every other product, and unset this function is unchanged
+    if (const int m = iq4_w4a8_mode(); m == 1 || (m == 2 && p.type == GGML_TYPE_IQ4_NL)) {
+        if (run_iq4_w4a8(p, stream)) {
+            ck(cudaGetLastError(), "iq4 w4a8");
+            return;
+        }
+    }
+#endif
     const ggml_type t = (ggml_type) p.type;
         const int64_t qk = type_blck((int) t), bpr = p.w_cols / qk;   // (upstream: the trellis types' block too)
     // The tile width J_best, chosen as ggml's mmq.cu host code does since upstream #29953 (mmq_args' last field was
@@ -521,6 +551,12 @@ void Context::run(const Product& p, void* stream) {
         }
         if (J_best <= 0) throw std::runtime_error("moe_mmq: no MMQ tile fits");
     }
+#if !defined(GGML_USE_HIP)
+    if (t == GGML_TYPE_MXFP4) {   // the int8 unit's own tile table (it hides Blackwell's FP4 MMA from mmq.cuh)
+        J_best = mxfp4_w4a8_j_best(p.max_rows, p.w_rows);
+        if (J_best <= 0) throw std::runtime_error("moe_mmq: no MMQ tile fits");
+    }
+#endif
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / type_bytes((int) t)), 0, 0,
@@ -547,6 +583,13 @@ void Context::run(const Product& p, void* stream) {
         ck(cudaGetLastError(), "mul_mat_q (pointer table)");
         return;
     }
+#if !defined(GGML_USE_HIP)
+    if (t == GGML_TYPE_MXFP4) {   // before the generated cases: their MXFP4 instance is the FP4 x FP4 one on 12xa
+        run_mxfp4_w4a8(ctx, a, s);
+        ck(cudaGetLastError(), "mul_mat_q");
+        return;
+    }
+#endif
     switch (t) {
         // UNION (xolotl): the same generated list that drives supported() above drives this dispatch - see the note
         // there.  The hand-written cases the dense lineage's refactor left behind are gone with the duplicate case
@@ -560,6 +603,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_MXFP4:
             run_mxfp4_w4a8(ctx, a, s);
             break;
+#endif
+#if defined(STRATA_MMQ_IQ1M)
+        case GGML_TYPE_IQ1_M: mul_mat_q_case<GGML_TYPE_IQ1_M>(ctx, a, s); break;
 #endif
         default:
             // unreachable for a caller that asked supported() first: the two switches expand the same list
@@ -595,7 +641,7 @@ size_t overread_bytes(int t, int64_t cols) {
     int64_t blocks = over(MMQ_ITER_K);
     const ggml_cuda_device_info& info = ggml_cuda_info();
     for (int id = 0; id < info.device_count; ++id)
-        for (int J = 8; J <= 128; J += 8) {
+        for (int J = 8; J <= kMmqTileColsMax; J += kMmqTileColsStep) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, info.devices[id].cc);
             if (c.type != GGML_TYPE_COUNT) blocks = std::max<int64_t>(blocks, over(c.K_vram));
         }
@@ -614,7 +660,7 @@ bool whole_tiles(int t, int64_t w_rows, int n_experts) {
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false, stream_k = false;
         ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config((ggml_type) t, 8, false, cc);
-        for (int J = 8; J <= 128; J += 8) {
+        for (int J = 8; J <= kMmqTileColsMax; J += kMmqTileColsStep) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, cc);
             if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
             if (!any) c0 = c;
@@ -633,6 +679,34 @@ bool whole_tiles(int t, int64_t w_rows, int n_experts) {
         }
     }
     return true;
+}
+
+bool launch_splits_k(int t, int64_t w_rows, int64_t max_rows, int n_experts) {
+    if (!supported(t) || w_rows <= 0 || max_rows <= 0 || n_experts <= 0) return false;
+    const ggml_cuda_device_info& info = ggml_cuda_info();
+    int id = 0;
+    cudaGetDevice(&id);
+    if (id < 0 || id >= info.device_count) return true;
+    const int cc = info.devices[id].cc, nsm = info.devices[id].nsm;
+    const size_t smpbo = info.devices[id].smpbo;
+    // mul_mat_q_switch_J: the first tile width (8, 16, ...) with the fewest column tiles that fits the shared memory
+    int best_I = 0;
+    bool best_stream_k = false;
+    int64_t ntiles_best = INT64_MAX;
+    for (int J = 8; J <= 128 && ntiles_best > 1; J += 8) {
+        const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, cc);
+        if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
+        const int64_t ntx = (max_rows + c.J - 1) / c.J;
+        if (ntx < ntiles_best) { ntiles_best = ntx; best_I = c.I; best_stream_k = c.stream_k; }
+    }
+    if (ntiles_best == INT64_MAX) return true;   // no tile fits: not a launch to predict
+    if (!best_stream_k) return false;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || nsm <= 0) return true;
+    // launch_mul_mat_q: one block per tile when the tiles fill >= 90 % of their waves, else nsm blocks and a fixup
+    // whenever the tile count is not a multiple of them
+    const int64_t nty = (w_rows + best_I - 1) / best_I, ntiles = nty * ntiles_best * n_experts;
+    const int64_t waves = (ntiles + nsm - 1) / nsm;
+    return 100 * ntiles / (nsm * waves) < 90 && ntiles % nsm != 0;
 }
 
 int direct_mode() {

@@ -498,11 +498,12 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `reasoning_budget_tokens` | `0` (no budget) | Caps the thinking at N tokens: the server ends it with a short wrap-up line and `</think>` and the model answers from there. The wrap-up counts as output tokens. A request's own `reasoning_budget_tokens` (or llama.cpp's `thinking_budget_tokens`) wins. |
 | `answer_room` | on | A request with thinking on, no budget and `max_tokens` of 1,024 or more gets one: thinking is wrapped up when a quarter of the cap (at least 512 tokens) is left. Requests without `max_tokens` get three quarters of the context. `false` turns it off. Clients should not cap the reply far below what the context allows. |
 | `reasoning_close_retry` | off | Closes the thinking once and continues when a reply ended inside its thinking with no answer and no tool call (#1053). |
-| `reasoning_loop_recovery` | off | `"stop"` ends, `"recover"` (or `true`) restarts once, a reply whose reasoning repeats whole passages. Checked every 512 output tokens. It can mistake repeated useful code for a loop, so keep the answer quality alongside the completion rate when testing it (#728). |
+| `reasoning_loop_recovery` | off | `"stop"` ends, `"recover"` (or `true`) restarts once (Qwen prompts only), `"wrap"` closes the thinking so the model answers (any model, once), a reply whose reasoning repeats whole passages. Checked every 512 output tokens. It can mistake repeated useful code for a loop, so keep the answer quality alongside the completion rate when testing it (#728). |
 | `repeat_stop_tokens` | `256` | A reply that repeats one token this many times in a row ends as `"length"`. `0` turns it off. |
 | `effort_position` | `"start"` | `"end"` puts a `low` or `medium` effort in a short system turn right before the answer, so a request that only changes the effort reuses the conversation cache. How well the model follows a level in that place is not measured. |
 | `anthropic_thinking` | as the template | `"on_request"` renders a `/v1/messages` request that asks for no thinking without thinking, as Anthropic does. Claude Code's short helper calls need it. |
 | `tool_call_recovery` | on (since 0.2.8; off in 0.2.7 and before) | Also reads a declared tool's call written as `<parameter=NAME>`, as JSON inside `<tool_call>`, as a `<function=NAME>` block without `<tool_call>`, or as a second call inside one `<tool_call>`. On 1,462 agent turns 98.3% read as intended with it and 92.9% without; the 49 specimens of the test corpus read the same with it on or off. Only a declared tool's call is ever recovered; anything else stays text. `"tool_call_recovery": false` turns it off. |
+| `keep_cut_tool_calls` | off | A whole (non-streaming) OpenAI answer that hit the token limit inside a tool call keeps that call in `tool_calls`, its `arguments` as far as they got (never valid JSON), as a streaming client sees it and as OpenAI's API returns it; `finish_reason` stays `"length"`. Off, the call is left out (#211), so the tokens the model spent on it appear in no field of the answer. `"keep_cut_tool_calls": true` turns it on. The Anthropic API is unchanged. |
 | `env_to_user` | off | Moves opencode's `<env>` block (working directory, date) to the first user message so the system turn is the same for every session and the disk prefix cache restores it. |
 | `return_progress` | off | Per request `"return_progress": true` adds llama.cpp's `prompt_progress` (`total`, `cache`, `processed`, `time_ms`) to the stream, one update per `--prefill` chunk. A prompt shorter than one chunk sends nothing. |
 | `prevent_sleep` | off | Windows only: keeps the PC awake while a request runs or waits (`SetThreadExecutionState`). On Linux and macOS one startup line says it does nothing. |
@@ -549,10 +550,37 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   tool the request did not declare. The server window prints the same names (`N <tool_call> block(s) ... went back as text`), and
   `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`. A block that is malformed (not an undeclared name) is counted
   there and in the window, but has no name to list.
+- Native Flash grammar is opt-in at build time: `-DSTRATA_FLASH_GRAMMAR=ON`, with the same pinned llama.cpp
+  source as ggml. A native GGUF model then advertises `INFO grammar=1`. The existing API accepts `grammar` or
+  `structured_outputs.grammar` without client changes; JSON schemas use the server's grammar conversion.
+  Each request and batch slot owns its parser state. Prefix/image caches and sleep do not restore that state.
+  Engines advertising `grammar_replay=1` can move a request between the solo and batch paths: the server sends
+  `grammar_prefix` with only that request's previously emitted token IDs, and a fresh parser replays them. This
+  internal field is never inferred from prompt positions, image placeholders or a cached conversation. A reasoning
+  budget continuation uses the same replay and the original `grammar_after` trigger. Engines without this
+  capability keep their existing protocol.
+  If the grammar has no next token after a valid prefix, only that request/slot ends with `DONE`/`BDONE` reason
+  `grammar`. The server consumes that terminal marker and reports a request error; the engine stays available.
+  The affected live/slot cache is invalidated. Raw non-finite logits and GPU failures keep their existing handling.
+  MTP continues to propose tokens. Grammar requests replay the constrained target draw and accept a proposal only
+  when it matches, instead of applying the unconstrained draft's probability-ratio correction. This also covers
+  sampled requests and pipelined/batch windows. This opt-in path copies full vocabulary logits to the CPU for the
+  native grammar mask and back to the existing GPU sampler; its throughput needs separate measurement.
+  The vocabulary is loaded without GPU layers from the native model's metadata shard; its `<|im_end|>` token must
+  be included in `--eos-ids`. `grammar_after` activates the parser after the requested generated token (for thinking).
+  Invalid grammar is rejected before prompt state changes. A build without this option keeps the existing path.
+- Native DeepSeek V4.1 GBNF is opt-in for source builds: configure with
+  `-DSTRATA_DS41_GRAMMAR=ON`. The `ds41_generate` serving path then advertises `grammar=1` and accepts the
+  existing `grammar` / `structured_outputs.grammar` API fields. It uses the pinned native grammar parser,
+  DeepSeek's end-of-turn token, and request-local state in both solo and batch decoding. DSpark and lookup
+  proposals remain enabled; verification uses the constrained target distribution. The server privately replays
+  committed output when a request changes between solo and batch modes. Checkpoint sleep and conversation caches
+  retain model state, while a new request always starts its own grammar. Builds without this option retain their
+  previous capability and reject GBNF requests. This build option does not change model or sampling defaults.
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
-  work and remote ones are refused. This is schema prompting followed by server validation, not grammar-constrained
-  decoding, with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
+  work and remote ones are refused. Engines without native grammar use schema prompting followed by server validation,
+  with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
   without it the answer is only checked to be one JSON object. Malformed output returns **502** with
   `error.code: structured_output_failed`, an invalid schema **400**. JSON formats combined with tools or MCP are refused.
   Streaming buffers the answer and emits content only after validation. Math answers often hold LaTeX such as `\alpha`, which is
@@ -1283,6 +1311,12 @@ when two entries are the hardware threads of one core, when an entry is the host
 processor the process may use (it is left out). The option moves threads only and never changes a result. The Qwen3.6 engine
 (`strata-q36`) keeps its own `--pool-workers` and default placement.
 
+Native DeepSeek (`ds41_generate`) accepts `--pool-cores` and `STRATA_POOL_CORES`, including the config's `pool_cores`.
+Its worker-count option is `--threads N`. With zero or no configured count, the usable CPU list determines the count.
+`--host-core first|last|sibling` or `STRATA_HOST_CORE` also explicitly pins its executor after startup. Without that
+selection, native DeepSeek leaves the executor's affinity as inherited. Existing startup threads keep their own masks.
+Helpers created later can inherit the selected executor CPU. Choose CPU lists for the machine running the engine.
+
 ### Other threads (`--aux-cpus`, Linux, off by default)
 
 A thread the engine starts after the host thread is pinned inherits the host's one CPU: the adaptive tier's job thread, prefill
@@ -1337,6 +1371,7 @@ that one compute capability. The identity gate (10 prompts plus exact_pp 4K/20K,
 | Architecture | On by default | Off switch |
 | --- | --- | --- |
 | sm_86 (RTX 3050-3090, RTX A2000-A6000) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`, `STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GU_SWIGLU=1`, `STRATA_QSA_ROWS=1`, `STRATA_B6_MMVQ_ROWS=1` | `STRATA_SM86_PERF=0` |
+| sm_89 (RTX 4060-4090, RTX Ada, L4, L40S), since 6 Nov 2026 | the sm_86 set (measured as one stack on an RTX 4090: QFN 45 GB decode +8.1 %, output the same) | `STRATA_SM89_PERF=0` |
 | sm_60 (Tesla P100) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_SIDE_MIXER=2`, `STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1` | `STRATA_SM60_PERF=0` |
 | sm_120 (RTX 50 and RTX PRO Blackwell) | `STRATA_SIDE_MIXER=2`, `STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GR_DOWN_TG=1`, `STRATA_GU_SWIGLU=1` | `STRATA_SM120_PERF=0` |
 

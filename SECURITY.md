@@ -4,15 +4,42 @@
 
 Please report anything that should not be public until it is fixed **privately**, through GitHub's private
 vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/Niko1221/Strata/security/advisories/new)). Say what you found, how to reproduce it
-(the request, the config keys involved, the Strata version), and what an attacker gains. We answer there, fix it in
+([direct link](https://github.com/Indras-Mirror/Xolotl/security/advisories/new)). Say what you found, how to reproduce it
+(the request, the config keys involved, the Xolotl commit), and what an attacker gains. We answer there, fix it in
 a release, and credit you in the advisory unless you ask us not to.
 
 Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Niko1221/Strata/issues) (#544 collects audit findings) or as a pull request, which we
+[issue](https://github.com/Indras-Mirror/Xolotl/issues) (upstream Strata's audit findings are collected in [Strata #544](https://github.com/Niko1221/Strata/issues/544)) or as a pull request, which we
 review like our own code.
 
-Supported: the latest release. Fixes go into the next release, not into older ones.
+Supported: the latest commit on `main` (Xolotl has no releases). The server code below is Strata's, so the same
+protections apply.
+
+## Local models and your network
+
+A model file (GGUF) is weights and metadata: Xolotl's C++ engines read it as data, and nothing in it runs as code.
+Checked on 8 Nov 2026:
+
+- **The engines have no network code.** `strata`, `xolotl-dense`, `ds41_generate` and `glm_generate` link no network
+  library (no curl, no TLS) and open no internet socket: they talk to the server only through stdin / stdout. Watched
+  while the 27B worked through agent tasks: zero inet sockets. `tools/xolotl/apparmor/xolotl-engines` makes that a
+  rule the kernel enforces (one `sudo` to install). The one exception is `xolotl-lfm3`: next to another model
+  (`--peer-vram`) it runs `curl` to that server's `/v1/vram` on localhost to share the GPU, so it is left out of the
+  profile.
+  **If you add network code to an engine** (any socket, curl, an HTTP fetch, even to localhost), the profile blocks it
+  and that engine fails with a permission error (`EACCES`, "Permission denied" on `socket()`) or won't start. Check
+  with `journalctl -k | grep 'profile="xolotl-engine"'` (DENIED lines name the engine and the operation). Then
+  either keep the network part in the Python server, leave that engine out of the profile's name list (as with
+  `xolotl-lfm3`), or remove the profile. Tested under the profile on 8 Nov 2026: DeepSeek-V4.1 fast, QFN45, the 27B
+  and Flash-Next start and answer, `xol-lease` sleep / wake / unload / load works, and LFM3 (unconfined, with its
+  speech and vision helpers) chats, speaks and parks / unparks over `--peer-vram`.
+- **The server listens on `127.0.0.1`** unless you pass `--host`. It connects out only to what you configure (MCP
+  servers in the run config, a voice backend) and to an image URL that a client request contains. Remote JSON-schema
+  `$ref`s are never fetched. Chat templates from model files render in Jinja's immutable sandbox. Nothing loads
+  pickles or `trust_remote_code`.
+- **The real risk is tools.** A model can only act on the world through the tools an agent gives it. In QuetzaCodetl,
+  shell commands, the JS REPL, web search and web fetch (outside a short list of documentation sites) all ask before
+  they run, unless you allow them.
 
 ## What the server exposes
 
@@ -74,6 +101,8 @@ the model. The section above is about the engine's HTTP server. This is what the
   See [packaging/UPDATES.md](packaging/UPDATES.md).
 
 ### How far to trust `curl | sh` and `irm | iex`
+
+(This is upstream Strata's installer. Xolotl itself is built from source - see [AGENTS.md](AGENTS.md).)
 
 The Terminal installs with one line:
 

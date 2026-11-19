@@ -127,6 +127,7 @@ endif()
 # HIP a code object loads on first use, so they cost other models nothing there (R9700: the same slots).  Used at run
 # time with STRATA_MMQ_KQ=1 (opt-in: it changes the prompt's rounding against the FP16 path).
 option(STRATA_MMQ_TQ_OVERLAY "Gyro trellis MMQ prompt kernels on an upstream llama.cpp: an overlay of its ggml-cuda headers written at configure time (cmake/strata_ggml_tq_overlay.cmake).  Xolotl: OFF - our pinned ggml carries its own mmq changes the overlay does not match, and no Xolotl model uses the trellis types" OFF)
+option(STRATA_MMQ_IQ1M "MMQ prompt kernels for IQ1_M experts (QFN45's gate/up in 27 of 48 layers; Basalt 86b1e97f4): an overlay of the pinned ggml-cuda headers written at configure time (cmake/strata_ggml_iq1m_overlay.cmake).  On at run time; STRATA_MMQ_IQ1M=0 restores the FP16 path / pf_wmma (q8_1 activations change the prompt's rounding on those layers)" ON)
 option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the experts of Unsloth's K-quant files, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" ON)
 # Q6_K gate/up in the grouped expert kernels (Unsloth's UD-Q6_K_XL, and layer 2 of UD-Q5_K_XL; docs/QUANTS.md).  On by
 # default since MODEL-UPDATE Phase 1: one more instance per grouped kernel in iq_kernels.cu, +19 KB of sm_60 code,
@@ -170,14 +171,32 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
 # native-experts section far below, so a first configure registered four tests fewer than the second)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
-# xolotl: the Qwen3.8-27B dense engine `strata-dense` (src/program/dense_main.cpp).  The dense lineage committed its
+# xolotl: the Qwen3.8-27B dense engine `xolotl-dense`, formerly `strata-dense` (src/program/dense_main.cpp).  The dense lineage committed its
 # sources but never its CMake target - the production binary was built from an uncommitted CMakeLists in
 # /tmp/strata-dense-eval (gone).  Reconstructed from that build dir's link line and flags (~/AI/strata-dense-build).
-option(STRATA_DENSE "Build strata-dense, the Qwen3.8-27B dense GGUF engine (CUDA)" ON)
+option(STRATA_DENSE "Build xolotl-dense (strata-dense), the Qwen3.8-27B dense GGUF engine (CUDA)" ON)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
   find_package(Threads REQUIRED)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(m31_prefix_codec_check tools/m31/tests/prefix_codec_check.cpp)
+    target_include_directories(m31_prefix_codec_check PRIVATE include)
+    add_test(NAME m31_prefix_codec_check COMMAND m31_prefix_codec_check)
+    add_executable(q36_persistent_payload_test tests/qwen35/test_q36_persistent_payload.cpp)
+    target_include_directories(q36_persistent_payload_test PRIVATE src/qwen35)
+    add_test(NAME q36_persistent_payload_test COMMAND q36_persistent_payload_test)
+    add_executable(persistent_prefix_test src/core/persistent_prefix_test.cpp)
+    target_include_directories(persistent_prefix_test PRIVATE include)
+    target_link_libraries(persistent_prefix_test PRIVATE Threads::Threads)
+    add_test(NAME persistent_prefix_test COMMAND persistent_prefix_test)
+    set_tests_properties(persistent_prefix_test PROPERTIES TIMEOUT 90)
+    add_executable(persistent_prefix_storage_fault tests/persistent_prefix_storage_fault.cpp)
+    target_include_directories(persistent_prefix_storage_fault PRIVATE include)
+    target_link_libraries(persistent_prefix_storage_fault PRIVATE Threads::Threads)
+    add_test(NAME persistent_prefix_storage_fault COMMAND persistent_prefix_storage_fault)
+    set_tests_properties(persistent_prefix_storage_fault PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  endif()
   add_executable(shared_bytes_test src/core/shared_bytes_test.cpp)
   target_include_directories(shared_bytes_test PRIVATE include)
   target_link_libraries(shared_bytes_test PRIVATE Threads::Threads)
@@ -405,6 +424,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(model_family_test tests/core/model_family_test.cpp)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
   add_test(NAME model_family_test COMMAND model_family_test)
+  # xolotl-dense's admission rule: Qwen4-generation dense features are refused by name (header-only, no GPU)
+  add_executable(dense_arch_test tests/core/dense_arch_test.cpp)
+  target_include_directories(dense_arch_test PRIVATE include)
+  add_test(NAME dense_arch_test COMMAND dense_arch_test)
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
@@ -451,6 +474,21 @@ if(STRATA_BUILD_TESTS)
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
+
+  # the stream-all threshold priced from the link and the non-resident bytes (Basalt #107): header-only, no GPU
+  add_executable(stream_all_test tests/prefill/stream_all_test.cpp)
+  target_include_directories(stream_all_test PRIVATE include)
+  add_test(NAME stream_all_test COMMAND stream_all_test)
+
+  # PR #5108: the MMQ row table's over-read margin follows the backend tile bound; every fixup read stays inside (header-only, no GPU)
+  add_executable(mmq_ids_margin_test tests/prefill/mmq_ids_margin_test.cpp)
+  target_include_directories(mmq_ids_margin_test PRIVATE include)
+  add_test(NAME mmq_ids_margin_test COMMAND mmq_ids_margin_test)
+
+  # PR #4844: the adaptive tier's copy-in range across serial, pipelined and drained rounds (header-only, no GPU)
+  add_executable(adaptive_range_test tests/program/adaptive_range_test.cpp)
+  target_include_directories(adaptive_range_test PRIVATE include)
+  add_test(NAME adaptive_range_test COMMAND adaptive_range_test)
 
   # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
@@ -539,6 +577,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
                           src/kernels/cuda/route_prior.cu
+                          src/kernels/cuda/expert_keep.cu
                           src/kernels/cuda/native_gdn_preprocess.cu
                           src/kernels/cuda/native_qsa.cu
                           src/kernels/cuda/native_rope.cu
@@ -938,16 +977,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_options(strata PRIVATE "LINKER:/DELAYLOAD:hipblas.dll" "LINKER:/DELAYLOAD:libhipblaslt.dll" "LINKER:/DELAYLOAD:rocblas.dll")
   endif()
 
-  # xolotl: strata-dense (see option STRATA_DENSE).  Same shape as the production build: dense_model.cpp in
+  # xolotl: xolotl-dense (see option STRATA_DENSE).  Same shape as the production build: dense_model.cpp in
   # strata_engine with STRATA_DENSE_MMQ=1 (its MMQ prompt path; set on that one file only, it is the only reader),
   # dense_kernels.cu in strata_kernels, the binary linked against strata_engine + strata_mmq.
   if(STRATA_DENSE AND STRATA_ENABLE_CUDA AND STRATA_NATIVE_EXPERTS)
     target_sources(strata_engine PRIVATE src/core/dense_model.cpp)
     set_source_files_properties(src/core/dense_model.cpp PROPERTIES COMPILE_DEFINITIONS STRATA_DENSE_MMQ=1)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/dense_kernels.cu)
-    add_executable(strata-dense src/program/dense_main.cpp)
-    target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(strata-dense PRIVATE strata_engine strata_mmq ${_strata_gpu_runtime_target})
+    add_executable(xolotl-dense src/program/dense_main.cpp)
+    target_include_directories(xolotl-dense PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(xolotl-dense PRIVATE strata_engine strata_mmq ${_strata_gpu_runtime_target})
+    # 2026-11-08: renamed from strata-dense (the Xolotl name; the port is Mirko Perrone's, see CREDITS.md).  The old
+    # name stays next to it - a symlink on Linux / macOS, a copy on Windows - so existing configs and scripts keep
+    # working.
+    if(WIN32)
+      add_custom_command(TARGET xolotl-dense POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:xolotl-dense> $<TARGET_FILE_DIR:xolotl-dense>/strata-dense${CMAKE_EXECUTABLE_SUFFIX})
+    else()
+      add_custom_command(TARGET xolotl-dense POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE_DIR:xolotl-dense>/strata-dense
+        COMMAND ${CMAKE_COMMAND} -E create_symlink xolotl-dense $<TARGET_FILE_DIR:xolotl-dense>/strata-dense)
+    endif()
   endif()
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet
@@ -1350,6 +1400,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(dma_batch_parity PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME dma_batch_parity COMMAND dma_batch_parity)
     set_tests_properties(dma_batch_parity PROPERTIES TIMEOUT 120)
+    # PR #5096: flag B stays behind queued copies (delayed host-function copy, a consumer kernel, graph replay, every device)
+    add_executable(flag_order_test tests/core/flag_order_test.cu)
+    target_include_directories(flag_order_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(flag_order_test PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
+    add_test(NAME flag_order_test COMMAND flag_order_test)
+    set_tests_properties(flag_order_test PROPERTIES TIMEOUT 60)
     if(WIN32)
       add_test(NAME dma_batch_registered_parity COMMAND dma_batch_parity --registered)
       set_tests_properties(dma_batch_registered_parity PROPERTIES TIMEOUT 120)
@@ -1443,6 +1499,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(b6_mmvq_bench src/kernels/b6_mmvq_bench.cpp)
     target_include_directories(b6_mmvq_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(b6_mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_executable(dense27_mmvq_bench src/kernels/dense27_mmvq_bench.cpp)
+    target_include_directories(dense27_mmvq_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(dense27_mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   add_executable(gr_parity src/kernels/gr_parity.cpp)
   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
@@ -1842,6 +1901,13 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(split_ring_test src/program/split_ring_test.cpp)
   target_include_directories(split_ring_test PRIVATE include)
   add_test(NAME split_ring_test COMMAND split_ring_test)
+  # Model-free sampling/distribution checks for native DeepSeek grammar.
+  add_executable(ds41_grammar_sampling_test tools/v41/engine/test_ds41_grammar_sampling.cpp)
+  target_include_directories(ds41_grammar_sampling_test PRIVATE include)
+  add_test(NAME ds41_grammar_sampling_test COMMAND ds41_grammar_sampling_test)
+  add_executable(grammar_row_test src/program/grammar_row_test.cpp)
+  target_include_directories(grammar_row_test PRIVATE include)
+  add_test(NAME grammar_row_test COMMAND grammar_row_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(branch_boundary_test src/program/branch_boundary_test.cpp)
   target_include_directories(branch_boundary_test PRIVATE include)
@@ -2072,7 +2138,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
                                              src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp src/kernels/cpu/iq3_one.cpp)
   else()
     # the trellis dispatcher alone (the DeepSeek engine's CPU lane and Gyro): tq_cpu.cpp runs its scalar rows when the x86 units are
     # not compiled (the Metal build does the same)
@@ -2080,7 +2146,7 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
+    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/iq3_one.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
@@ -2097,6 +2163,8 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mavx512vpopcntdq;-mbmi2;-mf16c;-mfma")
+    set_source_files_properties(src/kernels/cpu/iq3_one.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mbmi2;-mf16c;-mfma")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
@@ -2245,10 +2313,28 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_tq_overlay)
       set(_strata_quantize_cu ${_strata_tq_overlay_dir}/quantize.cu)
     endif()
+    # IQ1_M MMQ (Basalt 86b1e97f4): the type added to an overlay of the pinned ggml-cuda (the trellis overlay's, when that
+    # is on); off with a message when the pinned text is not what the overlay anchors on
+    set(_strata_mmq_iq1m OFF)
+    if(STRATA_MMQ_IQ1M)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_ggml_iq1m_overlay.cmake)
+      if(_strata_mmq_tq_overlay)
+        set(_strata_iq1m_overlay_dir ${_strata_tq_overlay_dir})
+        strata_ggml_iq1m_overlay("${_strata_gg}/.." "${_strata_iq1m_overlay_dir}" INPLACE)
+      else()
+        set(_strata_iq1m_overlay_dir "${CMAKE_BINARY_DIR}/ggml-iq1m-overlay")
+        strata_ggml_iq1m_overlay("${_strata_gg}/.." "${_strata_iq1m_overlay_dir}")
+      endif()
+      if(STRATA_IQ1M_OVERLAY_OK)
+        set(_strata_mmq_iq1m ON)
+        set(_strata_quantize_cu ${_strata_iq1m_overlay_dir}/quantize.cu)
+        message(STATUS "IQ1_M MMQ (prompt experts; STRATA_MMQ_IQ1M=0 turns it off): overlay in ${_strata_iq1m_overlay_dir}")
+      endif()
+    endif()
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
-                src/prefill/mmq_nvfp4_w4a8.cu
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_iq4_w4a8.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+                src/prefill/mmq_nvfp4_w4a8.cu src/prefill/mmq_mxfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
       # GP100 (sm_60): a resident layer's experts weight-stationary, one launch per product (moe_ws.hpp; opt-in at
@@ -2309,6 +2395,11 @@ if(STRATA_NATIVE_EXPERTS)
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
+    if(_strata_mmq_iq1m)
+      target_sources(strata_mmq PRIVATE ${_strata_iq1m_overlay_dir}/template-instances/mmq-instance-iq1_m.cu)
+      target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_iq1m_overlay_dir} ${_strata_iq1m_overlay_dir}/include)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_IQ1M=1)
+    endif()
     if(_strata_mmq_tq_overlay)
       foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
         target_sources(strata_mmq PRIVATE ${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu)
@@ -2494,6 +2585,14 @@ if(STRATA_NATIVE_EXPERTS)
         set_tests_properties(prefill_ws_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       endif()
     endif()
+    if(STRATA_BUILD_TESTS AND NOT STRATA_HIP_GFX906)
+      # STRATA_IQ4_W4A8: the IQ4 W4A8 expert kernel against MMQ, bit for bit, on the group buffers and (with
+      # STRATA_MMQ_TAB) the pointer table (exit 77 without a card or off sm_80..sm_88; gfx906: a stub, no test)
+      add_executable(prefill_iq4_w4a8_test tests/cuda/prefill_iq4_w4a8_test.cu)
+      target_link_libraries(prefill_iq4_w4a8_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_iq4_w4a8_test COMMAND prefill_iq4_w4a8_test)
+      set_tests_properties(prefill_iq4_w4a8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
     if(STRATA_BUILD_TESTS AND _strata_mmq_tab_on)
       # STRATA_MMQ_DIRECT: the pointer-table MMQ bit for bit against the gathered MMQ (exit 77 below sm_80)
       add_executable(prefill_mmq_tab_test tests/cuda/prefill_mmq_tab_test.cu)
@@ -2508,6 +2607,13 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
       # the K-quant MMQ is opt-in at run time (STRATA_MMQ_KQ=1), and on CUDA it is strata_kq next to the test
       set_tests_properties(prefill_mmq_kquant_test PROPERTIES TIMEOUT 120 ENVIRONMENT STRATA_MMQ_KQ=1)
+    endif()
+    if(STRATA_BUILD_TESTS AND _strata_mmq_iq1m)
+      # IQ1_M experts through MMQ (the overlay, Basalt 86b1e97f4) against ggml's dequantized weights (random blocks)
+      add_executable(prefill_mmq_iq1m_test tests/cuda/prefill_mmq_iq1m_test.cpp)
+      target_link_libraries(prefill_mmq_iq1m_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_mmq_iq1m_test COMMAND prefill_mmq_iq1m_test)
+      set_tests_properties(prefill_mmq_iq1m_test PROPERTIES TIMEOUT 120 ENVIRONMENT STRATA_MMQ_IQ1M=1)
     endif()
     # the NVFP4 expert products (w4a8 / w4a4, STRATA_PREFILL_NVFP4) against a double-precision reference
     add_executable(mmq_nvfp4_parity src/prefill/mmq_nvfp4_parity.cpp)
@@ -2959,6 +3065,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/fork.cmake OPTIONAL)
 # the GLM-5.3-Flash engine (GlmDense + the shared Ds4MoeTier) - needs the ds4 slices above
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/glm/cmake/glm.cmake OPTIONAL)
 
+# Flash uses the same pinned native grammar parser and vocabulary as q36.
+option(STRATA_FLASH_GRAMMAR "Enable native Flash GBNF constrained decoding" OFF)
 # q36 GBNF uses the same vocab-only llama library as M31, without common/chat.
 if(TARGET strata_qwen35)
   option(STRATA_Q36_GRAMMAR "Enable q36 GBNF constrained decoding" OFF)
@@ -2971,6 +3079,24 @@ if(TARGET strata_qwen35)
     target_compile_definitions(q36-grammar-check PRIVATE STRATA_Q36_GRAMMAR=1)
     target_link_libraries(q36-grammar-check PRIVATE q36_llama)
   endif()
+endif()
+
+if(STRATA_FLASH_GRAMMAR AND TARGET strata)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/grammar.cmake)
+  target_link_libraries(strata PRIVATE q36_llama)
+  target_compile_definitions(strata PRIVATE STRATA_Q36_GRAMMAR=1)
+  add_executable(flash-grammar-state-check EXCLUDE_FROM_ALL tools/flash_grammar_state_check.cpp)
+  target_include_directories(flash-grammar-state-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+  target_compile_definitions(flash-grammar-state-check PRIVATE STRATA_Q36_GRAMMAR=1)
+  target_link_libraries(flash-grammar-state-check PRIVATE q36_llama)
+endif()
+
+# DeepSeek reuses the pinned vocabulary-only grammar parser; no GPU llama backend.
+option(STRATA_DS41_GRAMMAR "Enable native DeepSeek V4.1 GBNF" OFF)
+if(STRATA_DS41_GRAMMAR AND TARGET ds41_generate)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/grammar.cmake)
+  target_link_libraries(ds41_generate PRIVATE q36_llama)
+  target_compile_definitions(ds41_generate PRIVATE STRATA_Q36_GRAMMAR=1)
 endif()
 
 # the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON).
@@ -2998,4 +3124,12 @@ if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
   add_executable(xolotl-lfm3 src/program/lfm3_main.cpp)
   target_include_directories(xolotl-lfm3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(xolotl-lfm3 PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+endif()
+
+# Muse Glimmer 30B (Meta) behind the serve protocol: llama.cpp's muse-glimmer graph on ggml-backend (CUDA + CPU fallback),
+# src/program/glimmer_main.cpp (the xolotl-lfm3 skeleton).  Same needs as xolotl-lfm3.
+if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
+  add_executable(xolotl-glimmer src/program/glimmer_main.cpp)
+  target_include_directories(xolotl-glimmer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-glimmer PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
 endif()

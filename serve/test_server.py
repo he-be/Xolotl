@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import os
@@ -1394,6 +1395,27 @@ class UnfinishedToolCall(unittest.TestCase):
                 self.assertEqual([c["id"] for c in msg["tool_calls"]], want)
         msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "stop")])["choices"][0]["message"]
         self.assertNotIn("tool_calls", msg)
+        # opt-in "keep_cut_tool_calls": the call cut at the token limit stays, its arguments as far as they got (as a
+        # stream shows them); a turn that stopped inside a call still leaves it out
+        for finish, want in (("stop", ["a"]), ("length", ["a", "b"]), ("tool_calls", ["a", "b"])):
+            with self.subTest(keep_cut=True, finish=finish):
+                msg = openai_collect([chunk({"tool_calls": [whole]}), chunk({"tool_calls": [cut]}),
+                                      chunk({}, finish)], keep_cut=True)["choices"][0]["message"]
+                self.assertEqual([c["id"] for c in msg["tool_calls"]], want)
+        msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "length")], keep_cut=True)["choices"][0]["message"]
+        self.assertEqual(msg["tool_calls"][0]["function"]["arguments"], '{"y": "ha')
+
+    def test_keep_cut_tool_calls_is_opt_in(self):
+        from serve.server import keep_cut_tool_calls_setting
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIs(svc.keep_cut_tool_calls, False)
+        self.assertIs(keep_cut_tool_calls_setting({}), False)
+        self.assertIs(keep_cut_tool_calls_setting({"keep_cut_tool_calls": True}), True)
+        self.assertIs(keep_cut_tool_calls_setting({"keep_cut_tool_calls": False}), False)
+        for bad in ("true", 0, 1, None):
+            with self.assertRaises(SystemExit):
+                keep_cut_tool_calls_setting({"keep_cut_tool_calls": bad})
 
     def test_a_whole_call(self):
         whole = {"path": "notes.txt", "content": "all of it"}
@@ -2058,7 +2080,11 @@ class IncrementalPrompts(unittest.TestCase):
             status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
             self.assertEqual(status, 200, b)
             prompt = self.svc.template.render(msgs)
-            self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))
+            # the reference is the same messages with the thinking the server wrote put back into the turns a client
+            # dropped it from (Service._restore_reasoning; serve/test_restore_reasoning.py covers that on its own)
+            expect = copy.deepcopy(msgs)
+            self.svc._restore_reasoning(expect)
+            self.assertEqual(self.engine.last_ids, full.encode_prompt(expect, None, {}))
             if turn:
                 self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
             msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
@@ -2650,6 +2676,7 @@ class NonFiniteLogits(unittest.TestCase):
         """StrataEngine.generate: `DONE ... nonfinite` raises EngineNonFinite after the tokens before it."""
         import queue as queue_
         eng = object.__new__(StrataEngine)
+        eng.info = {}  # bare fixtures still model the initialized capability map
         eng.lines = queue_.Queue()
         for line in ("T 5", "T 6", "DONE 2 3 1.0 2.0 nonfinite 0 0 0"):
             eng.lines.put(line)
@@ -3065,6 +3092,7 @@ class LiveRate(unittest.TestCase):
         import queue
         from types import SimpleNamespace
         engine = StrataEngine.__new__(StrataEngine)
+        engine.info = {}  # bare fixtures still model the initialized capability map
         engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
         engine.lines = queue.Queue()
         engine.can_stop = False
@@ -3378,6 +3406,26 @@ class SharedSettings(unittest.TestCase):
         self.assertEqual(r["reasoning_effort"], "low")
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
+
+    def test_a_new_seed_for_each_request_without_one(self):
+        """(local rb25) No seed from the request, the config or the shared settings: every request gets a new one (the
+        engine's generator, seeded once at its start, made the first sampled reply after each start the same); a
+        request's own seed wins."""
+        seeds = []
+        for _ in range(3):
+            code, _ = self.chat(temperature=0.8)
+            self.assertEqual(code, 200)
+            s = self.engine.last_sampling.get("seed")
+            self.assertIsInstance(s, int)
+            self.assertTrue(0 < s < 2 ** 31, s)
+            seeds.append(s)
+        self.assertEqual(len(set(seeds)), 3, seeds)                    # one fixed seed would repeat
+        code, _ = self.chat(temperature=0.8, seed=12345)
+        self.assertEqual(code, 200)
+        self.assertEqual(self.engine.last_sampling["seed"], 12345)
+        code, _ = self.chat(temperature=0.8, seed=None)                # null = not given
+        self.assertEqual(code, 200)
+        self.assertNotEqual(self.engine.last_sampling["seed"], 12345)
 
     def test_off_again(self):
         self.req("/settings", {"defaults": {"temperature": 0.3}})
@@ -5254,6 +5302,7 @@ class SilentEngine(unittest.TestCase):
         import io
         import queue
         engine = StrataEngine.__new__(StrataEngine)
+        engine.info = {}  # bare fixtures still model the initialized capability map
         engine.proc = mock.Mock()
         engine.proc.stdin = io.StringIO()
         engine.proc.poll.return_value = None

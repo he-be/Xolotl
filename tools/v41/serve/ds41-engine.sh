@@ -3,11 +3,14 @@
 # protections in the FOREGROUND (memguard.sh backgrounds its command, which would break the stdin/stdout protocol):
 # ComfyUI check, the shared GPU lock (held while the server runs), an 84 GiB RAM cap, no swap.  (= GLM's glm-engine.sh)
 set -u
+# Xolotl names: XOLOTL_<X> = STRATA_<X> (the Xolotl name wins; STRATA_* keeps working)
+for _v in $(compgen -e | grep '^XOLOTL_'); do export "STRATA_${_v#XOLOTL_}=${!_v}"; done; unset _v
 cd "$(dirname "$0")/../../.."
 if [ "${MEMGUARD_ALLOW_COMFY:-0}" != 1 ] && ss -ltn 2>/dev/null | grep -q ':8188 '; then
     echo "ds41-engine: refusing - ComfyUI is running on :8188 (RAM)" >&2; exit 3
 fi
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 export GGML_NO_BACKTRACE=1
 # 4 KiB pages pin the 60 GiB arena at 1.2 GB/s (load ~50 s); THP pins at ~0.16 GB/s (~4 min)
 export STRATA_NO_LARGEPAGES="${STRATA_NO_LARGEPAGES:-1}"
@@ -21,7 +24,7 @@ export STRATA_SERVE_PASS_BIAS="${STRATA_SERVE_PASS_BIAS:-0}"
 # trunk's): the Q2_K sidecar, the draft's experts pruned to the 64 most used per layer (dspark_expert_counts.txt),
 # depth 4 with the confidence-head trim at 0.6 (s11: +30% avg, prose 9.5 -> 17.3 tok/s).  STRATA_SERVE_DSPARK= (empty)
 # turns it off.  The engine args (strata-ds41.json): route bias x0.5 + file 0.3, --arena-adapt, arena 64 GiB, --kv-fp4.
-DSPARK_SIDECAR=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.Q2_K.gguf
+DSPARK_SIDECAR=/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision.Q2_K.gguf
 export STRATA_SERVE_DSPARK="${STRATA_SERVE_DSPARK-$DSPARK_SIDECAR}"
 export STRATA_DSPARK_KEEP="${STRATA_DSPARK_KEEP:-$PWD/tools/v41/serve/dspark_expert_counts.txt:64}"
 export STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}"
@@ -57,6 +60,22 @@ export STRATA_DENSE_REQUANT="${STRATA_DENSE_REQUANT-q6_K}"
 # the chunk prestage region: 1.5 GiB is what the adopted 12288 batch was measured with (3.0 GiB starves the batch's
 # own buffers on a 24 GB card).  0 = off.
 export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
+# Keisawaakira's decode set (ported 2026-11-19, tools/v41/engine/DECODE_OPTINS.md), served default since 19 Nov:
+# routing copies fused + read on the card, the metadata pulled once, the prefetch waits on the host, the hit fast path,
+# the attention tail (the shared expert moves into the attention graph; it replaces STRATA_DS41_SHEXP_LATE), the route
+# hook, async dense, pinned route buffers, graph concurrency 7, fused QKV.  RTX 4090, served q6 config + fast mode,
+# 8K prompt / 512 tokens: 98.8 -> 89.1 ms per verify pass (-10 %); short34 0.4651 / 88.61 % against the base's
+# 0.4614-0.4653 / 88.42-88.65 % (not bit-identical: sums move).  Not taken: STRATA_DEMOTE_ASYNC (lost, 98.6 ms).
+# With STRATA_RB_PROTECT set (the smart router's route meter) ATTN_TAIL, and RB_HOOK / GRAPH_CONC behind it, stay off
+# and ROUTE_FUSE is skipped; the -10 % above is the other seven (the engine log prints which are OFF).  Agent tasks
+# (Gauntlet 01+03, fast): 42.7 tok/s against 39.6 / 40.8 on 7 Nov (+5-8 %).
+# Turn the whole set off with XOLOTL_KEIS_DECODE=0; any single switch with its own =0.
+if [ "${XOLOTL_KEIS_DECODE:-1}" != 0 ]; then
+    for _kv in STRATA_ROUTE_FUSE=1 STRATA_X_DEV=1 STRATA_META_PULL=1 STRATA_PF_HOSTWAIT=1 STRATA_ATTN_TAIL=3 STRATA_RB_HOOK=1 \
+               STRATA_HIT_FAST=3 STRATA_DENSE_ASYNC=1 STRATA_PIN_RB=1 STRATA_GRAPH_CONC=7 STRATA_QKV_FUSE=1; do
+        _k=${_kv%%=*}; [ -z "${!_k+x}" ] && export "$_kv"
+    done; unset _kv _k
+fi
 # an explicit STRATA_PROMPT_BATCH still wins over the json's --prompt-batch (it is appended after those args)
 [ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
@@ -64,8 +83,11 @@ export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
 # pre-merge build dir (build-ds4-gpu) is still found so an old checkout of this script keeps working
 # build-ds41 = ds41_generate built against third_party/llama.cpp-x75 (cmake -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp-x75
 # -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DGGML_CUDA=ON); preferred over build-xolotl when present (2026-11-01)
-if [ -z "${STRATA_BUILD_DIR:-}" ] && [ -x "$PWD/build-ds41/ds41_generate" ]; then BUILD_DIR="$PWD/build-ds41"; else BUILD_DIR="${STRATA_BUILD_DIR:-$PWD/build-xolotl}"; fi
-[ -x "$BUILD_DIR/ds41_generate" ] || [ ! -x "$PWD/build-ds4-gpu/ds41_generate" ] || BUILD_DIR="$PWD/build-ds4-gpu"
+# One build: build-xolotl (2026-11-08 - a stale build-ds41 used to win silently whenever it existed, so the wrappers ran
+# a 4 Nov engine without fast mode).  STRATA_BUILD_DIR still overrides it, and the engine log names the binary.
+BUILD_DIR="${STRATA_BUILD_DIR:-$PWD/build-xolotl}"
+[ -x "$BUILD_DIR/ds41_generate" ] || { echo "ds41-engine: no $BUILD_DIR/ds41_generate (ninja -C build-xolotl ds41_generate)" >&2; exit 2; }
+echo "ds41-engine: $BUILD_DIR/ds41_generate ($(date -r "$BUILD_DIR/ds41_generate" '+%F %H:%M'))" >&2
 # systemd-run --user applies the MemoryMax cap (DS41_MEMORY_MAX, default 100G: arena 80 + engine + page cache on the 109 GiB box, 2026-11-01) and the no-swap guard.  It does not exist in a container
 # without a user manager (unprivileged LXC, some Docker setups; issue #60), so fall back to a plain exec there
 # rather than failing to start.  STRATA_NO_SCOPE=1 forces the fallback on a box that does have systemd.

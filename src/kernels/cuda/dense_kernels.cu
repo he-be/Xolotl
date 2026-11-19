@@ -53,6 +53,41 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * scale * w[i];
 }
 
+// xolotl: one block of 1024 threads per row, the row read once into registers (PER values a thread, cols <= PER * 1024).
+template <int PER>
+__global__ void __launch_bounds__(1024) rms_norm_reg_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                            float* __restrict__ out, int cols, float eps) {
+    const float* xr = x + (size_t) blockIdx.x * cols;
+    float* orow = out + (size_t) blockIdx.x * cols;
+    float v[PER];
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int i = threadIdx.x + j * 1024;
+        v[j] = i < cols ? xr[i] : 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < PER; ++j) acc = __fmaf_rn(v[j], v[j], acc);
+    acc = warp_sum(acc);
+    __shared__ float part[32];
+    __shared__ float scale;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float t = part[lane];
+        t = warp_sum(t);
+        if (lane == 0) scale = rsqrtf(t / (float) cols + eps);
+    }
+    __syncthreads();
+    const float sc = scale;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int i = threadIdx.x + j * 1024;
+        if (i < cols) orow[i] = v[j] * sc * w[i];
+    }
+}
+
 // One block per value head: rms over `cols`, then * w[i] * silu(z[i]).
 __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
                                     const float* __restrict__ w, float* __restrict__ y, int cols, float eps) {
@@ -354,6 +389,142 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const floa
 }
 
 int splits_for(int cells) { return (cells + kChunk - 1) / kChunk; }
+
+// ------------------------------------------------------------------------------------------------ multi-column attention
+// xolotl: the n columns of a verify window (column c sees cells [0, n_ctx0 + c)) in ONE launch.  A warp loads a K / V
+// cell once and updates every column that sees it, so the cache is read once per window instead of once per column
+// (the old path launched dense_attn_decode per column).  Per column it is the split-K decode above, cell for cell and
+// split for split; the products use explicit fma / mul so the arithmetic does not depend on how many columns share
+// the launch: a column computes the same bits alone (n = 1, single steps) as inside a window.
+// Grid (n_head, splits of the widest column), 256 threads.  q is [n][n_head][head_dim]; the partials of column c
+// sit at scratch + c * dense_attn_scratch_bytes(...) / 4 with column c's own n_splits as the stride.
+template <int KF, int VF, int NQ>
+__global__ void __launch_bounds__(kWarps * 32) attn_partial_multi_kernel(
+        const float* __restrict__ q, const uint8_t* __restrict__ K, const uint8_t* __restrict__ V,
+        float* __restrict__ scratch, size_t col_stride, int max_splits, int n_head, int n_kv, int head_dim,
+        int n_ctx0, int ncols, int max_ctx, float scale) {
+    const int h = blockIdx.x, split = blockIdx.y;
+    const int kvh = h / (n_head / n_kv);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int per = head_dim >> 5;
+    const int begin = split * kChunk;
+    const int end_all = min(n_ctx0 + ncols - 1, begin + kChunk);
+
+    __shared__ float sq[NQ][kMaxHeadDim];
+    for (int c = 0; c < ncols; ++c) {
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) sq[c][i] = q[((size_t) c * n_head + h) * head_dim + i];
+        if (KF == kQ4) fwht256_shared(sq[c]);                // head_dim == 256 == blockDim.x
+    }
+    __syncthreads();
+    // the per-lane query values, scaled exactly as the one-column kernel scales them
+    float qv[NQ][8];
+#pragma unroll
+    for (int c = 0; c < NQ; ++c)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) qv[c][i] = (c < ncols && i < per) ? __fmul_rn(sq[c][lane + 32 * i], scale) : 0.0f;
+
+    const size_t kcell = (size_t) cell_bytes(KF, head_dim), vcell = (size_t) cell_bytes(VF, head_dim);
+    const uint8_t* Kb = K + (size_t) kvh * max_ctx * kcell;
+    const uint8_t* Vb = V + (size_t) kvh * max_ctx * vcell;
+
+    float m[NQ], l[NQ], acc[NQ][8];
+#pragma unroll
+    for (int c = 0; c < NQ; ++c) {
+        m[c] = -FLT_MAX; l[c] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[c][i] = 0.0f;
+    }
+    for (int t = begin + warp; t < end_all; t += kWarps) {
+        const uint8_t* kcl = Kb + (size_t) t * kcell;
+        const uint8_t* vcl = Vb + (size_t) t * vcell;
+        float kr[8], vr[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            kr[i] = i < per ? kv_val<KF>(kcl, i, lane) : 0.0f;
+            vr[i] = i < per ? kv_val<VF>(vcl, i, lane) : 0.0f;
+        }
+#pragma unroll
+        for (int c = 0; c < NQ; ++c) {
+            if (c >= ncols || t >= n_ctx0 + c) continue;     // column c sees cells [0, n_ctx0 + c)
+            float d = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (i < per) d = __fmaf_rn(qv[c][i], kr[i], d);
+            d = warp_sum(d);
+            const float mn = fmaxf(m[c], d);
+            const float corr = __expf(m[c] - mn);
+            const float p = __expf(d - mn);
+            l[c] = __fmaf_rn(l[c], corr, p);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (i < per) acc[c][i] = __fmaf_rn(p, vr[i], __fmul_rn(acc[c][i], corr));
+            m[c] = mn;
+        }
+    }
+
+    __shared__ float sm[kWarps], sl[kWarps];
+    __shared__ float sacc[kWarps][kMaxHeadDim];
+#pragma unroll
+    for (int c = 0; c < NQ; ++c) {
+        if (c >= ncols) break;
+        const int n_splits = (n_ctx0 + c + kChunk - 1) / kChunk;
+        if (split >= n_splits) continue;                       // uniform over the block
+        if (lane == 0) { sm[warp] = m[c]; sl[warp] = l[c]; }
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            if (i < per) sacc[warp][lane + 32 * i] = acc[c][i];
+        __syncthreads();
+        if (threadIdx.x < head_dim) {
+            float gm = -FLT_MAX;
+            for (int w = 0; w < kWarps; ++w) gm = fmaxf(gm, sm[w]);
+            float a = 0.0f, L = 0.0f;
+            for (int w = 0; w < kWarps; ++w) {
+                if (sl[w] == 0.0f) continue;
+                const float f = __expf(sm[w] - gm);
+                a = __fmaf_rn(sacc[w][threadIdx.x], f, a);
+                L = __fmaf_rn(sl[w], f, L);
+            }
+            float* part_acc = scratch + (size_t) c * col_stride;
+            float* part_ml = part_acc + (size_t) n_head * max_splits * head_dim;
+            part_acc[((size_t) h * n_splits + split) * head_dim + threadIdx.x] = a;
+            if (threadIdx.x == 0) {
+                part_ml[((size_t) h * n_splits + split) * 2] = L > 0.0f ? gm : -FLT_MAX;
+                part_ml[((size_t) h * n_splits + split) * 2 + 1] = L;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Grid (n_head, n), head_dim threads: merges the splits of column blockIdx.y.
+template <int VF>
+__global__ void attn_merge_multi_kernel(const float* __restrict__ scratch, size_t col_stride, int max_splits,
+                                        float* __restrict__ out, int n_head, int head_dim, int n_ctx0) {
+    __shared__ float so[kMaxHeadDim];
+    const int h = blockIdx.x, c = blockIdx.y;
+    const int n_splits = (n_ctx0 + c + kChunk - 1) / kChunk;
+    const float* part_acc = scratch + (size_t) c * col_stride;
+    const float* part_ml = part_acc + (size_t) n_head * max_splits * head_dim;
+    float gm = -FLT_MAX;
+    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_ml[((size_t) h * n_splits + s) * 2]);
+    float a = 0.0f, L = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+        const float l = part_ml[((size_t) h * n_splits + s) * 2 + 1];
+        if (l == 0.0f) continue;
+        const float f = __expf(part_ml[((size_t) h * n_splits + s) * 2] - gm);
+        a = __fmaf_rn(part_acc[((size_t) h * n_splits + s) * head_dim + threadIdx.x], f, a);
+        L = __fmaf_rn(l, f, L);
+    }
+    float val = L > 0.0f ? a / L : 0.0f;
+    if (VF == kQ4) {
+        so[threadIdx.x] = val;
+        __syncthreads();
+        fwht256_shared(so);
+        val = so[threadIdx.x];
+    }
+    out[((size_t) c * n_head + h) * head_dim + threadIdx.x] = val;
+}
+
 
 // ================================================================================== the batched prompt kernels
 // The same arithmetic as the per-token path above, with the token as the slow index, so a chunk of T tokens lands on
@@ -777,6 +948,48 @@ __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* _
     if (lane == 0) y[(size_t) col * n_out + row] = acc;
 }
 
+// xolotl: y = W x with W in Q8_0 GGUF blocks (f16 scale + 32 int8) and x in FP32 - no q8_1 rounding of the activation.
+// For files whose error is dominated by the activation rounding (SenseNova-Loop: q8_1 activations cost ~4x the Q8_0
+// weights, 18 Nov parity).  One warp per output row, every column in the same pass so the row is read once; eight
+// lanes per block (lane k of the eight takes values 4k..4k+3: two 2-byte loads, the block's int8s start at byte 2) so a
+// warp walks four consecutive blocks per step.  Accumulation in FP32, the dequantized weight times the FP32 input:
+// the same product the reference computes from a dequantized Q8_0 file.
+constexpr int kQ80F32MaxCols = 8;
+__global__ void gemv_q80_f32_kernel(const uint8_t* __restrict__ W, const float* __restrict__ X, float* __restrict__ y,
+                                    int n_in, int n_out, int n) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= n_out) return;
+    const int lane = threadIdx.x & 31, k = lane & 7;
+    const int nb = n_in >> 5;
+    const uint8_t* wr = W + (size_t) row * nb * 34;
+    float acc[kQ80F32MaxCols];
+#pragma unroll
+    for (int c = 0; c < kQ80F32MaxCols; ++c) acc[c] = 0.0f;
+    for (int b = lane >> 3; b < nb; b += 4) {
+        const uint8_t* blk = wr + (size_t) b * 34;
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint16_t u0 = *reinterpret_cast<const uint16_t*>(blk + 2 + 4 * k);
+        const uint16_t u1 = *reinterpret_cast<const uint16_t*>(blk + 4 + 4 * k);
+        const float q0 = (float) (int8_t) (u0 & 0xff), q1 = (float) (int8_t) (u0 >> 8);
+        const float q2 = (float) (int8_t) (u1 & 0xff), q3 = (float) (int8_t) (u1 >> 8);
+        const size_t xo = (size_t) b * 32 + 4 * k;
+#pragma unroll
+        for (int c = 0; c < kQ80F32MaxCols; ++c) {
+            if (c < n) {
+                const float4 xv = *reinterpret_cast<const float4*>(X + (size_t) c * n_in + xo);
+                acc[c] += d * (q0 * xv.x + q1 * xv.y + q2 * xv.z + q3 * xv.w);
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kQ80F32MaxCols; ++c) {
+        if (c < n) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) y[(size_t) c * n_out + row] = v;
+        }
+    }
+}
+
 // One thread per conv channel, walking the chunk inside the launch (the decode path's conv_silu with a token loop).
 // The thread owns its channel's whole 4-tap window, so a snapshot of the history after column j is three stores from
 // registers it already has: that is how a speculative pass gets its rollback points without a copy per column.
@@ -917,7 +1130,11 @@ __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
 }  // namespace
 
 void dense_rms_norm(const float* x, const float* w, float* out, int rows, int cols, float eps, void* stream) {
-    rms_norm_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(x, w, out, cols, eps);
+    // xolotl: a decode step has 1-8 rows of 5120, so one 256-thread block per row left most of the card idle and each
+    // thread walked the row twice (8 us a call, ~150 calls a verify pass).  1024 threads holding <= 8 values each read
+    // the row once.
+    if (cols <= 8 * 1024) rms_norm_reg_kernel<8><<<rows, 1024, 0, (cudaStream_t) stream>>>(x, w, out, cols, eps);
+    else rms_norm_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(x, w, out, cols, eps);
     check("dense_rms_norm");
 }
 
@@ -1032,6 +1249,46 @@ void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_ca
     if (v_fmt == kQ4) attn_merge_kernel<kQ4><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, out, head_dim, n_splits);
     else attn_merge_kernel<kF16><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, out, head_dim, n_splits);
     check("dense_attn_merge");
+}
+
+void dense_attn_decode_multi_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt,
+                                 float* out, float* scratch, int n_head, int n_kv, int head_dim, int n_ctx0, int n,
+                                 int max_ctx, float scale, void* stream) {
+    if (n < 1 || n > 8) throw std::runtime_error("dense_attn_decode_multi: 1 to 8 columns");
+    if (n_ctx0 < 1 || n_ctx0 + n - 1 > max_ctx) throw std::runtime_error("dense_attn_decode_multi: n_ctx outside the cache");
+    if (head_dim % 32 != 0 || head_dim > kMaxHeadDim || n_head % n_kv != 0)
+        throw std::runtime_error("dense_attn_decode_multi: head_dim must be a multiple of 32 up to 256 and n_head a multiple of n_kv");
+    check_kv_formats("dense_attn_decode_multi", k_fmt, v_fmt, head_dim);
+    const int max_splits = splits_for(max_ctx);
+    const size_t col_stride = (size_t) n_head * max_splits * ((size_t) head_dim + 2);
+    const cudaStream_t st = (cudaStream_t) stream;
+    const uint8_t* K = (const uint8_t*) k_cache;
+    const uint8_t* V = (const uint8_t*) v_cache;
+    const dim3 grid(n_head, splits_for(n_ctx0 + n - 1));
+#define STRATA_ATTM(KF, VF)                                                                                         \
+    do {                                                                                                            \
+        if (n == 1) attn_partial_multi_kernel<KF, VF, 1><<<grid, kWarps * 32, 0, st>>>(q, K, V, scratch, col_stride, max_splits, n_head, n_kv, head_dim, n_ctx0, n, max_ctx, scale); \
+        else if (n <= 2) attn_partial_multi_kernel<KF, VF, 2><<<grid, kWarps * 32, 0, st>>>(q, K, V, scratch, col_stride, max_splits, n_head, n_kv, head_dim, n_ctx0, n, max_ctx, scale); \
+        else if (n <= 4) attn_partial_multi_kernel<KF, VF, 4><<<grid, kWarps * 32, 0, st>>>(q, K, V, scratch, col_stride, max_splits, n_head, n_kv, head_dim, n_ctx0, n, max_ctx, scale); \
+        else attn_partial_multi_kernel<KF, VF, 8><<<grid, kWarps * 32, 0, st>>>(q, K, V, scratch, col_stride, max_splits, n_head, n_kv, head_dim, n_ctx0, n, max_ctx, scale); \
+    } while (0)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_ATTM(kF16, kF16); break;
+        case 1: STRATA_ATTM(kF16, kQ8); break;
+        case 2: STRATA_ATTM(kF16, kQ4); break;
+        case 3: STRATA_ATTM(kQ8, kF16); break;
+        case 4: STRATA_ATTM(kQ8, kQ8); break;
+        case 5: STRATA_ATTM(kQ8, kQ4); break;
+        case 6: STRATA_ATTM(kQ4, kF16); break;
+        case 7: STRATA_ATTM(kQ4, kQ8); break;
+        default: STRATA_ATTM(kQ4, kQ4); break;
+    }
+#undef STRATA_ATTM
+    check("dense_attn_partial_multi");
+    const dim3 mgrid(n_head, n);
+    if (v_fmt == kQ4) attn_merge_multi_kernel<kQ4><<<mgrid, head_dim, 0, st>>>(scratch, col_stride, max_splits, out, n_head, head_dim, n_ctx0);
+    else attn_merge_multi_kernel<kF16><<<mgrid, head_dim, 0, st>>>(scratch, col_stride, max_splits, out, n_head, head_dim, n_ctx0);
+    check("dense_attn_merge_multi");
 }
 
 void dense_attn_decode(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, float* scratch,
@@ -1174,6 +1431,15 @@ void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int
     check("dense_gemv_f32_rows");
 }
 
+void dense_gemv_q80_f32(const void* W, const float* X, float* y, int n_in, int n_out, int n, void* stream) {
+    if (n < 1) return;
+    if (n > kQ80F32MaxCols || (n_in & 31)) throw std::runtime_error("dense_gemv_q80_f32: 1..8 columns, n_in a multiple of 32");
+    const int warps = 4;
+    gemv_q80_f32_kernel<<<(n_out + warps - 1) / warps, warps * 32, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) W, X, y, n_in, n_out, n);
+    check("dense_gemv_q80_f32");
+}
+
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
                           const DenseGdnSnap& snap, void* stream) {
     if (T < 1) return;
@@ -1219,6 +1485,147 @@ void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const 
     gdn_rec_chunk_kernel<<<v_heads, block, 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y,
                                                                        k_heads, v_heads, T, snap);
     check("dense_gdn_rec_chunk");
+}
+
+// ============================================================================ xolotl: mHC (SenseNova-Loop)
+//
+// The reference is modeling_sensenova_loop.py MHCRouter.  One column holds S residual streams of E floats, stream-major
+// ([S][E], the reference's flatten(-2) order, which the router weight's columns follow).  Per column:
+//   rsq     = rsqrt(mean(R^2) + 1e-6)                    (over all S*E values, no weight)
+//   logits  = rsq * (W . R) + b                           W [rows][S*E], rows = 2S (+ S*S unless fixed_identity)
+//   pre     = sigmoid(logits[0:S])          branch = pre_scale * sum_j pre[j] * R[j]
+//   post    = 2 * sigmoid(logits[S:2S])
+//   mix     = sinkhorn(logits[2S:], iters)  (log space: rows, then columns; identity when fixed)
+// and the write is R'[i] = sum_j mix[i][j] R[j] + post[i] * y.  coef holds pre[S], post[S], mix[S*S] per column.
+namespace {
+constexpr int kMhcMaxS = 4, kMhcMaxRows = 2 * kMhcMaxS + kMhcMaxS * kMhcMaxS, kMhcThreads = 512;
+
+__global__ void mhc_read_kernel(const float* __restrict__ R, const float* __restrict__ W, const float* __restrict__ b,
+                                int S, int E, int rows, int iters, bool fixed_identity, float pre_scale,
+                                float* __restrict__ branch, float* __restrict__ coef) {
+    const int c = blockIdx.x, SE = S * E;
+    const float* r = R + (size_t) c * SE;
+    float acc[kMhcMaxRows + 1];
+    #pragma unroll
+    for (int k = 0; k <= kMhcMaxRows; ++k) acc[k] = 0.f;
+    for (int i = threadIdx.x; i < SE; i += blockDim.x) {
+        const float v = r[i];
+        acc[kMhcMaxRows] += v * v;
+        #pragma unroll
+        for (int k = 0; k < kMhcMaxRows; ++k)
+            if (k < rows) acc[k] += W[(size_t) k * SE + i] * v;
+    }
+    __shared__ float red[kMhcThreads / 32][kMhcMaxRows + 1];
+    __shared__ float cf[2 * kMhcMaxS + kMhcMaxS * kMhcMaxS];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    #pragma unroll
+    for (int k = 0; k <= kMhcMaxRows; ++k) {
+        float v = acc[k];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) red[warp][k] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot[kMhcMaxRows + 1];
+        for (int k = 0; k <= kMhcMaxRows; ++k) {
+            tot[k] = 0.f;
+            for (int w = 0; w < nw; ++w) tot[k] += red[w][k];
+        }
+        const float rsq = rsqrtf(tot[kMhcMaxRows] / (float) SE + 1e-6f);
+        float lg[kMhcMaxRows];
+        for (int k = 0; k < rows; ++k) lg[k] = tot[k] * rsq + b[k];
+        for (int j = 0; j < S; ++j) {
+            cf[j] = 1.f / (1.f + expf(-lg[j]));
+            cf[S + j] = 2.f / (1.f + expf(-lg[S + j]));
+        }
+        float* mix = cf + 2 * S;
+        if (fixed_identity) {
+            for (int i = 0; i < S; ++i)
+                for (int j = 0; j < S; ++j) mix[i * S + j] = i == j ? 1.f : 0.f;
+        } else {
+            float m[kMhcMaxS * kMhcMaxS];
+            for (int k = 0; k < S * S; ++k) m[k] = lg[2 * S + k];
+            for (int it = 0; it < iters; ++it) {
+                for (int i = 0; i < S; ++i) {          // logsumexp over the last dim (each row)
+                    float mx = -FLT_MAX, sum = 0.f;
+                    for (int j = 0; j < S; ++j) mx = fmaxf(mx, m[i * S + j]);
+                    for (int j = 0; j < S; ++j) sum += expf(m[i * S + j] - mx);
+                    const float lse = mx + logf(sum);
+                    for (int j = 0; j < S; ++j) m[i * S + j] -= lse;
+                }
+                for (int j = 0; j < S; ++j) {          // then over dim -2 (each column)
+                    float mx = -FLT_MAX, sum = 0.f;
+                    for (int i = 0; i < S; ++i) mx = fmaxf(mx, m[i * S + j]);
+                    for (int i = 0; i < S; ++i) sum += expf(m[i * S + j] - mx);
+                    const float lse = mx + logf(sum);
+                    for (int i = 0; i < S; ++i) m[i * S + j] -= lse;
+                }
+            }
+            for (int k = 0; k < S * S; ++k) mix[k] = expf(m[k]);
+        }
+        float* out = coef + (size_t) c * (2 * S + S * S);
+        for (int k = 0; k < 2 * S + S * S; ++k) out[k] = cf[k];
+    }
+    __syncthreads();
+    float* br = branch + (size_t) c * E;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        float v = 0.f;
+        for (int j = 0; j < S; ++j) v += cf[j] * r[(size_t) j * E + e];
+        br[e] = v * pre_scale;
+    }
+}
+
+__global__ void mhc_write_kernel(float* __restrict__ R, const float* __restrict__ coef, const float* __restrict__ y,
+                                 int S, int E) {
+    const int c = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    const float* cf = coef + (size_t) c * (2 * S + S * S);
+    float* r = R + (size_t) c * S * E;
+    float in[kMhcMaxS];
+    for (int j = 0; j < S; ++j) in[j] = r[(size_t) j * E + e];
+    const float yv = y[(size_t) c * E + e];
+    for (int i = 0; i < S; ++i) {
+        float v = cf[S + i] * yv;
+        for (int j = 0; j < S; ++j) v += cf[2 * S + i * S + j] * in[j];
+        r[(size_t) i * E + e] = v;
+    }
+}
+
+__global__ void mhc_enter_kernel(const float* __restrict__ x, float* __restrict__ R, int S, int E) {
+    const int c = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    const float v = x[(size_t) c * E + e];
+    for (int j = 0; j < S; ++j) R[((size_t) c * S + j) * E + e] = v;
+}
+
+__global__ void mhc_leave_kernel(const float* __restrict__ R, float* __restrict__ x, int S, int E) {
+    const int c = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    float v = 0.f;
+    for (int j = 0; j < S; ++j) v += R[((size_t) c * S + j) * E + e];
+    x[(size_t) c * E + e] = v / (float) S;
+}
+}  // namespace
+
+void dense_mhc_read(const float* R, const float* W, const float* b, int S, int E, int iters, bool fixed_identity,
+                    float pre_scale, float* branch, float* coef, int n, void* stream) {
+    if (S < 1 || S > kMhcMaxS) throw std::runtime_error("dense_mhc_read: streams must be 1..4");
+    const int rows = 2 * S + (fixed_identity ? 0 : S * S);
+    mhc_read_kernel<<<n, kMhcThreads, 0, (cudaStream_t) stream>>>(R, W, b, S, E, rows, iters, fixed_identity,
+                                                                   pre_scale, branch, coef);
+    check("dense_mhc_read");
+}
+void dense_mhc_write(float* R, const float* coef, const float* y, int S, int E, int n, void* stream) {
+    mhc_write_kernel<<<dim3((E + 255) / 256, n), 256, 0, (cudaStream_t) stream>>>(R, coef, y, S, E);
+    check("dense_mhc_write");
+}
+void dense_mhc_enter(const float* x, float* R, int S, int E, int n, void* stream) {
+    mhc_enter_kernel<<<dim3((E + 255) / 256, n), 256, 0, (cudaStream_t) stream>>>(x, R, S, E);
+    check("dense_mhc_enter");
+}
+void dense_mhc_leave(const float* R, float* x, int S, int E, int n, void* stream) {
+    mhc_leave_kernel<<<dim3((E + 255) / 256, n), 256, 0, (cudaStream_t) stream>>>(R, x, S, E);
+    check("dense_mhc_leave");
 }
 
 }  // namespace strata::kernels

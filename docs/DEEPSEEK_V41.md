@@ -133,6 +133,32 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
   exact and every expert stays reachable. Cost on 4096-token perplexity: code 2.38 -> 2.87, agentic text 15.11 -> 6.39
   (better: the GSQ quant gave its cheapest formats to rarely-used experts). `--route-bias 0 --route-bias-file 0` =
   exact routing at ~3.5 tok/s.
+- **One direction out of every residual write** (opt-in, local rb26): `--ablate FILE` (2 x 5120 float32: r, then v)
+  maps x -> x - r (v.x) / (v.r) on the text token embeddings, the Engram value, the attention output and the FFN output
+  (shared + routed) - what an abliteration does to those weights, applied on top of any quant. Orca's
+  DeepSeek-V4.1-Flash-1017-abliterated is exactly this map with one pair for all 40 layers (v = the direction it zeroes,
+  r = the direction it changes along, 14 degrees apart; readers, router, HC, head and the Engram tables are untouched);
+  its mmproj changes only the four tensors that write the LM's space (x - v (v.x)), so image rows come from the encoder
+  as they are. On GSQ IQ2_XS: the same decode speed, normal answers stay normal, the canned refusals go. Without the
+  flag no graph node or input byte changes.
+  `--ablate-scale S` and `--ablate-sites LIST` (local rb32; LIST = a comma list of embd, engram, attn, shexp, routed,
+  default all) make it x -> x - S r (v.x) / (v.r) on the listed writes only. A pair file with v = r and S = 2 is a
+  reflection: the r-part of each write changes sign and its norm stays. AtomicChat's DeepSeek-V4.1-Flash-1017 LoRA
+  (rank 1, alpha 1, used at `--lora-scaled 2.0`) is exactly that on the original weights: every lora_b is the same unit
+  r and lora_a = -(r^T W) on the attention output, the shared and routed experts' down and the Engram value, with no
+  embeddings, so `--ablate-scale 2 --ablate-sites engram,attn,shexp,routed` applies it to the weights the engine runs.
+  Their GSQ build re-quantizes only the dense writers and leaves the routed experts as ISTA shipped them (`engram,attn,shexp`).
+- **A pool boundary at the end of the system prompt** (opt-in, local rb27): `STRATA_SERVE_PREFIX_SAVE=1`. Subagents
+  send one system prompt + tools and each its own task, and a pool record resumes only at a saved boundary (a prompt's
+  end) or up to 16 tokens below one, so every new conversation re-read the shared system prompt. With the switch a
+  layer-major read that crosses the first user-turn token (`<｜User｜>` 128803 / `<｜latest_reminder｜>` 128828;
+  `STRATA_SERVE_PREFIX_TOKENS`) stops there, saves [0, p) to the pool and reads on; a later conversation resumes at p
+  and reads only its own part. Prefixes under `STRATA_SERVE_PREFIX_MIN` (1024) tokens are left alone; text prompts on
+  the solo path only (no batch slots, images or DSpark tail). GSQ IQ2_XS, RTX 5090 + 64 GB, route bias 0.5/0.3, a
+  6K-token system prompt: a second conversation's first prompt 7.2 -> 0.87 s; four conversations x two turns sent
+  together 83.2 -> 58.0 s; the first conversation pays its tail's own expert sweep (~1 s). A resumed prompt's last-row
+  logits equal a fresh read's bit for bit; against the unsplit read the tail's logits move by batch-shape noise (KL
+  0.014-0.019, the same top-1). Off: the 13 serve scenarios answer as rb26.
 - Where the time goes - prefill (8192 tokens, ~37 s): dense half ~11 s, experts ~26 s (the grouped expert kernels and
   ~10 GB/s of expert uploads). Decode (~38 ms/token): dense half ~19 ms (its Q8_0 weights read at ~880 GB/s - the
   card's bandwidth), expert tier ~16 ms.
@@ -177,6 +203,33 @@ The serve config's `gpu` becomes `--gpu`, which sets `CUDA_VISIBLE_DEVICES` itse
 launcher set (the engine warns when it does). With two cards, use the config's own numbering: `CUDA_VISIBLE_DEVICES=1`
 with `"gpu": [0]` still runs on physical GPU 0; set `"gpu": [1]` (#47).
 
+Pictures on a discrete card: start with `--reserve-mib 900`. The 600 MiB default leaves about 10 MiB of worst-case
+margin once 36 experts are resident, and the first picture's BLAS start plus the tower's buffers need more (taken from
+upstream Strata `c5ab5d400`; the engine default is unchanged).
+
+#### A bigger box: `--arena-gib` and `--kv-q8` (RTX 5090 32 GiB · Ryzen 7 9800X3D · 183 GiB DDR5, #114)
+
+Measured by cpacsm75 on the V4 XQ pack (163 GB) through `serve_ds41.py`, build `1dad2ad`, GPU power held at 450 W, one
+request per point, so these are single samples:
+
+| ctx / prompt | settings | VRAM experts | prompt tok/s | decode tok/s |
+| --- | --- | ---: | ---: | ---: |
+| 512K / 452,727 | `--arena-gib 110` | 1,494 | 968.3 | 42.0 |
+| 512K / 452,727 | `--arena-gib 130` | 1,494 | 1,056.4 | 42.0 |
+| 512K / 452,727 | `--arena-gib 130 --kv-q8` | 1,561 | **1,497.6** | **45.9** |
+| 256K / 232,201 | `--arena-gib 130` | 1,566 | 1,276.9 | 44.9 |
+| 256K / 232,201 | `--arena-gib 130 --kv-q8` | 1,596 | **1,572.4** | **46.2** |
+
+- With RAM to spare, raise the arena until the file tier is nearly empty. On that box 130 GiB left 1,609 experts on
+  NVMe (10,054 at the default 60) and left ~42 GiB free for page cache. Decode did not move, since it is bound by RAM
+  bandwidth.
+- `--kv-q8` speeds up the dense/attention phase of a long prompt (512K: 295 s down to 169 s). The expert phase is
+  unchanged and the VRAM expert seed barely moves, so the gain comes from reading less KV, not from fitting more
+  experts. The gain grows with context: +23% prompt at 256K, +42% at 512K.
+- Measured and not adopted: `--prompt-batch 4096`. It freed VRAM, but the expert seed is decided at load, so the prompt
+  only got slower.
+- Not measured there: `--kv-fp4` against BF16/Q8 at matched long context, and any quality check of these settings.
+
 ### Unsloth's UD-Q2_K_XL (UD 3.1)
 
 [Unsloth's DeepSeek-V4.1-Flash-1017 GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) are in
@@ -213,6 +266,19 @@ after a 512-token prompt, no DSpark, one run each:
 UD-Q2_K_XL is closer to the model on this text and slower, as its 39 GiB more expert bytes mean fewer experts in VRAM
 and RAM. One text and one run each, not a benchmark; Unsloth's own KLD for UD-Q2_K_XL is on their
 [model page](https://unsloth.ai/docs/models/deepseek-v4.1-flash).
+
+### Fast mode (opt-in, lossy, 7 Nov)
+
+For the 1017 V4 build: a sidecar file with a 2-bit (Q2_K) copy of every MXFP4 and Q3_K expert, about half the bytes
+that cross the RAM bus and the NVMe drive per token. The engine reads that copy instead; the model file is not
+changed. RTX 4090, 8K prompt: decode **26.1 -> 33.0 tok/s (+27 %)**, short34 top-1 87.01 -> 86.16 %, NLL 0.512 -> 0.540.
+
+```bash
+build-xolotl/ds41_generate -m V41-XQ-1017-v4.gguf --build-shadow /nvme/V4.fast.x41s   # once: ~30 min CPU, ~40 GB
+XOLOTL_SHADOW=$(cat /nvme/V4.fast.x41s.list)  <your usual serve command>             # unset it to turn it off
+```
+
+Build, switches, the importance matrix and what else was tried: [docs/XOLOTL_FAST.md](XOLOTL_FAST.md).
 
 ### Serving it (OpenAI + Anthropic API, tool calls)
 

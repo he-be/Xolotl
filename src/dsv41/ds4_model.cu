@@ -2495,6 +2495,55 @@ struct Model::Impl {
             head_dev = L[(size_t) g.nl - 1].dev;
             d_dev = g.n_mtp > 0 ? L[(size_t) g.nl].dev : 0;
         }
+        // the dense weights (attention, the shared experts, the head) always live in VRAM - only the routed experts
+        // can go to RAM, the CPU lane or the disk - so a GPU whose free memory cannot hold its layers' dense weights
+        // cannot run them: said here, before anything loads, instead of a cudaMalloc failure part way in (Maya-XS on
+        // an 8 GB card: 8.46 GB of dense weights).  A device with layers of a tensor parallel group holds a part of
+        // them, so only the devices whose layers are whole are checked.
+        for (size_t di = 0; di < devs.size(); ++di) {
+            double need = di == (size_t) head_dev ? (double) head_b : 0.0;
+            int first = -1, last = -1;
+            bool whole = true;
+            for (const Layer& l : L) {
+                if (l.dev != (int) di) continue;
+                whole = whole && groups[(size_t) l.grp].mem.size() == 1;
+                need += (double) l.dense_bytes;
+                if (!l.mtp) {
+                    if (first < 0) first = l.il;
+                    last = l.il;
+                }
+            }
+            const Dev& d = devs[di];
+            const double room = (double) d.free0 - (double) ((size_t) o.reserve_mib << 20);
+            if (!whole || need <= 0 || need <= room) continue;
+            // (past the free memory itself the cudaMalloc of these weights cannot succeed: said here, before anything loads.
+            //  Between the free memory minus the reserve and the free memory they fit but leave less than --reserve-mib for the
+            //  caches and scratch: a warning, the load goes on)
+            const bool cannot = need > (double) d.free0;
+            char msg[1024];
+            std::snprintf(msg, sizeof msg,
+                          "CUDA%d has %.2f GB free of %.2f GB, but the dense weights of %s%s need %.2f GB on it "
+                          "(attention, shared experts%s): they always stay in VRAM - the CPU lane and --vram-experts "
+                          "move only the routed experts. To run it: %s, or more GPUs (the layers are split across "
+                          "them), or close other programs using this GPU",
+                          d.id, (double) d.free0 / 1e9, (double) d.total / 1e9,
+                          first < 0 ? "the drafter"
+                                    : ("layers " + std::to_string(first) + "-" + std::to_string(last)).c_str(),
+                          di == (size_t) head_dev ? " and the head" : "", need / 1e9,
+                          di == (size_t) head_dev ? ", the output head" : "",
+                          (devs.size() == 1 ? "a GPU with about " +
+                                                  std::to_string((int) std::ceil((need + 2.5e9) / 1e9)) +
+                                                  " GB of VRAM or more"
+                                            : std::string("GPUs with more free VRAM"))
+                              .c_str());
+            if (cannot) {
+                err = msg;
+                return false;
+            }
+            std::fprintf(stderr, "ds4: WARNING: CUDA%d has %.2f GB free and the dense weights of its layers need %.2f GB: they "
+                                 "fit, but leave less than the %lld MiB reserve for the caches and scratch (--reserve-mib); the "
+                                 "load goes on\n", d.id, (double) d.free0 / 1e9, need / 1e9, (long long) o.reserve_mib);
+        }
         // the groups' members: copies of each layer's device state, a member's part of an expert
         for (Layer& l : L) {
             l.ff0 = 0;
@@ -10334,6 +10383,12 @@ struct Model::Impl {
                 const int e = h_idx[t * kPicks + i];
                 if (e < 0 || e >= l.n_exp) {
                     err = "router picked expert " + std::to_string(e) + " (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + ", of " + std::to_string(l.k_exp) + ")";
+                    return false;
+                }
+                // (a non-finite gate input: route_kernel then gave a valid pick but a NaN weight - the layer's output would be
+                //  garbage; said here, where the picks are on the host anyway, instead of a request that answers nonsense)
+                if (!std::isfinite(h_w[t * kPicks + i])) {
+                    err = "the router's weight is not finite (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + "): the gate's input went NaN or infinite";
                     return false;
                 }
                 ++pr[e];

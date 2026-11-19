@@ -3,18 +3,22 @@
 
 #include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/dense_arch.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/gr.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #ifdef STRATA_DENSE_MMQ
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -27,12 +31,155 @@
 #include <cstring>
 #include <exception>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <utility>
 
 namespace strata::core {
 namespace {
+
+// ---- KV spill (--kv-resident N): a K or V cache is ONE virtual range whose pages are VRAM for the first N cells of
+// every KV head and pinned host RAM (mapped for the GPU, read over PCIe) for the rest.  Every kernel sees the same
+// flat [kv_head][cell][bytes] array as before, so nothing that reads or writes the cache changes; a context that
+// stays under N cells never touches host RAM.  The driver entry points are resolved at run time (as core/vmm.cpp does).
+struct SpillApi {
+    bool ok = false;
+    int dev = -1;
+    CUmemLocation host{};
+    size_t gran = 0;
+    decltype(&cuMemAddressReserve) reserve = nullptr;
+    decltype(&cuMemAddressFree) free_va = nullptr;
+    decltype(&cuMemCreate) create = nullptr;
+    decltype(&cuMemRelease) release = nullptr;
+    decltype(&cuMemMap) map = nullptr;
+    decltype(&cuMemUnmap) unmap = nullptr;
+    decltype(&cuMemSetAccess) access = nullptr;
+    std::string why;
+};
+template <class F> bool spill_resolve(const char* name, F& f) {
+    cudaDriverEntryPointQueryResult q{};
+    void* p = nullptr;
+#if CUDART_VERSION >= 12050
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
+#else
+    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
+#endif
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) { (void) cudaGetLastError(); return false; }
+    f = (F) p;
+    return true;
+}
+const SpillApi& spill_api() {
+    static SpillApi& a = *new SpillApi;   // never destroyed: the model frees its ranges in its destructor
+    static std::once_flag once;
+    std::call_once(once, [] {
+        decltype(&cuDeviceGetAttribute) attr = nullptr;
+        decltype(&cuMemGetAllocationGranularity) granularity = nullptr;
+        if (cudaGetDevice(&a.dev) != cudaSuccess) { a.why = "no CUDA device"; return; }
+        if (!spill_resolve("cuDeviceGetAttribute", attr) || !spill_resolve("cuMemGetAllocationGranularity", granularity) ||
+            !spill_resolve("cuMemAddressReserve", a.reserve) || !spill_resolve("cuMemAddressFree", a.free_va) ||
+            !spill_resolve("cuMemCreate", a.create) || !spill_resolve("cuMemRelease", a.release) ||
+            !spill_resolve("cuMemMap", a.map) || !spill_resolve("cuMemUnmap", a.unmap) || !spill_resolve("cuMemSetAccess", a.access)) {
+            a.why = "the driver lacks the virtual memory API";
+            return;
+        }
+        int vmm = 0, host_vmm = 0, numa = -1;
+        attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+        attr(&host_vmm, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+        attr(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, (CUdevice) a.dev);
+        if (!vmm || !host_vmm) { a.why = "this GPU/driver cannot map host memory through the virtual memory API"; return; }
+        a.host.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        a.host.id = numa >= 0 ? numa : 0;
+        CUmemAllocationProp pd{}, ph{};
+        pd.type = ph.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        pd.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        pd.location.id = a.dev;
+        ph.location = a.host;
+        size_t gd = 0, gh = 0;
+        if (granularity(&gd, &pd, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS ||
+            granularity(&gh, &ph, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || !gd || !gh) {
+            a.why = "no allocation granularity for host/device pages";
+            return;
+        }
+        a.gran = std::max(gd, gh);
+        a.ok = true;
+    });
+    return a;
+}
+
+struct SpillBuf {
+    CUdeviceptr va = 0;
+    size_t size = 0;
+    struct Run { size_t off, len; CUmemGenericAllocationHandle h; };
+    std::vector<Run> runs;
+    uint64_t dev_bytes = 0, host_bytes = 0;
+};
+
+void spill_free(SpillBuf& b) {
+    const SpillApi& a = spill_api();
+    if (!a.ok) return;
+    for (auto& r : b.runs) {
+        a.unmap(b.va + r.off, r.len);
+        a.release(r.h);
+    }
+    b.runs.clear();
+    if (b.va) a.free_va(b.va, b.size);
+    b.va = 0;
+    b.size = 0;
+}
+
+// a [heads][cells][cb] cache: the pages that hold any of cells [0, hot) of any head are VRAM, the others host RAM
+bool spill_alloc(SpillBuf& b, int heads, int64_t cells, uint64_t cb, int64_t hot, std::string& err) {
+    const SpillApi& a = spill_api();
+    if (!a.ok) { err = "dense model: --kv-resident: " + a.why; return false; }
+    const uint64_t g = a.gran, region = (uint64_t) cells * cb, total = (uint64_t) heads * region;
+    b.size = (size_t) ((total + g - 1) / g * g);
+    if (a.reserve(&b.va, b.size, g, 0, 0) != CUDA_SUCCESS) { err = "dense model: --kv-resident: cannot reserve the address range"; b.va = 0; return false; }
+    const uint64_t pages = b.size / g;
+    auto hot_page = [&](uint64_t i) {
+        const uint64_t lo = i * g, hi = lo + g;
+        for (int h = 0; h < heads; ++h) {
+            const uint64_t s = (uint64_t) h * region, e = s + (uint64_t) hot * cb;
+            if (lo < e && s < hi) return true;
+        }
+        return false;
+    };
+    for (uint64_t i = 0; i < pages;) {
+        const bool dev = hot_page(i);
+        uint64_t j = i + 1;
+        while (j < pages && hot_page(j) == dev) ++j;
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        if (dev) { prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = a.dev; }
+        else prop.location = a.host;
+        SpillBuf::Run r{(size_t) (i * g), (size_t) ((j - i) * g), 0};
+        if (a.create(&r.h, r.len, &prop, 0) != CUDA_SUCCESS) {
+            err = std::string("dense model: --kv-resident: cannot allocate ") + std::to_string(r.len >> 20) + " MiB of " +
+                  (dev ? "VRAM" : "pinned host RAM") + " for the KV cache";
+            spill_free(b);
+            return false;
+        }
+        if (a.map(b.va + r.off, r.len, 0, r.h, 0) != CUDA_SUCCESS) {
+            a.release(r.h);
+            err = "dense model: --kv-resident: cannot map the KV pages";
+            spill_free(b);
+            return false;
+        }
+        b.runs.push_back(r);
+        (dev ? b.dev_bytes : b.host_bytes) += r.len;
+        i = j;
+    }
+    CUmemAccessDesc ad{};
+    ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    ad.location.id = a.dev;
+    ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (a.access(b.va, b.size, &ad, 1) != CUDA_SUCCESS) {
+        err = "dense model: --kv-resident: the GPU cannot be given access to the KV pages";
+        spill_free(b);
+        return false;
+    }
+    return true;
+}
 
 using namespace strata::kernels;
 
@@ -53,6 +200,13 @@ struct Layer {
     float* attn_norm = nullptr;
     float* post_norm = nullptr;
     QMat ffn_gate, ffn_up, ffn_down;
+    // Hyper-connections (the gated residual): the two mixers' weights, in the engine form gr_read takes.  The
+    // matrices are BF16 (uint16_t) and the norms F32, exactly as the MoE path pins them in layout.cpp.
+    uint16_t *hc_attn_down = nullptr, *hc_attn_up = nullptr, *hc_attn_inject = nullptr;
+    uint16_t *hc_ffn_down = nullptr, *hc_ffn_up = nullptr, *hc_ffn_inject = nullptr;
+    float *hc_attn_norm = nullptr, *hc_ffn_norm = nullptr;
+    // xolotl mHC routers (SenseNova-Loop), F32: [rows][S*n_embd] and [rows]; null on a layer outside the mHC block
+    float *mhc_attn_w = nullptr, *mhc_attn_b = nullptr, *mhc_ffn_w = nullptr, *mhc_ffn_b = nullptr;
     // GDN mixer
     QMat qkv, z, ssm_out;
     float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *ssm_norm = nullptr;
@@ -184,7 +338,7 @@ void trace_logits(int64_t pos, const float* dev, int n, void* stream) {
 // printed to stderr every 8 passes.  The pass is synchronized at its end, so this slows decoding slightly: it is a
 // measuring mode, not a way to run.
 struct Prof {
-    enum { GEMV_Q4K, GEMV_Q6K, GEMV_Q80, GEMV_OTHER, QUANT, GDN_LOOP, ATTN_LOOP, NB };
+    enum { GEMV_Q4K, GEMV_Q6K, GEMV_Q80, GEMV_OTHER, QUANT, GDN_LOOP, ATTN_LOOP, MHC, NB };
     bool enabled = false, on = false;
     std::vector<cudaEvent_t> ev;
     size_t used = 0;
@@ -220,10 +374,10 @@ struct Prof {
             for (int i = 0; i < NB; ++i) known += ms[i];
             const double P = (double) passes;
             std::fprintf(stderr,
-                         "strata-dense prof: %.1f cols/pass, GPU %.1f ms/pass = gemv Q4_K %.1f + Q6_K %.1f + Q8_0 %.1f + other %.1f"
-                         " | quantize %.1f | gdn token loop %.1f | attn token loop %.1f | rest %.1f ; host enqueue %.1f ms/pass\n",
+                         "xolotl-dense prof: %.1f cols/pass, GPU %.1f ms/pass = gemv Q4_K %.1f + Q6_K %.1f + Q8_0 %.1f + other %.1f"
+                         " | quantize %.1f | gdn token loop %.1f | attn token loop %.1f | mhc %.1f | rest %.1f ; host enqueue %.1f ms/pass\n",
                          (double) cols / P, total_ms / P, ms[GEMV_Q4K] / P, ms[GEMV_Q6K] / P, ms[GEMV_Q80] / P, ms[GEMV_OTHER] / P,
-                         ms[QUANT] / P, ms[GDN_LOOP] / P, ms[ATTN_LOOP] / P, (total_ms - known) / P, host_ms / P);
+                         ms[QUANT] / P, ms[GDN_LOOP] / P, ms[ATTN_LOOP] / P, ms[MHC] / P, (total_ms - known) / P, host_ms / P);
             for (double& m : ms) m = 0;
             total_ms = host_ms = 0; passes = cols = 0;
         }
@@ -248,8 +402,15 @@ struct DenseModel::Impl {
     std::map<std::string, Found> index;
     std::vector<Layer> layers;
     Mtp mtp;
+    // xolotl: an external drafter's inputs (DenseOptions::taps): tap_slot[l] = this layer's place in a tap row, -1 none
+    std::vector<int> tap_slot;
+    int n_taps = 0;
+    float* taps_run = nullptr;                      // [NC][n_taps * n_embd]: the last run()'s columns
+    float* taps_ring = nullptr;                     // [kTapRing][n_taps * n_embd]: prefill rows at position % kTapRing
     std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
     std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
+    std::vector<SpillBuf> spill;                    // --kv-resident: K/V caches split between VRAM and host RAM
+    int64_t kv_hot = 0;                             // cells per KV head kept in VRAM (max_context: all of them)
     uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
     uint64_t dev_used = 0, host_bytes = 0;
     int host_tensors = 0;
@@ -270,10 +431,34 @@ struct DenseModel::Impl {
     };
     EmbdSrc embd, embd_mtp;
     float* embd_stage = nullptr;                    // pinned, NC * n_embd floats
+    const float* const* img_rows = nullptr;         // set_embd_rows(): per-cell image rows (nullptr = the table)
+    int64_t img_n = 0;
 
     float* output_norm = nullptr;
     QMat head;
+    // ---- hyper-connections (hc > 0): the residual STACK and its mixers.  Absent (null) on a plain dense file.
+    uint16_t *out_hc_down = nullptr, *out_hc_up = nullptr;
+    float* out_hc_norm = nullptr;
+    float* R = nullptr;                 ///< [NC][hc * n_embd]  the residual stack, hc streams per column
+    float* hc_xn = nullptr;             ///< [NC][hc * n_embd]  gr_read's activated streams (its workspace, mine here)
+    float* hc_gated = nullptr;          ///< [NC][hc * n_embd]  the gated stream product, before the mean
+    float* hc_lo = nullptr;             ///< [NC][hc_lr]        the bottleneck
+    float* hc_inject = nullptr;         ///< [NC][hc]           one injection per stream, per column
+    // ---- xolotl mHC: the stream stack, the router's branch and its coefficients (NC columns each)
+    float* mhc_R = nullptr;             ///< [NC][S][n_embd]
+    float* mhc_br = nullptr;            ///< [NC][n_embd]        the branch the layer's mixer / FFN reads (pre-norm)
+    float* mhc_cf = nullptr;            ///< [NC][2S + S*S]      pre, post, mix
+    strata::kernels::GrShapes gr_shape;
+    strata::kernels::GrWorkspace gr_ws;  ///< the single-token gr_read path's scratch (carved from gr_ws_mem)
+    void* gr_ws_mem = nullptr;
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
+    // xolotl: the interleaved copy of q8_1 (native_q8_1_interleave) for native_mmvq_il at 2..8 columns - one 16-byte
+    // load reads a position of every column, where native_mmvq's exact kernels issue one 4-byte load per column (LSU-
+    // bound at 8: ncu 78 % LSU, DRAM 72 %).  Written once per quantize(), on the first GEMV that takes it; bitwise
+    // native_mmvq's output.  STRATA_MMVQ_IL=0 keeps native_mmvq.
+    void* q8_il = nullptr;
+    bool il_ready = false;
+    int il_n_in = 0;
     int64_t max_context = 0;
 
     // ---- the batched prompt path (prefill_setup() / prefill()); see the block definitions below.
@@ -287,6 +472,7 @@ struct DenseModel::Impl {
         float *q_full = nullptr, *qcur = nullptr, *kcur = nullptr, *vcur = nullptr;
         float *attn = nullptr, *attn32 = nullptr;
         float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr;
+        float *mhc_R = nullptr, *mhc_br = nullptr, *mhc_cf = nullptr;   // mHC files only: [T][S][E], [T][E], [T][2S+S*S]
         float* stage = nullptr;                 // pinned embedding stage, T rows
         int32_t* pos_dev = nullptr;             // the position of every row, for RoPE
         void* xq = nullptr;                     // the q8_1 activations MMQ multiplies with
@@ -327,6 +513,14 @@ struct DenseModel::Impl {
     float* mtp_h = nullptr;                         // the MTP block's own output hidden (chains the next draft step)
     int* d_tok = nullptr;
     float* d_prob = nullptr;
+    QMat draft_head;                                // the MTP drafts' shortlist head (DenseOptions::draft_vocab), or empty
+    std::vector<int32_t> draft_ids;                 // draft_head row -> token id
+    int draft_base = 0, draft_cap = 0;              // shortlist rows, and the free rows after them for the prompt's tokens
+    std::vector<uint8_t> draft_in;                  // per token id: 1 = in the shortlist
+    const uint8_t* draft_src = nullptr;             // the head's rows in the file
+    uint64_t draft_row = 0;                         // bytes per head row
+    std::vector<int32_t> draft_extra;               // the prompt tokens currently appended
+    std::vector<uint8_t> draft_stage;
 
     // ---- helpers
     template <class T> bool alloc(T** out, uint64_t bytes, std::string& err, const char* what) {
@@ -370,6 +564,38 @@ struct DenseModel::Impl {
         }
         if (!alloc(out, n * 4, err, name.c_str())) return false;
         const cudaError_t s = cudaMemcpy(*out, host.data(), n * 4, cudaMemcpyHostToDevice);
+        if (s != cudaSuccess) { err = "dense model: upload " + name + ": " + cudaGetErrorString(s); return false; }
+        return true;
+    }
+
+    // A matrix uploaded in the engine's BF16 form, which is what `gr_read`'s projections take (the MoE path pins the
+    // same form: layout.cpp calls these Bf16InF32).  A BF16 source round-trips exactly; an F32 source is rounded
+    // once here, on the host, so the kernel sees exactly what the reference does.
+    bool upload_bf16(const Found* f, const std::string& name, uint64_t expect, uint16_t** out, std::string& err) {
+        if (!f) { err = "dense model: missing tensor " + name; return false; }
+        uint64_t n = 1;
+        for (uint64_t d : f->tensor->shape) n *= d;
+        if (expect && n != expect) {
+            err = "dense model: " + name + " has " + std::to_string(n) + " values, expected " + std::to_string(expect);
+            return false;
+        }
+        if (n > (uint64_t) INT_MAX) { err = "dense model: " + name + " is too large to convert on the host"; return false; }
+        const uint8_t* src = f->file->tensor_data(*f->tensor);
+        std::vector<float> host(n);
+        if (!dequant_row(f->tensor->type, src, (int) n, host.data())) {
+            err = "dense model: " + name + " is " + upper_type(f->tensor->type) + ", which cannot be read as floats";
+            return false;
+        }
+        std::vector<uint16_t> bf(n);
+        for (uint64_t i = 0; i < n; ++i) {
+            uint32_t x;
+            std::memcpy(&x, &host[i], 4);
+            if ((x & 0x7fffffffu) > 0x7f800000u) { bf[i] = (uint16_t) ((x >> 16) | 0x40); continue; }   // NaN stays NaN
+            x += 0x7fffu + ((x >> 16) & 1u);                                                             // round to nearest even
+            bf[i] = (uint16_t) (x >> 16);
+        }
+        if (!alloc(out, n * 2, err, name.c_str())) return false;
+        const cudaError_t s = cudaMemcpy(*out, bf.data(), n * 2, cudaMemcpyHostToDevice);
         if (s != cudaSuccess) { err = "dense model: upload " + name + ": " + cudaGetErrorString(s); return false; }
         return true;
     }
@@ -453,12 +679,17 @@ struct DenseModel::Impl {
     }
 
     // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
+    // cell0 >= 0: the rows are cells cell0.., and a cell with an image row (set_embd_rows) takes that row instead
     bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst,
-                           std::string& err, float* stage = nullptr) {
+                           std::string& err, float* stage = nullptr, int64_t cell0 = -1) {
         float* st = stage ? stage : embd_stage;
         if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
         for (int j = 0; j < n; ++j) {
             if (toks[j] < 0 || toks[j] >= n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+            if (cell0 >= 0 && img_rows != nullptr && cell0 + j < img_n && img_rows[cell0 + j] != nullptr) {
+                std::memcpy(st + (size_t) j * E, img_rows[cell0 + j], (size_t) E * sizeof(float));
+                continue;
+            }
             const uint8_t* row = src.f.file->tensor_data(*src.f.tensor) + (size_t) toks[j] * src.row_bytes;
             if (!dequant_row(src.type, row, E, st + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
         }
@@ -468,13 +699,42 @@ struct DenseModel::Impl {
     }
 
     // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.
+    static bool mmvq_il_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }();
+        return on;
+    }
+    // xolotl: STRATA_DENSE_ACT_F32=1 - Q8_0 projections read the FP32 activation quantize() was given instead of its
+    // q8_1 copy (dense_gemv_q80_f32).  Opt-in quality path for activation-sensitive files (SenseNova-Loop); other
+    // weight types keep MMVQ.  The MMQ prefill is switched off with it (prefill_setup), so the prompt is exact too.
+    static bool act_f32_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_DENSE_ACT_F32"); return v != nullptr && v[0] == '1'; }();
+        return on;
+    }
+    const float* act_src = nullptr;   ///< the FP32 rows the last quantize() read (valid until they are overwritten)
+    int act_n_in = 0;
     void gemv(const QMat& w, float* y, int n, void* s) {
         PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
+        if (w.type == 8 && act_src != nullptr && w.n_in == act_n_in && act_f32_on()) {
+            dense_gemv_q80_f32(w.dev, act_src, y, w.n_in, w.n_out, n, s);
+            return;
+        }
+        if (n >= 2 && q8_il != nullptr && w.n_in == il_n_in && mmvq_il_on() && native_mmvq_il_supported(w.type, n, w.n_out)) {
+            if (!il_ready) {
+                native_q8_1_interleave(q8_1, q8_il, w.n_in, n, s);
+                il_ready = true;
+            }
+            native_mmvq_il(w.type, w.dev, q8_1, q8_il, y, w.n_in, w.n_out, n, s);
+            return;
+        }
         native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, n, s);
     }
     void quantize(const float* x, int n_in, int n, void* s) {
         PScope ps(&prof, Prof::QUANT, s);
         native_quantize_q8_1(x, q8_1, n_in, n, s);
+        il_ready = false;
+        il_n_in = n_in;
+        act_src = x;
+        act_n_in = n_in;
     }
 
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
@@ -482,7 +742,12 @@ struct DenseModel::Impl {
     void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n, void* s);
+    void ffn_matmul(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, int n, void* s);
+    // One hyper-connection read: the residual stack in, the mixer's input written into `xn` and the per-stream
+    // injection into `hc_inject`.  Absent on a plain dense file.
+    void hc_read(const Layer& L, bool attn_mixer, float eps, int n, void* s);
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
+    bool mtp_kv_only = true;                      // an ingest writes the block's K/V rows only (STRATA_DENSE_MTP_KV_ONLY=0: the whole block)
 
 #ifdef STRATA_DENSE_MMQ
     // ---- the same blocks over a chunk of T tokens, reading and writing Pf instead of the NC-column buffers.
@@ -493,6 +758,7 @@ struct DenseModel::Impl {
                        const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int64_t T, int pos0, void* s);
     void pf_ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
                       int64_t T, void* s);
+    void pf_ffn_matmul(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, int64_t T, void* s);
 #endif
 };
 
@@ -559,14 +825,24 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     dense_positions_i32(pos_dev, n * HK, HK, pos0, s);
     native_rope_apply(kcur, kcur, n * HK, D, c.n_rot, rope, pos_dev, s);
     dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
-    for (int j = 0; j < n; ++j) {
-        dense_attn_decode_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch,
-                              H, HK, D, pos0 + j + 1, (int) max_context, scale, s);
-    }
+    // xolotl: every column in one launch (the cache is read once per window, not once per column); a column gets the
+    // same bits alone as inside a window, so single steps and verified columns agree
+    dense_attn_decode_multi_fmt(qcur, kc, vc, kfmt, vfmt, attn, attn_scratch, H, HK, D, pos0 + 1, n, (int) max_context, scale, s);
     dense_gate_apply(attn, q_full, attn32, n * H, H, D, s);
     }
     quantize(attn32, H * D, n, s);
     gemv(wo, mix, n, s);
+}
+
+// The FFN itself over n columns: `xn` holds the mixer's input, `mix` receives the output.  No residual add - the
+// caller owns the residual (add_inplace on a plain model, gr_write on a hyper-connection one).
+void DenseModel::Impl::ffn_matmul(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, int n, void* s) {
+    quantize(xn, c.n_embd, n, s);
+    gemv(g, ffn_g, n, s);
+    gemv(u, ffn_u, n, s);
+    dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
+    quantize(ffn_h, c.n_ff, n, s);
+    gemv(d, mix, n, s);
 }
 
 // x += ffn(rms_norm(x, post_norm)), for n columns
@@ -574,13 +850,19 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
                                  int n, void* s) {
     const int E = c.n_embd;
     dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
-    quantize(xn, E, n, s);
-    gemv(g, ffn_g, n, s);
-    gemv(u, ffn_u, n, s);
-    dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
-    quantize(ffn_h, c.n_ff, n, s);
-    gemv(d, mix, n, s);
+    ffn_matmul(c, g, u, d, n, s);
     add_inplace(x, mix, (int64_t) n * E, s);
+}
+
+// One hyper-connection read: the residual stack (R) -> the mixer's input (xn) and the per-stream injection.
+// The same kernels the MoE path runs (kernels/gr.hpp, `build_hc_mix`), so a dense and a MoE file of this family
+// mix their streams identically.
+void DenseModel::Impl::hc_read(const Layer& L, bool attn_mixer, float eps, int n, void* s) {
+    strata::kernels::gr_read_multi(R, attn_mixer ? L.hc_attn_norm : L.hc_ffn_norm,
+                                   attn_mixer ? L.hc_attn_down : L.hc_ffn_down,
+                                   attn_mixer ? L.hc_attn_up : L.hc_ffn_up,
+                                   attn_mixer ? L.hc_attn_inject : L.hc_ffn_inject,
+                                   eps, gr_shape, gr_ws, hc_xn, hc_lo, hc_gated, xn, hc_inject, n, s);
 }
 
 #ifdef STRATA_DENSE_MMQ
@@ -681,6 +963,14 @@ void DenseModel::Impl::pf_ffn_block(const DenseConfig& c, const QMat& g, const Q
                                     const float* post_norm, int64_t T, void* s) {
     const int E = c.n_embd;
     dense_rms_norm(pf->x, post_norm, pf->xn, (int) T, E, c.rms_eps, s);
+    pf_ffn_matmul(c, g, u, d, T, s);
+    add_inplace(pf->x, pf->mix, (int64_t) T * E, s);
+}
+
+// The FFN alone over the chunk: pf->xn in, pf->mix out, no norm and no residual (the mHC write owns the residual).
+void DenseModel::Impl::pf_ffn_matmul(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, int64_t T,
+                                     void* s) {
+    const int E = c.n_embd;
     pf_quantize(pf->xn, g.type, E, T, s);
     pf_gemv(g, pf->ffn_g, T, s);
     if (u.type != g.type) pf_quantize(pf->xn, u.type, E, T, s);
@@ -688,7 +978,6 @@ void DenseModel::Impl::pf_ffn_block(const DenseConfig& c, const QMat& g, const Q
     dense_swiglu(pf->ffn_g, pf->ffn_u, pf->ffn_h, (int64_t) T * c.n_ff, s);
     pf_quantize(pf->ffn_h, d.type, c.n_ff, T, s);
     pf_gemv(d, pf->mix, T, s);
-    add_inplace(pf->x, pf->mix, (int64_t) T * E, s);
 }
 #endif  // STRATA_DENSE_MMQ
 
@@ -700,6 +989,23 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
     quantize(cat, 2 * E, n, s);
     gemv(M.eh_proj, x, n, s);                       // x = the block's input and its attention residual
     dense_rms_norm(x, M.attn_norm, xn, n, E, c.rms_eps, s);
+    if (!want_logits && mtp_kv_only) {
+        // An ingest keeps nothing of the block but its K/V rows: the block is one layer, so a position's K and V come
+        // from this input alone, and the block's output is read only by a draft step (want_logits).  The rows below are
+        // attn_block()'s own launches in its order (same quantize, same projections, same norm, RoPE and append), so
+        // the cache gets the same bits; the q projection, the attention over the cache, the output projection and the
+        // whole FFN are not run.  Measured 2026-11-11 (RTX 4090, Swift-1.5 27B IQ3_S, k8v4, draft 3): prompt read-in
+        // +19 % at 2K and +29 % at 30K, greedy answers and draft cycles identical.  STRATA_DENSE_MTP_KV_ONLY=0 = the old path.
+        const int HK = c.n_head_kv, D = c.head_dim;
+        quantize(xn, E, n, s);
+        gemv(M.k, kcur, n, s);
+        gemv(M.v, vcur, n, s);
+        rms_norm_weighted(kcur, M.k_norm, n * HK, D, c.rms_eps, s);
+        dense_positions_i32(pos_dev, n * HK, HK, pos0, s);
+        native_rope_apply(kcur, kcur, n * HK, D, c.n_rot, rope, pos_dev, s);
+        dense_kv_append_rows_fmt(M.kc, M.vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
+        return true;
+    }
     attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, s);
     add_inplace(x, mix, (int64_t) n * E, s);
     ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, s);
@@ -707,7 +1013,7 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
         dense_rms_norm(x + (size_t) (n - 1) * E, M.head_norm, xn, 1, E, c.rms_eps, s);
         cudaMemcpyAsync(mtp_h, xn, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
         quantize(xn, E, 1, s);
-        gemv(M.head, mtp_logits, 1, s);
+        gemv(draft_head.dev ? draft_head : M.head, mtp_logits, 1, s);
     }
     return true;
 }
@@ -719,6 +1025,7 @@ DenseModel::~DenseModel() {
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
+    for (auto& b : impl_->spill) spill_free(b);
     for (auto& c : impl_->ckpt) if (c.host) cudaFreeHost(c.host);
 #ifdef STRATA_DENSE_MMQ
     if (impl_->pf && impl_->pf->stage) cudaFreeHost(impl_->pf->stage);
@@ -729,6 +1036,24 @@ DenseModel::~DenseModel() {
 }
 
 float* DenseModel::logits_col(int j) const { return impl_->logits + (size_t) j * cfg_.n_vocab; }
+int DenseModel::n_taps() const { return impl_->n_taps; }
+const float* DenseModel::run_taps() const { return impl_->taps_run; }
+const float* DenseModel::ring_taps() const { return impl_->taps_ring; }
+const void* DenseModel::head_weights() const { return impl_->head.dev; }
+int DenseModel::head_type() const { return impl_->head.type; }
+int64_t DenseModel::head_rows() const { return impl_->head.n_out; }
+void DenseModel::set_embd_rows(const float* const* rows, int64_t n) {
+    impl_->img_rows = rows;
+    impl_->img_n = rows != nullptr ? n : 0;
+}
+
+bool DenseModel::embed_host(int32_t token, float* out, std::string& err) const {
+    const Impl& I = *impl_;
+    if (token < 0 || token >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+    const uint8_t* row = I.embd.f.file->tensor_data(*I.embd.f.tensor) + (size_t) token * I.embd.row_bytes;
+    if (!dequant_row(I.embd.type, row, cfg_.n_embd, out)) { err = "dense model: embedding dequantization"; return false; }
+    return true;
+}
 void* DenseModel::stream() const { return impl_->stream; }
 
 bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err, const DenseOptions& opt) {
@@ -747,13 +1072,27 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (!arch) { err = "dense model: missing general.architecture"; return false; }
         cfg_.arch = arch->s;
         const std::string a = cfg_.arch + ".";
-        if (cfg_.arch.rfind("qwen3", 0) != 0) {
-            err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
+        if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {
+            err = "dense model: this GGUF is a MoE model; run it with `strata`, not `xolotl-dense`";
             return false;
         }
-        if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {
-            err = "dense model: this GGUF is a MoE model; run it with `strata`, not `strata-dense`";
-            return false;
+        {
+            // Qwen4-generation dense files carry the Flash-Next additions.  Hyper-connections are served (below);
+            // a QSA indexer and PLE are not, and an architecture this engine was never validated on is opt-in.
+            strata::core::DenseArchProbe probe;
+            const strata::MetaValue* hc = g0.get(a + "hyper_connection.count");
+            probe.hyper_connections = hc != nullptr && hc->is_num() && hc->num() > 0;
+            const strata::MetaValue* ix = g0.get(a + "attention.indexer.head_count");
+            probe.qsa_indexer = ix != nullptr && ix->is_num() && ix->num() > 0;
+            const strata::MetaValue* pl = g0.get(a + "ple.layers");
+            probe.ple = pl != nullptr && pl->type == strata::MetaType::ARRAY && pl->count > 0;
+            if (!probe.ple)
+                for (const auto& entry : I.index)
+                    if (entry.first.ends_with(".ple_key.weight")) { probe.ple = true; break; }
+            const char* experimental = std::getenv("STRATA_DENSE_EXPERIMENTAL_ARCH");
+            const std::string refusal = strata::core::dense_arch_refusal(
+                cfg_.arch, probe, experimental != nullptr && experimental[0] == '1');
+            if (!refusal.empty()) { err = refusal; return false; }
         }
         int64_t v = 0;
         auto need = [&](const char* key, int& dst) {
@@ -773,6 +1112,60 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         cfg_.n_nextn = meta_int(g0, a + "nextn_predict_layers", v) ? (int) v : 0;
         cfg_.n_layer = block_count - cfg_.n_nextn;
         if (cfg_.n_layer <= 0) { err = "dense model: no trunk layers"; return false; }
+        // Hyper-connections (the Qwen4 gated residual).  Absent keys mean the plain pre-norm residual.
+        cfg_.hc = meta_int(g0, a + "hyper_connection.count", v) && v > 0 ? (int) v : 0;
+        cfg_.hc_lr = meta_int(g0, a + "hyper_connection.low_rank", v) ? (int) v : 0;
+        if (!cfg_.has_hc()) cfg_.hc_lr = 0;
+        if (const std::string why = strata::core::dense_hc_refusal(cfg_.hc, cfg_.hc_lr, cfg_.n_embd, with_mtp);
+            !why.empty()) {
+            err = why;
+            return false;
+        }
+        // ---- xolotl: the layer schedule (a looped file's own, or --layer-schedule) and mHC
+        {
+            int64_t ls = 0, le = 0, lc = 0;
+            if (meta_int(g0, a + "loop.start", ls) && meta_int(g0, a + "loop.end", le) && meta_int(g0, a + "loop.count", lc)) {
+                std::string why;
+                cfg_.plan = strata::core::dense_loop_plan(cfg_.n_layer, (int) ls, (int) le, (int) lc, why);
+                if (!why.empty()) { err = why; return false; }
+            }
+            std::string sched = opt.layer_schedule;   // XOLOTL_LAYER_SCHEDULE: the same, for --check / --selftest runs
+            if (const char* e = std::getenv("XOLOTL_LAYER_SCHEDULE"); sched.empty() && e && *e) sched = e;
+            if (const std::string why = strata::core::dense_parse_schedule(sched, cfg_.n_layer, cfg_.plan);
+                !why.empty()) {
+                err = why;
+                return false;
+            }
+            if (meta_int(g0, a + "mhc.streams", v) && v > 0) {
+                int64_t ms = 0, me = 0;
+                if (!meta_int(g0, a + "mhc.start", ms) || !meta_int(g0, a + "mhc.end", me) || ms < 0 || me <= ms ||
+                    me > cfg_.n_layer || v > 4) {
+                    err = "dense model: mhc.streams is set but mhc.start / mhc.end are missing or out of range (or more than 4 streams)";
+                    return false;
+                }
+                cfg_.mhc_streams = (int) v;
+                cfg_.mhc_start = (int) ms;
+                cfg_.mhc_end = (int) me;
+                if (meta_int(g0, a + "mhc.iterations", v)) cfg_.mhc_iters = (int) v;
+                if (const auto* e = g0.get(a + "mhc.pre_scale")) cfg_.mhc_pre_scale = (float) e->num();
+                if (const auto* e = g0.get(a + "mhc.fixed_identity")) cfg_.mhc_fixed_identity = e->num() != 0;
+                if (cfg_.has_hc()) { err = "dense model: a file with both the gated residual and mHC is not a known model"; return false; }
+                if (with_mtp) { err = "dense model: mHC with the MTP block is not wired; start without --mtp"; return false; }
+                if (const std::string why = strata::core::dense_mhc_plan_refusal(cfg_.plan, cfg_.n_layer, cfg_.mhc_start, cfg_.mhc_end);
+                    !why.empty()) {
+                    err = why;
+                    return false;
+                }
+                std::fprintf(stderr, "xolotl-dense: mHC: %d streams on layers [%d, %d), Sinkhorn %d%s\n", cfg_.mhc_streams,
+                             cfg_.mhc_start, cfg_.mhc_end, cfg_.mhc_iters, cfg_.mhc_fixed_identity ? " (fixed identity)" : "");
+            }
+            if (!cfg_.plan.empty()) {
+                if (cfg_.has_hc()) { err = "dense model: a layer schedule with the gated residual is not wired"; return false; }
+                if (!opt.taps.empty()) { err = "dense model: drafter taps (--dflash2) are not wired for a layer schedule"; return false; }
+                std::fprintf(stderr, "xolotl-dense: layer schedule: %d executions of %d layers (%s)\n", cfg_.n_slot(), cfg_.n_layer,
+                             sched.empty() ? "the file's loop" : sched.c_str());
+            }
+        }
         if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
         if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
         // The rope the analytic kernel applies: the process scaling (rope_scaling.hpp, `none` unless a caller
@@ -780,6 +1173,24 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         // angles must match the weights.
         I.rope = rope_scaling();
         I.rope.freq_base = (double) cfg_.rope_base;
+        {   // xolotl: a file that declares YaRN (SenseNova-Loop: factor 2 over 262144, the 512K extension).  Off by
+            // default (YaRN is the long-context step, not part of normal runs or tests); with
+            // STRATA_DENSE_FILE_ROPE=1 the engine applies the file's YaRN at every position, as the HF config does.
+            const char* fr = std::getenv("STRATA_DENSE_FILE_ROPE");
+            const bool file_rope = fr && fr[0] == '1';
+            const strata::MetaValue* rt0 = g0.get(a + "rope.scaling.type");
+            if (!file_rope && rt0 && rt0->type == strata::MetaType::STRING && rt0->s == "yarn")
+                std::fprintf(stderr, "xolotl-dense: rope: the file declares YaRN; not applied (STRATA_DENSE_FILE_ROPE=1 for the 512K extension)\n");
+            const strata::MetaValue* rt = g0.get(a + "rope.scaling.type");
+            if (file_rope && I.rope.type == RopeScalingType::None && rt && rt->type == strata::MetaType::STRING && rt->s == "yarn") {
+                I.rope.type = RopeScalingType::YaRN;
+                if (const auto* e = g0.get(a + "rope.scaling.factor")) I.rope.factor = e->num();
+                if (const auto* e = g0.get(a + "rope.scaling.original_context_length")) I.rope.orig_ctx = e->num();
+                I.rope.ext_factor = 1.0;
+                std::fprintf(stderr, "xolotl-dense: rope: YaRN from the file (factor %.2f over %.0f, magnitude %.4f)\n",
+                             I.rope.factor, I.rope.orig_ctx, I.rope.mscale());
+            }
+        }
         if (const char* why = rope_scaling_invalid(I.rope)) {
             err = std::string("dense model: invalid rope scaling configuration: ") + why;
             return false;
@@ -815,6 +1226,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const int E = cfg_.n_embd;
         const int mtp_block_idx = cfg_.n_layer;           // the MTP block follows the trunk
         const std::string mp = "blk." + std::to_string(mtp_block_idx) + ".";
+        uint64_t draft_bytes = 0;                         // the --draft-vocab head, 0 = none (section 4 decides)
         if (with_mtp && (cfg_.n_nextn < 1 || !I.find(mp + "nextn.eh_proj.weight"))) {
             err = "dense model: this GGUF has no MTP block (nextn_predict_layers = " + std::to_string(cfg_.n_nextn) +
                   "); start without --mtp";
@@ -826,8 +1238,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (cs == cudaSuccess) cs = cudaHostAlloc((void**) &I.embd_stage, (size_t) NC * E * 4, cudaHostAllocDefault);
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
         if (const char* e = std::getenv("STRATA_DENSE_PROF")) I.prof.enabled = e[0] && e[0] != '0';
+        if (const char* e = std::getenv("STRATA_DENSE_MTP_KV_ONLY")) I.mtp_kv_only = e[0] && e[0] != '0';
         if (const char* e = std::getenv("STRATA_DENSE_MMVQ_FAST"))      // the multi-column layout that is faster but not bitwise equal to 1 column
-            if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "strata-dense: multi-column GEMV: upstream layout\n"); }
+            if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "xolotl-dense: multi-column GEMV: upstream layout\n"); }
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
             long long a0 = 0, b0 = 0;
             if (std::sscanf(e, "%lld:%lld", &a0, &b0) == 2) { I.dbg_from = a0; I.dbg_to = b0; }
@@ -862,17 +1275,41 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         {   // What is free, minus the KV caches, the rollback snapshots and a margin for the CUDA context, the
             // activations and the kernels.  The rest of the weights stays in pinned host memory.
             int n_attn = 0, n_gdn = 0;
-            for (int l = 0; l < cfg_.n_layer; ++l) {
-                if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn; else ++n_gdn;
+            for (int si = 0; si < cfg_.n_slot(); ++si) {   // xolotl: per execution slot (a loop's repeats each own a cache)
+                if (I.find("blk." + std::to_string(cfg_.phys(si)) + ".attn_q.weight")) ++n_attn; else ++n_gdn;
             }
-            const uint64_t kv_per_layer = (uint64_t) HK * (uint64_t) max_context * (kcell + vcell);
+            // --kv-resident: the cells of every trunk attention layer that live in VRAM (the rest spill to host RAM,
+            // spill_alloc); the MTP block's own cache stays whole in VRAM.  auto (-1) is settled below, once the
+            // weights are known: the weights come first (they are read every token), the KV takes what is left.
+            I.kv_hot = opt.kv_resident > 0 ? std::min<int64_t>(opt.kv_resident, max_context) : max_context;
+            uint64_t kv_per_layer = (uint64_t) HK * (uint64_t) I.kv_hot * (kcell + vcell);
+            const uint64_t kv_full_layer = (uint64_t) HK * (uint64_t) max_context * (kcell + vcell);
             const uint64_t snap_one = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4 +
                                       (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;     // one snapshot of one GDN layer
+            const uint64_t tap_bytes = opt.taps.empty() ? 0 :
+                (uint64_t) (NC + DenseModel::kTapRing) * opt.taps.size() * (uint64_t) cfg_.n_embd * 4;
+            // the decode attention's partials: one region per column of a window (the extra NC - 1, ~19 MB each at 200K)
+            const uint64_t scratch_extra = (uint64_t) (NC - 1) * dense_attn_scratch_bytes(cfg_.n_head, cfg_.head_dim, (int) max_context);
+            // the prompt prefill's scratch for a 512-token chunk (allocated lazily at the first prompt, so it has to be
+            // kept out of the weights' budget or a full card fails on its first request; see size_scratch below)
+            const uint64_t pf_reserve = [&]() -> uint64_t {
+                const uint64_t per_tok = 4ull * (3ull * E + 2ull * C + 3ull * cfg_.ssm_v_heads + 2ull * V + 2ull * H * 2 * D +
+                                                 3ull * H * D + 2ull * HK * D + 3ull * cfg_.n_ff + std::max(H, HK)) + 4 +
+                                         2ull * std::max({E, V, cfg_.n_ff, H * D});   // + the q8_1 copy of the widest input
+                const uint64_t MSu = (uint64_t) std::max(0, cfg_.mhc_streams);
+                const uint64_t mhc_tok = cfg_.has_mhc() ? 4ull * (MSu * E + E + 2 * MSu + MSu * MSu) : 0;   // P.mhc_*
+                return 512ull * (per_tok + mhc_tok) + (16ull << 20);
+            }();
             auto reserved_for = [&](bool mtp) {
-                return (uint64_t) (n_attn + (mtp ? 1 : 0)) * kv_per_layer + (mtp ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0);
+                return pf_reserve + (uint64_t) n_attn * kv_per_layer + (mtp ? kv_full_layer : 0) +
+                       ((mtp || opt.spec_snapshots) ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0) + tap_bytes + scratch_extra;
             };
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
+            {   // --vram-reserve-mib N: leave N MiB free for another program (the vision encoder)
+                const uint64_t reserve = (uint64_t) std::max(0, opt.vram_reserve_mib) << 20;
+                free_b = free_b > reserve ? free_b - reserve : 0;
+            }
             const uint64_t margin = 1024ull << 20;
             auto budget_for = [&](bool mtp) -> int64_t { return (int64_t) free_b - (int64_t) reserved_for(mtp) - (int64_t) margin; };
             // the bytes of every quantized matrix the trunk (and the MTP block) will upload
@@ -891,7 +1328,27 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             else if (tok) trunk_bytes += native_mmvq_supported((int) tok->tensor->type)
                     ? native_mmvq_weight_bytes((int) tok->tensor->type, E, cfg_.n_vocab) : 0;
             mtp_bytes = bytes_of_prefix(mp);
+            if (with_mtp && !opt.draft_vocab.empty()) {     // the shortlist head is a second, smaller copy of head rows
+                const Found* h = I.find("output.weight") ? I.find("output.weight") : tok;
+                if (h && native_mmvq_supported((int) h->tensor->type))
+                    draft_bytes = native_mmvq_weight_bytes((int) h->tensor->type, E,
+                                                           (int) opt.draft_vocab.size() + std::max(0, opt.draft_vocab_extra));
+            }
             const bool user_cap = std::getenv("STRATA_DENSE_GPU_MIB") != nullptr;
+            if (opt.kv_resident < 0) {   // auto: every cell that fits beside the weights stays in VRAM
+                const int64_t per_cell = (int64_t) n_attn * HK * (int64_t) (kcell + vcell);
+                kv_per_layer = 0;
+                const int64_t room = budget_for(with_mtp) - (int64_t) (trunk_bytes + (with_mtp ? mtp_bytes : 0) + draft_bytes);
+                int64_t hot = per_cell > 0 && room > 0 ? room / per_cell / 1024 * 1024 : 0;
+                hot = std::max<int64_t>(hot, std::min<int64_t>(8192, max_context));
+                I.kv_hot = std::min<int64_t>(hot, max_context);
+                kv_per_layer = (uint64_t) HK * (uint64_t) I.kv_hot * (kcell + vcell);
+            }
+            if (I.kv_hot < max_context)
+                std::fprintf(stderr, "xolotl-dense: KV spill: %lld of %lld cells per KV head in VRAM (%.2f GiB), the rest in pinned "
+                             "host RAM (%.2f GiB, read over PCIe once the context passes %lld)\n",
+                             (long long) I.kv_hot, (long long) max_context, n_attn * kv_per_layer / 1073741824.0,
+                             n_attn * (double) (kv_full_layer - kv_per_layer) / 1073741824.0, (long long) I.kv_hot);
             if (with_mtp && !user_cap && !opt.mtp_force && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes)) {
                 // the longest context at which everything, MTP included, stays in VRAM
                 const int64_t per_token = (int64_t) (n_attn + 1) * HK * (int64_t) (kcell + vcell);   // KV bytes per token, MTP layer too
@@ -899,30 +1356,37 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                                      (int64_t) ((uint64_t) n_gdn * snap_one * (uint64_t) draft_max);
                 const int64_t fit_ctx = room > 0 ? (room / per_token) / 1024 * 1024 : 0;
                 std::fprintf(stderr,
-                             "strata-dense: MTP is OFF: the weights (%.2f GiB with the MTP block), the KV cache for %lld tokens and "
+                             "xolotl-dense: MTP is OFF: the weights (%.2f GiB with the MTP block), the KV cache for %lld tokens and "
                              "the %d rollback snapshot(s) do not all fit in VRAM, so some weights would be read over PCIe on every "
                              "token - slower, not faster.%s\n",
                              (trunk_bytes + mtp_bytes) / 1073741824.0, (long long) max_context, draft_max,
                              fit_ctx >= 2048 ? "" : " Even a short context would not fit: use a smaller quant.");
                 if (fit_ctx >= 2048)
-                    std::fprintf(stderr, "strata-dense:   with MTP on, a --context up to about %lld tokens fits in this GPU "
+                    std::fprintf(stderr, "xolotl-dense:   with MTP on, a --context up to about %lld tokens fits in this GPU "
                                  "(or use --draft-max 1); --mtp-force keeps MTP at the current context anyway.\n",
                                  (long long) fit_ctx);
                 with_mtp = false;
+            }
+            // the shortlist head only if it fits next to everything else: without the room it is left out, MTP stays on
+            if (draft_bytes && (!with_mtp || (!user_cap && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes + draft_bytes)))) {
+                if (with_mtp)
+                    std::fprintf(stderr, "xolotl-dense: --draft-vocab left out: no VRAM for its %.0f MiB (MTP stays on, drafts use the full head)\n",
+                                 draft_bytes / 1048576.0);
+                draft_bytes = 0;
             }
             const uint64_t reserved = reserved_for(with_mtp);
             const uint64_t kv_need = (uint64_t) (n_attn + (with_mtp ? 1 : 0)) * kv_per_layer;
             if (user_cap) {                                                  // explicit cap for the weights, in MiB
                 I.budget = (uint64_t) std::atoll(std::getenv("STRATA_DENSE_GPU_MIB")) << 20;
             } else if ((int64_t) free_b > (int64_t) (reserved + margin)) {
-                I.budget = (uint64_t) budget_for(with_mtp);
+                I.budget = (uint64_t) budget_for(with_mtp) - draft_bytes;   // the weights leave the shortlist head its room
             } else {
                 err = "dense model: the KV cache for a context of " + std::to_string(max_context) + " needs " +
                       std::to_string(kv_need >> 20) + " MiB, but only " + std::to_string(free_b >> 20) +
                       " MiB of VRAM are free (1 GiB is kept as margin). Use a shorter --context.";
                 return false;
             }
-            std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (%s, context %lld)%s; "
+            std::fprintf(stderr, "xolotl-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (%s, context %lld)%s; "
                          "%llu MiB of weights may go to the GPU (the model needs %.0f MiB), the rest stays in host memory\n",
                          free_b >> 20, total_b >> 20, (unsigned long long) (kv_need >> 20), kv_name_.c_str(), (long long) max_context,
                          with_mtp ? " + MTP snapshots" : "", (unsigned long long) (I.budget >> 20),
@@ -960,18 +1424,83 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         }
 
         // ---- 6. the trunk layers
-        I.layers.assign((size_t) cfg_.n_layer, Layer{});
-        for (int l = 0; l < cfg_.n_layer; ++l) {
-            Layer& L = I.layers[(size_t) l];
+        // xolotl: one Layer per EXECUTION SLOT.  A physical layer's first slot uploads its weights; a repeat (a loop's
+        // second pass) copies those device pointers (the allocations are owned centrally, so nothing is freed twice)
+        // and gets its own recurrent state, snapshots and KV cache - the per-visit state the reference keeps.
+        auto alloc_state = [&](Layer& L) -> bool {
+            if (!L.attn) {
+                const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+                const uint64_t cbytes = (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;
+                if (!I.alloc(&L.state, sbytes, err, "GDN state") || !I.alloc(&L.conv_state, cbytes, err, "conv state")) return false;
+                if (with_mtp || opt.spec_snapshots) {
+                    L.st_slots.assign((size_t) draft_max, nullptr);
+                    L.cv_slots.assign((size_t) draft_max, nullptr);
+                    for (int j = 0; j < draft_max; ++j)
+                        if (!I.alloc(&L.st_slots[(size_t) j], sbytes, err, "GDN state snapshot") ||
+                            !I.alloc(&L.cv_slots[(size_t) j], cbytes, err, "conv snapshot"))
+                            return false;
+                }
+                return true;
+            }
+            const uint64_t kb = (uint64_t) HK * (uint64_t) max_context * kcell, vb = (uint64_t) HK * (uint64_t) max_context * vcell;
+            if (I.kv_hot < max_context) {   // --kv-resident: VRAM for the first kv_hot cells, host RAM after
+                I.spill.emplace_back();
+                if (!spill_alloc(I.spill.back(), HK, max_context, kcell, I.kv_hot, err)) { I.spill.pop_back(); return false; }
+                L.kc = (uint16_t*) (uintptr_t) I.spill.back().va;
+                I.spill.emplace_back();
+                if (!spill_alloc(I.spill.back(), HK, max_context, vcell, I.kv_hot, err)) { I.spill.pop_back(); return false; }
+                L.vc = (uint16_t*) (uintptr_t) I.spill.back().va;
+            } else if (!I.alloc(&L.kc, kb, err, "K cache") || !I.alloc(&L.vc, vb, err, "V cache")) return false;
+            kv_bytes_ += kb + vb;
+            return true;
+        };
+        I.layers.assign((size_t) cfg_.n_slot(), Layer{});
+        std::vector<int> first_slot((size_t) cfg_.n_layer, -1);
+        for (int si = 0; si < cfg_.n_slot(); ++si) {
+            const int l = cfg_.phys(si);
+            Layer& L = I.layers[(size_t) si];
+            if (first_slot[(size_t) l] >= 0) {
+                L = I.layers[(size_t) first_slot[(size_t) l]];
+                L.state = L.conv_state = nullptr;
+                L.st_slots.clear();
+                L.cv_slots.clear();
+                L.kc = L.vc = nullptr;
+                if (!alloc_state(L)) return false;
+                continue;
+            }
+            first_slot[(size_t) l] = si;
             const std::string p = "blk." + std::to_string(l) + ".";
             const std::string at = "layer " + std::to_string(l) + ": ";
             const bool has_gdn = I.find(p + "attn_qkv.weight") != nullptr;
             const bool has_attn = I.find(p + "attn_q.weight") != nullptr;
             if (has_gdn == has_attn) { err = "dense model: " + at + "needs exactly one of attn_qkv.weight / attn_q.weight"; return false; }
             L.attn = has_attn;
-            if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err)) return false;
-            if (!I.upload_floats(I.find_any({"post_attention_norm.weight", "ffn_norm.weight"}, p), p + "post_attention_norm.weight",
-                                 E, &L.post_norm, err)) return false;
+            if (cfg_.has_hc()) {
+                // The gated residual replaces BOTH layer norms: the mixer's two reads are the equivalent of
+                // rms_norm(attn_norm) and rms_norm(post_attention_norm), with the streams mixed in.
+                const int HD = cfg_.hc_dim();
+                if (!I.upload_floats(I.find(p + "hc_attn_norm.weight"), p + "hc_attn_norm.weight", HD, &L.hc_attn_norm, err) ||
+                    !I.upload_floats(I.find(p + "hc_ffn_norm.weight"), p + "hc_ffn_norm.weight", HD, &L.hc_ffn_norm, err) ||
+                    !I.upload_bf16(I.find(p + "hc_attn_down.weight"), p + "hc_attn_down.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_attn_down, err) ||
+                    !I.upload_bf16(I.find(p + "hc_attn_up.weight"), p + "hc_attn_up.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_attn_up, err) ||
+                    !I.upload_bf16(I.find(p + "hc_attn_inject.weight"), p + "hc_attn_inject.weight", (uint64_t) HD * cfg_.hc, &L.hc_attn_inject, err) ||
+                    !I.upload_bf16(I.find(p + "hc_ffn_down.weight"), p + "hc_ffn_down.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_ffn_down, err) ||
+                    !I.upload_bf16(I.find(p + "hc_ffn_up.weight"), p + "hc_ffn_up.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_ffn_up, err) ||
+                    !I.upload_bf16(I.find(p + "hc_ffn_inject.weight"), p + "hc_ffn_inject.weight", (uint64_t) HD * cfg_.hc, &L.hc_ffn_inject, err))
+                    return false;
+            } else {
+                if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err)) return false;
+                if (!I.upload_floats(I.find_any({"post_attention_norm.weight", "ffn_norm.weight"}, p), p + "post_attention_norm.weight",
+                                     E, &L.post_norm, err)) return false;
+            }
+            if (cfg_.mhc_layer(l)) {   // the two routers, F32 as the reference keeps them
+                const uint64_t rows = (uint64_t) cfg_.mhc_rows(), wn = rows * cfg_.mhc_streams * (uint64_t) E;
+                if (!I.upload_floats(I.find(p + "mhc_attn.router"), p + "mhc_attn.router", wn, &L.mhc_attn_w, err) ||
+                    !I.upload_floats(I.find(p + "mhc_attn.bias"), p + "mhc_attn.bias", rows, &L.mhc_attn_b, err) ||
+                    !I.upload_floats(I.find(p + "mhc_ffn.router"), p + "mhc_ffn.router", wn, &L.mhc_ffn_w, err) ||
+                    !I.upload_floats(I.find(p + "mhc_ffn.bias"), p + "mhc_ffn.bias", rows, &L.mhc_ffn_b, err))
+                    return false;
+            }
             if (!I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) ||
                 !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
                 !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err))
@@ -1004,17 +1533,6 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                                !I.upload_floats(fb, p + "ssm_beta.weight", (uint64_t) E * cfg_.ssm_v_heads, &L.beta_w, err))
                         return false;
                 }
-                const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
-                const uint64_t cbytes = (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;
-                if (!I.alloc(&L.state, sbytes, err, "GDN state") || !I.alloc(&L.conv_state, cbytes, err, "conv state")) return false;
-                if (with_mtp) {
-                    L.st_slots.assign((size_t) draft_max, nullptr);
-                    L.cv_slots.assign((size_t) draft_max, nullptr);
-                    for (int j = 0; j < draft_max; ++j)
-                        if (!I.alloc(&L.st_slots[(size_t) j], sbytes, err, "GDN state snapshot") ||
-                            !I.alloc(&L.cv_slots[(size_t) j], cbytes, err, "conv snapshot"))
-                            return false;
-                }
             } else {
                 if (!I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", E, H * 2 * D, L.q, total, err) ||
                     !I.upload_mat(I.find(p + "attn_k.weight"), p + "attn_k.weight", E, HK * D, L.k, total, err) ||
@@ -1024,24 +1542,70 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 if (!I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
                     !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err))
                     return false;
-                const uint64_t kb = (uint64_t) HK * (uint64_t) max_context * kcell, vb = (uint64_t) HK * (uint64_t) max_context * vcell;
-                if (!I.alloc(&L.kc, kb, err, "K cache") || !I.alloc(&L.vc, vb, err, "V cache")) return false;
-                kv_bytes_ += kb + vb;
             }
+            if (!alloc_state(L)) return false;
         }
 
         // ---- 7. the output side
-        if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) return false;
+        if (cfg_.has_hc()) {
+            // The final mixer replaces output_norm: it collapses the residual stack to the one vector the head takes.
+            const int HD = cfg_.hc_dim();
+            I.gr_shape = strata::kernels::GrShapes{cfg_.n_embd, cfg_.hc, cfg_.hc_lr};
+            if (!I.upload_floats(I.find("output_hc_norm.weight"), "output_hc_norm.weight", HD, &I.out_hc_norm, err) ||
+                !I.upload_bf16(I.find("output_hc_down.weight"), "output_hc_down.weight",
+                               (uint64_t) HD * cfg_.hc_lr, &I.out_hc_down, err) ||
+                !I.upload_bf16(I.find("output_hc_up.weight"), "output_hc_up.weight",
+                               (uint64_t) HD * cfg_.hc_lr, &I.out_hc_up, err))
+                return false;
+        } else if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) {
+            return false;
+        }
         const Found* head = I.find("output.weight");
         if (!head) head = tok;                                   // tied embeddings
         if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", E, cfg_.n_vocab,
                           I.head, total, err))
             return false;
         if (with_mtp && !I.mtp.head.dev) I.mtp.head = I.head;    // the MTP block shares the trunk's head
+        if (with_mtp && !opt.draft_vocab.empty() && I.mtp.head.dev != I.head.dev)
+            std::fprintf(stderr, "xolotl-dense: --draft-vocab ignored: this MTP block has its own head\n");
+        else if (with_mtp && draft_bytes) {
+            // Copy the shortlist's rows of the head (rows are whole blocks, contiguous) into one smaller matrix.
+            const QMat& src = I.mtp.head;
+            const Found* hf = I.find("output.weight") ? I.find("output.weight") : tok;
+            const int n = (int) opt.draft_vocab.size(), cap = std::max(0, opt.draft_vocab_extra);
+            const uint64_t row = native_mmvq_weight_bytes(src.type, E, 1);
+            const uint8_t* base = (const uint8_t*) hf->file->tensor_data(*hf->tensor);
+            std::vector<uint8_t> rows((size_t) row * (n + cap));
+            for (int i = 0; i < n; ++i) {
+                const int32_t id = opt.draft_vocab[i];
+                if (id < 0 || id >= cfg_.n_vocab) { err = "dense model: --draft-vocab id " + std::to_string(id) + " is outside the vocabulary"; return false; }
+                std::memcpy(rows.data() + (size_t) row * i, base + (size_t) row * id, row);
+            }
+            void* dev = nullptr;
+            if (cudaMalloc(&dev, rows.size()) != cudaSuccess || cudaMemcpy(dev, rows.data(), rows.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                if (dev) cudaFree(dev);
+                cudaGetLastError();
+                std::fprintf(stderr, "xolotl-dense: --draft-vocab: no VRAM for the %.0f MiB shortlist head, drafts use the full head\n",
+                             rows.size() / 1048576.0);
+            } else {
+                I.allocations.push_back(dev);
+                total += rows.size();
+                I.draft_head = QMat{dev, src.type, E, n};
+                I.draft_ids = opt.draft_vocab;
+                I.draft_base = n;
+                I.draft_cap = cap;
+                I.draft_in.assign((size_t) cfg_.n_vocab, 0);
+                for (int32_t id : opt.draft_vocab) I.draft_in[(size_t) id] = 1;
+                I.draft_src = base;
+                I.draft_row = row;
+                std::fprintf(stderr, "xolotl-dense: MTP drafts score a %d-token shortlist + up to %d of each prompt's own tokens "
+                             "(%.0f MiB; verification keeps all %d)\n", n, cap, rows.size() / 1048576.0, cfg_.n_vocab);
+            }
+        }
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
         if (I.host_tensors)
-            std::fprintf(stderr, "strata-dense: %d tensors (%.2f GiB of %.2f) live in host memory and are read over PCIe "
+            std::fprintf(stderr, "xolotl-dense: %d tensors (%.2f GiB of %.2f) live in host memory and are read over PCIe "
                          "on every token - a shorter --context or a smaller quant puts more on the GPU\n",
                          I.host_tensors, I.host_bytes / 1073741824.0, total / 1073741824.0);
 
@@ -1049,6 +1613,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const int max_in = std::max({2 * E, cfg_.n_ff, V, H * D});
         const uint64_t f = 4, K = NC;
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, NC), err, "q8_1 scratch") &&
+                  I.alloc(&I.q8_il, native_q8_1_il_bytes(max_in, NC), err, "q8_1 interleaved scratch") &&
                   I.alloc(&I.x, K * E * f, err, "x") && I.alloc(&I.xn, K * E * f, err, "xn") &&
                   I.alloc(&I.mix, K * E * f, err, "mix") && I.alloc(&I.qkv, K * C * f, err, "qkv") &&
                   I.alloc(&I.h, K * C * f, err, "h") &&
@@ -1060,20 +1625,63 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                   I.alloc(&I.attn, K * H * D * f, err, "attn") && I.alloc(&I.attn32, K * H * D * f, err, "attn32") &&
                   I.alloc(&I.ffn_g, K * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, K * cfg_.n_ff * f, err, "ffn_u") &&
                   I.alloc(&I.ffn_h, K * cfg_.n_ff * f, err, "ffn_h") && I.alloc(&I.logits, K * cfg_.n_vocab * f, err, "logits") &&
-                  I.alloc(&I.attn_scratch, dense_attn_scratch_bytes(H, D, (int) max_context), err, "attention scratch") &&
+                  I.alloc(&I.attn_scratch, (uint64_t) NC * dense_attn_scratch_bytes(H, D, (int) max_context), err, "attention scratch") &&
                   // one position per row of a full NC-column pass: the attention's RoPE is batched over the columns
                   I.alloc(&I.pos_dev, K * (uint64_t) std::max(H, HK) * 4, err, "positions") &&
                   I.alloc(&I.hid, K * E * f, err, "hidden") && I.alloc(&I.h_last, (uint64_t) E * f, err, "last hidden") &&
                   I.alloc(&I.d_tok, 16, err, "sampler output") && I.alloc(&I.d_prob, 16, err, "draft probability");
+        if (ok && cfg_.has_hc()) {
+            // The residual stack and gr_read's explicit scratch, NC columns each (gr_read_multi writes these
+            // per token; the single-token path carves the same numbers out of gr_ws_mem).
+            const uint64_t HD = (uint64_t) cfg_.hc_dim();
+            ok = I.alloc(&I.R, K * HD * f, err, "residual stack") &&
+                 I.alloc(&I.hc_xn, K * HD * f, err, "hyper-connection streams") &&
+                 I.alloc(&I.hc_gated, K * HD * f, err, "hyper-connection gate") &&
+                 I.alloc(&I.hc_lo, K * (uint64_t) cfg_.hc_lr * f, err, "hyper-connection bottleneck") &&
+                 I.alloc(&I.hc_inject, K * (uint64_t) cfg_.hc * f, err, "hyper-connection injection") &&
+                 I.alloc(&I.gr_ws_mem, strata::kernels::gr_workspace_bytes(I.gr_shape), err, "gr_read workspace");
+            if (ok) {
+                strata::kernels::gr_workspace_init(I.gr_shape, I.gr_ws_mem, I.gr_ws);
+                std::fprintf(stderr, "xolotl-dense: hyper-connections: %d streams of %d, rank %d\n", cfg_.hc, cfg_.n_embd,
+                             cfg_.hc_lr);
+            }
+        }
+        if (ok && cfg_.has_mhc()) {
+            const uint64_t S = (uint64_t) cfg_.mhc_streams;
+            ok = I.alloc(&I.mhc_R, K * S * E * f, err, "mHC streams") && I.alloc(&I.mhc_br, K * E * f, err, "mHC branch") &&
+                 I.alloc(&I.mhc_cf, K * (2 * S + S * S) * f, err, "mHC coefficients");
+        }
         if (ok && with_mtp)
             ok = I.alloc(&I.m_e, K * E * f, err, "MTP embeddings") && I.alloc(&I.hin, K * E * f, err, "MTP hidden input") &&
                  I.alloc(&I.cat, K * 2 * E * f, err, "MTP concat") && I.alloc(&I.mtp_logits, (uint64_t) cfg_.n_vocab * f, err, "MTP logits") &&
                  I.alloc(&I.mtp_h, (uint64_t) E * f, err, "MTP output hidden");
+        if (ok && !opt.taps.empty() && cfg_.has_hc()) {
+            // A tap is one n_embd vector per layer; a hyper-connection layer holds hc of them.  The drafter would
+            // have to be trained on the stack, so refuse rather than feed it a shape it was not built for.
+            err = "dense model: drafter taps (--dflash2) are not wired for a hyper-connection model";
+            return false;
+        }
+        if (ok && !opt.taps.empty()) {
+            I.tap_slot.assign((size_t) cfg_.n_layer, -1);
+            for (size_t t = 0; t < opt.taps.size(); ++t) {
+                const int l = opt.taps[t];
+                if (l < 0 || l >= cfg_.n_layer || I.tap_slot[(size_t) l] >= 0) {
+                    err = "dense model: tap layer " + std::to_string(l) + " is outside the model's " + std::to_string(cfg_.n_layer) +
+                          " layers or repeated";
+                    return false;
+                }
+                I.tap_slot[(size_t) l] = (int) t;
+            }
+            I.n_taps = (int) opt.taps.size();
+            const uint64_t row = (uint64_t) I.n_taps * E * f;
+            ok = I.alloc(&I.taps_run, (uint64_t) NC * row, err, "drafter taps") &&
+                 I.alloc(&I.taps_ring, (uint64_t) DenseModel::kTapRing * row, err, "drafter tap ring");
+        }
         if (!ok) return false;
 
         native_gdn_set_enabled(true);
         has_mtp_ = with_mtp;
-        draft_max_ = with_mtp ? draft_max : 0;
+        draft_max_ = (with_mtp || opt.spec_snapshots) ? draft_max : 0;
         reset();
         std::string serr;
         if (!sync(serr)) { err = serr; return false; }
@@ -1192,23 +1800,63 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     Impl& I = *impl_;
     if (n < 1 || n > NC) { err = "dense model: run() takes 1 to " + std::to_string(NC) + " tokens"; return false; }
     if (pos_ + n > max_context_) { err = "dense model: the context is full"; return false; }
-    if (snapshot && (!has_mtp_ || n - 1 > draft_max_)) { err = "dense model: bad snapshot request (more columns than --draft-max + 1, or no MTP)"; return false; }
+    if (snapshot && (draft_max_ == 0 || n - 1 > draft_max_)) { err = "dense model: bad snapshot request (more columns than --draft-max + 1, or no drafter)"; return false; }
     void* s = I.stream;
     const int E = cfg_.n_embd;
     const int64_t pos0 = pos_;
     const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
     try {
         if (I.prof.enabled) I.prof.begin(s);
-        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
+        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err, nullptr, pos0)) { I.prof.on = false; return false; }
         if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
+        // A hyper-connection model starts as the embedding broadcast to every stream (the reference's own initial
+        // condition); a plain one keeps the single vector in `x`.
+        if (cfg_.has_hc()) strata::kernels::broadcast_streams(I.x, I.R, E, cfg_.hc, n, s);
 
-        for (int l = 0; l < cfg_.n_layer; ++l) {
+        const int MS = cfg_.mhc_streams;
+        for (int l = 0; l < cfg_.n_slot(); ++l) {     // l: the execution slot (= the layer on a plain file)
             Layer& L = I.layers[(size_t) l];
-            dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            const int pl = cfg_.phys(l);
+            const bool mhc = L.mhc_attn_w != nullptr;
+            if (mhc) {
+                // the reference's MHCDecoderLayer: the first layer of the block expands x into the streams, the router
+                // reads one branch out of them, the layer's own norm and mixer run on it, and the write mixes the
+                // streams and adds the mixer's output with the post weights
+                PScope ps_mhc(&I.prof, Prof::MHC, s);
+                if (pl == cfg_.mhc_start) dense_mhc_enter(I.x, I.mhc_R, MS, E, n, s);
+                dense_mhc_read(I.mhc_R, L.mhc_attn_w, L.mhc_attn_b, MS, E, cfg_.mhc_iters, cfg_.mhc_fixed_identity,
+                               cfg_.mhc_pre_scale, I.mhc_br, I.mhc_cf, n, s);
+                dense_rms_norm(I.mhc_br, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            } else if (cfg_.has_hc()) I.hc_read(L, /*attn_mixer=*/true, cfg_.rms_eps, n, s);   // -> xn (the mixer's input)
+            else dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
             if (!L.attn) I.gdn_block(cfg_, L, n, snapshot, s);
             else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, s);
-            add_inplace(I.x, I.mix, (int64_t) n * E, s);
-            I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            if (mhc) {
+                {
+                    PScope ps_mhc(&I.prof, Prof::MHC, s);
+                    dense_mhc_write(I.mhc_R, I.mhc_cf, I.mix, MS, E, n, s);
+                    dense_mhc_read(I.mhc_R, L.mhc_ffn_w, L.mhc_ffn_b, MS, E, cfg_.mhc_iters, cfg_.mhc_fixed_identity,
+                                   cfg_.mhc_pre_scale, I.mhc_br, I.mhc_cf, n, s);
+                    dense_rms_norm(I.mhc_br, L.post_norm, I.xn, n, E, cfg_.rms_eps, s);
+                }
+                I.ffn_matmul(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, n, s);            // -> mix
+                {
+                    PScope ps_mhc(&I.prof, Prof::MHC, s);
+                    dense_mhc_write(I.mhc_R, I.mhc_cf, I.mix, MS, E, n, s);
+                    if (pl == cfg_.mhc_end - 1) dense_mhc_leave(I.mhc_R, I.x, MS, E, n, s);
+                }
+            } else if (cfg_.has_hc()) {
+                strata::kernels::gr_write_multi(I.R, I.mix, I.hc_inject, I.gr_shape, I.R, n, s);
+                I.hc_read(L, /*attn_mixer=*/false, cfg_.rms_eps, n, s);                // -> xn again
+                I.ffn_matmul(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, n, s);            // -> mix
+                strata::kernels::gr_write_multi(I.R, I.mix, I.hc_inject, I.gr_shape, I.R, n, s);
+            } else {
+                add_inplace(I.x, I.mix, (int64_t) n * E, s);
+                I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            }
+            if (I.n_taps && I.tap_slot[(size_t) l] >= 0)   // this layer's output rows for the drafter
+                cudaMemcpy2DAsync(I.taps_run + (size_t) I.tap_slot[(size_t) l] * E, (size_t) I.n_taps * E * 4, I.x, (size_t) E * 4,
+                                  (size_t) E * 4, (size_t) n, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
             if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
         }
         pos_ += n;
@@ -1217,7 +1865,14 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
         snap_cols_ = n;
 
         if (lg != Logits::None || keep_hidden) {
-            dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            if (cfg_.has_hc()) {
+                // The final mixer collapses the stack to the one vector the head takes (no output_norm: the
+                // mixer's own norm plays that role, exactly as lm_head_mix does on the MoE path).
+                strata::kernels::gr_read_multi(I.R, I.out_hc_norm, I.out_hc_down, I.out_hc_up, nullptr, cfg_.rms_eps,
+                                               I.gr_shape, I.gr_ws, I.hc_xn, I.hc_lo, I.hc_gated, I.hid, nullptr, n, s);
+            } else {
+                dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            }
             if (lg == Logits::Last) {
                 I.quantize(I.hid + (size_t) (n - 1) * E, E, 1, s);
                 I.gemv(I.head, I.logits, 1, s);
@@ -1249,6 +1904,25 @@ int64_t DenseModel::prefill_chunk() const { return pf_chunk_; }
 bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
     pf_ready_ = false;
     pf_chunk_ = 0;
+    if (cfg_.has_mhc()) {
+        // xolotl: the chunked path runs the mHC block (same kernels as run(), T columns at a time).
+        // STRATA_DENSE_MHC_PREFILL=0 = the old behaviour: run() serves the prompt, NC tokens per call.
+        const char* ev = std::getenv("STRATA_DENSE_MHC_PREFILL");
+        if (ev && ev[0] == '0') {
+            err = "dense model: mHC prefill switched off (STRATA_DENSE_MHC_PREFILL=0); the prompt is fed NC tokens per call";
+            return false;
+        }
+    }
+    if (Impl::act_f32_on()) {
+        err = "dense model: STRATA_DENSE_ACT_F32=1 keeps FP32 activations, which the MMQ prefill does not; the prompt is fed NC tokens per call";
+        return false;
+    }
+    if (cfg_.has_hc()) {
+        // The chunked path runs rms_norm over a single vector; a hyper-connection file mixes hc streams first.
+        // run() serves the prompt instead - correct, NC tokens per call, and nothing else changes.
+        err = "dense model: hyper-connections are served on the run() path; the prompt is fed NC tokens per call";
+        return false;
+    }
 #ifdef STRATA_DENSE_MMQ
     Impl& I = *impl_;
     if (chunk <= 0) chunk = kPrefillDefaultCols;
@@ -1320,6 +1994,11 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
               pf_alloc((void**) &P.xq, strata::prefill::mmq::q8_bytes(t, max_in), "q8_1") &&
               pf_alloc((void**) &P.ids, T * 4, "row ids") && pf_alloc((void**) &P.bounds, 2 * 4, "group bounds") &&
               pf_alloc((void**) &P.pos_dev, T * (uint64_t) std::max(H, HK) * 4, "positions");
+    if (ok && cfg_.has_mhc()) {
+        const uint64_t S = (uint64_t) cfg_.mhc_streams;
+        ok = pf_alloc((void**) &P.mhc_R, T * S * E * f, "mHC streams") && pf_alloc((void**) &P.mhc_br, T * E * f, "mHC branch") &&
+             pf_alloc((void**) &P.mhc_cf, T * (2 * S + S * S) * f, "mHC coefficients");
+    }
     if (ok) {
         cudaError_t s = cudaHostAlloc((void**) &P.stage, T * E * 4, cudaHostAllocDefault);
         if (s != cudaSuccess)
@@ -1331,7 +2010,18 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
         ok = s == cudaSuccess;
     }
     if (ok) {
-        strata::prefill::mmq::iota(P.ids, t, I.stream);
+        // row ids 0..t-1 by a plain copy: mmq::iota() goes through ck(), which exit()s on a launch error, so a card
+        // filled to the last MiB killed the engine here instead of halving the chunk (DFlash2 at 200K, 14 Nov)
+        std::vector<int32_t> ids((size_t) t);
+        for (int64_t k = 0; k < t; ++k) ids[(size_t) k] = (int32_t) k;
+        const cudaError_t si = cudaMemcpy(P.ids, ids.data(), (size_t) t * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (si != cudaSuccess) {
+            cudaGetLastError();
+            err = std::string("dense model: prefill row ids: ") + cudaGetErrorString(si);
+            ok = false;
+        }
+    }
+    if (ok) {
         for (int k = 0; k < Impl::Pf::kBoundsSlots; ++k) {
             P.bounds_host[2 * k] = 0;
             P.bounds_host[2 * k + 1] = (int32_t) t;
@@ -1347,13 +2037,13 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
     for (;;) {
         if (size_scratch(chunk)) break;
         if (chunk <= NC) return false;
-        std::fprintf(stderr, "strata-dense: the prefill scratch for %lld tokens does not fit; trying %lld\n",
+        std::fprintf(stderr, "xolotl-dense: the prefill scratch for %lld tokens does not fit; trying %lld\n",
                      (long long) chunk, (long long) (chunk / 2));
         chunk /= 2;
     }
     pf_chunk_ = chunk;
     pf_ready_ = true;
-    std::fprintf(stderr, "strata-dense: prompt prefill through MMQ, %lld tokens at a time\n", (long long) chunk);
+    std::fprintf(stderr, "xolotl-dense: prompt prefill through MMQ, %lld tokens at a time\n", (long long) chunk);
     return true;
 #else
     (void) chunk;
@@ -1377,7 +2067,7 @@ bool DenseModel::prefill(const int32_t* tokens, int64_t n, Logits lg, std::strin
         for (int64_t i = 0; i < n;) {
             const int64_t T = std::min(pf_chunk_, n - i);
             const int64_t pos0 = pos_;
-            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage)) {
+            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage, pos0)) {
                 I.prof.on = false;
                 return false;
             }
@@ -1388,13 +2078,41 @@ bool DenseModel::prefill(const int32_t* tokens, int64_t n, Logits lg, std::strin
             slot[0] = 0;
             slot[1] = (int32_t) T;
             cudaMemcpyAsync(P.bounds, slot, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s);
-            for (int l = 0; l < cfg_.n_layer; ++l) {
+            for (int l = 0; l < cfg_.n_slot(); ++l) {   // l: the execution slot (a plain --layer-schedule comes here)
                 Layer& L = I.layers[(size_t) l];
-                dense_rms_norm(P.x, L.attn_norm, P.xn, (int) T, E, cfg_.rms_eps, s);
+                const int pl = cfg_.phys(l);
+                const bool mhc = L.mhc_attn_w != nullptr;
+                const int MS = cfg_.mhc_streams, Tn = (int) T;
+                if (mhc) {   // run()'s mHC sequence over the chunk's T columns (the kernels are per column)
+                    if (pl == cfg_.mhc_start) dense_mhc_enter(P.x, P.mhc_R, MS, E, Tn, s);
+                    dense_mhc_read(P.mhc_R, L.mhc_attn_w, L.mhc_attn_b, MS, E, cfg_.mhc_iters, cfg_.mhc_fixed_identity,
+                                   cfg_.mhc_pre_scale, P.mhc_br, P.mhc_cf, Tn, s);
+                    dense_rms_norm(P.mhc_br, L.attn_norm, P.xn, Tn, E, cfg_.rms_eps, s);
+                } else dense_rms_norm(P.x, L.attn_norm, P.xn, Tn, E, cfg_.rms_eps, s);
                 if (!L.attn) I.pf_gdn_block(cfg_, L, T, s);
                 else I.pf_attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, T, (int) pos0, s);
-                add_inplace(P.x, P.mix, T * E, s);
-                I.pf_ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, T, s);
+                if (mhc) {
+                    dense_mhc_write(P.mhc_R, P.mhc_cf, P.mix, MS, E, Tn, s);
+                    dense_mhc_read(P.mhc_R, L.mhc_ffn_w, L.mhc_ffn_b, MS, E, cfg_.mhc_iters, cfg_.mhc_fixed_identity,
+                                   cfg_.mhc_pre_scale, P.mhc_br, P.mhc_cf, Tn, s);
+                    dense_rms_norm(P.mhc_br, L.post_norm, P.xn, Tn, E, cfg_.rms_eps, s);
+                    I.pf_ffn_matmul(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, T, s);   // -> mix
+                    dense_mhc_write(P.mhc_R, P.mhc_cf, P.mix, MS, E, Tn, s);
+                    if (pl == cfg_.mhc_end - 1) dense_mhc_leave(P.mhc_R, P.x, MS, E, Tn, s);
+                } else {
+                    add_inplace(P.x, P.mix, T * E, s);
+                    I.pf_ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, T, s);
+                }
+                if (I.n_taps && I.tap_slot[(size_t) l] >= 0) {   // the drafter's rows: the chunk's last kTapRing, at position % ring
+                    const int64_t R = DenseModel::kTapRing;
+                    for (int64_t r = std::max<int64_t>(0, T - R); r < T;) {
+                        const int64_t slot = (pos0 + r) % R, len = std::min<int64_t>(T - r, R - slot);
+                        cudaMemcpy2DAsync(I.taps_ring + ((size_t) slot * I.n_taps + I.tap_slot[(size_t) l]) * E, (size_t) I.n_taps * E * 4,
+                                          P.x + (size_t) r * E, (size_t) E * 4, (size_t) E * 4, (size_t) len,
+                                          cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+                        r += len;
+                    }
+                }
             }
             // The MTP block is fed in kMaxCols groups, exactly as the prompt loop does after a run(): each group's
             // column 0 pairs with the previous group's last hidden (h_last, which mtp_ingest leaves behind).
@@ -1460,6 +2178,34 @@ bool DenseModel::mtp_ingest(const int32_t* tokens, int n, int pos0, int start, s
     }
 }
 
+void DenseModel::draft_vocab_extend(const int32_t* tokens, int64_t n) {
+    Impl& I = *impl_;
+    if (!I.draft_head.dev || I.draft_cap == 0) return;
+    std::vector<int32_t> extra;
+    std::vector<uint8_t> seen = I.draft_in;
+    for (int64_t i = n - 1; i >= 0 && (int) extra.size() < I.draft_cap; --i) {     // newest first
+        const int32_t t = tokens[i];
+        if (t < 0 || t >= cfg_.n_vocab || seen[(size_t) t]) continue;
+        seen[(size_t) t] = 1;
+        extra.push_back(t);
+    }
+    // pad to a multiple of 64 rows with copies of a shortlist token (a duplicate row has the same logit, so the
+    // argmax maps to the same id) - the GEMV launchers then see the same row-count shapes as the shortlist itself
+    while (!extra.empty() && (I.draft_base + extra.size()) % 64 && (int) extra.size() < I.draft_cap) extra.push_back(I.draft_ids[0]);
+    if (extra == I.draft_extra) return;             // the same conversation: the rows are already there
+    I.draft_stage.resize((size_t) I.draft_row * extra.size());
+    for (size_t k = 0; k < extra.size(); ++k)
+        std::memcpy(I.draft_stage.data() + I.draft_row * k, I.draft_src + I.draft_row * (size_t) extra[k], I.draft_row);
+    if (!extra.empty())
+        cudaMemcpyAsync((uint8_t*) I.draft_head.dev + I.draft_row * (size_t) I.draft_base, I.draft_stage.data(),
+                        I.draft_stage.size(), cudaMemcpyHostToDevice, (cudaStream_t) I.stream);
+    cudaStreamSynchronize((cudaStream_t) I.stream);
+    I.draft_ids.resize((size_t) I.draft_base);
+    I.draft_ids.insert(I.draft_ids.end(), extra.begin(), extra.end());
+    I.draft_head.n_out = I.draft_base + (int) extra.size();
+    I.draft_extra = std::move(extra);
+}
+
 bool DenseModel::mtp_draft(int32_t token, int pos, int max_n, float p_min, int32_t* out, int* n_out, std::string& err) {
     Impl& I = *impl_;
     *n_out = 0;
@@ -1475,13 +2221,14 @@ bool DenseModel::mtp_draft(int32_t token, int pos, int max_n, float p_min, int32
             dense_rms_norm(I.m_e, I.mtp.enorm, I.cat, 1, E, cfg_.rms_eps, s);
             dense_rms_norm(i == 0 ? I.h_last : I.mtp_h, I.mtp.hnorm, I.cat + E, 1, E, cfg_.rms_eps, s);
             I.mtp_block(cfg_, 1, pos + i, true, s);
-            dense_argmax_prob(I.mtp_logits, cfg_.n_vocab, I.d_tok, I.d_prob, s);
+            dense_argmax_prob(I.mtp_logits, I.draft_head.dev ? I.draft_head.n_out : cfg_.n_vocab, I.d_tok, I.d_prob, s);
             int id = -1;
             float prob = 0.0f;
             cudaMemcpyAsync(&id, I.d_tok, sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t) s);
             cudaMemcpyAsync(&prob, I.d_prob, sizeof(float), cudaMemcpyDeviceToHost, (cudaStream_t) s);
             if (!sync(err)) return false;
             if (prob < p_min) break;                    // not sure enough: this token is not offered
+            if (I.draft_head.dev) id = I.draft_ids[id]; // shortlist row -> token id (prob is over the shortlist)
             out[(*n_out)++] = id;
             tok = id;
         }

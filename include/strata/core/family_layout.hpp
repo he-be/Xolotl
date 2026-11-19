@@ -47,12 +47,23 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("attention.head_count_kv", g.n_head_kv);
     num("attention.key_length", key_length);
     num("attention.value_length", value_length);
-    num("expert_count", g.n_expert);
-    top_k = 10;
-    num("expert_used_count", top_k);
-    g.n_expert_used = top_k;
-    num("expert_feed_forward_length", g.n_ff);
-    num("expert_shared_feed_forward_length", g.n_ff_shexp);
+    // Route B: a file with no expert_count (or a zero one) is DENSE.  Its FFN width is feed_forward_length and it has
+    // no shared expert, so n_ff_shexp is 0 and there is no top-k.  Everything else is read the same way.
+    const strata::MetaValue* expert_count = meta.get(p + "expert_count");
+    if (expert_count == nullptr || (expert_count->is_num() && expert_count->u == 0)) {
+        g.n_expert = 0;
+        g.n_expert_used = 0;
+        g.n_ff_shexp = 0;
+        top_k = 0;
+        num("feed_forward_length", g.n_ff);
+    } else {
+        num("expert_count", g.n_expert);
+        top_k = 10;
+        num("expert_used_count", top_k);
+        g.n_expert_used = top_k;
+        num("expert_feed_forward_length", g.n_ff);
+        num("expert_shared_feed_forward_length", g.n_ff_shexp);
+    }
     num("ssm.conv_kernel", g.ssm_d_conv);
     num("ssm.state_size", g.ssm_state_size);
     num("ssm.group_count", g.ssm_k_heads);
@@ -82,10 +93,12 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         err = buf;
         return false;
     };
-    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
-        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 ||
+        g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
         g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
         return bad("a geometry key is zero or out of range");
+    if (g.has_experts() && (top_k <= 0 || top_k > g.n_expert))
+        return bad("expert_used_count is zero or above expert_count");
     if (value_length >= 0 && value_length != key_length) return bad("attention.key_length != attention.value_length");
     if (g.ssm_value_dim != g.ssm_state_size * g.ssm_v_heads) return bad("ssm.inner_size != ssm.state_size * ssm.time_step_rank");
     if (g.ssm_v_heads % g.ssm_k_heads) return bad("ssm.time_step_rank is not a multiple of ssm.group_count");
@@ -102,29 +115,39 @@ inline std::string compiled_geometry_mismatch(const ModelGeometry& g) {
     if (g.family != c.family)
         return std::string("the model is ") + strata::model_family_title(g.family) + ", this engine's kernels are built "
                "for " + strata::model_family_title(c.family);
+    // One field is run-time-sized rather than an instantiation's: a DENSE file's FFN width.  The dense path reads it as
+    // a GEMV argument (S4); only the routed/shared expert kernels have an FF contract, and a dense file has neither.
+    // It is normalised out here rather than listed as a mismatch.
+    //
+    // The HC bottleneck rank is NOT relaxed here even though the generic HC kernels take it at run time: the prompt
+    // path is a hand-written N=2560 / HC=4 / LR=320 fast path whose init refuses another geometry fatally
+    // (`src/prefill/prefill.cpp:1586`, called at `generate.cpp:18259`).  Admitting a 640-rank file here would move a
+    // clear load-time message into that failure.  See docs/qwen4/NINFER_PORT_GAPS.md §1/§6.
+    ModelGeometry cmp = g;
+    if (!cmp.has_experts()) { cmp.n_ff = c.n_ff; cmp.n_ff_shexp = c.n_ff_shexp; }
     struct F {
         const char* what;
         int64_t got, want;
     };
     const F fields[] = {
-        {"embedding_length", g.n_embd, c.n_embd},
-        {"the layer count", g.n_layers, c.n_layers},
-        {"full_attention_interval", g.qsa_interval, c.qsa_interval},
-        {"ssm.state_size", g.ssm_state_size, c.ssm_state_size},
-        {"ssm.group_count", g.ssm_k_heads, c.ssm_k_heads},
-        {"ssm.time_step_rank", g.ssm_v_heads, c.ssm_v_heads},
-        {"ssm.conv_kernel", g.ssm_d_conv, c.ssm_d_conv},
-        {"the GDN conv channels", g.ssm_conv_channels, c.ssm_conv_channels},
-        {"ssm.inner_size", g.ssm_value_dim, c.ssm_value_dim},
-        {"attention.head_count", g.n_head, c.n_head},
-        {"attention.head_count_kv", g.n_head_kv, c.n_head_kv},
-        {"attention.key_length", g.head_dim, c.head_dim},
-        {"attention.indexer.head_count", g.idx_q_heads, c.idx_q_heads},
-        {"attention.indexer.key_length", g.idx_key_dim, c.idx_key_dim},
-        {"hyper_connection.count", g.hc, c.hc},
-        {"hyper_connection.low_rank", g.hc_lr, c.hc_lr},
-        {"expert_feed_forward_length", g.n_ff, c.n_ff},
-        {"expert_shared_feed_forward_length", g.n_ff_shexp, c.n_ff_shexp},
+        {"embedding_length", cmp.n_embd, c.n_embd},
+        {"the layer count", cmp.n_layers, c.n_layers},
+        {"full_attention_interval", cmp.qsa_interval, c.qsa_interval},
+        {"ssm.state_size", cmp.ssm_state_size, c.ssm_state_size},
+        {"ssm.group_count", cmp.ssm_k_heads, c.ssm_k_heads},
+        {"ssm.time_step_rank", cmp.ssm_v_heads, c.ssm_v_heads},
+        {"ssm.conv_kernel", cmp.ssm_d_conv, c.ssm_d_conv},
+        {"the GDN conv channels", cmp.ssm_conv_channels, c.ssm_conv_channels},
+        {"ssm.inner_size", cmp.ssm_value_dim, c.ssm_value_dim},
+        {"attention.head_count", cmp.n_head, c.n_head},
+        {"attention.head_count_kv", cmp.n_head_kv, c.n_head_kv},
+        {"attention.key_length", cmp.head_dim, c.head_dim},
+        {"attention.indexer.head_count", cmp.idx_q_heads, c.idx_q_heads},
+        {"attention.indexer.key_length", cmp.idx_key_dim, c.idx_key_dim},
+        {"hyper_connection.count", cmp.hc, c.hc},
+        {"hyper_connection.low_rank", cmp.hc_lr, c.hc_lr},
+        {"expert_feed_forward_length", cmp.n_ff, c.n_ff},
+        {"expert_shared_feed_forward_length", cmp.n_ff_shexp, c.n_ff_shexp},
         // not the in-file MTP layers: Flash-Next's engine runs the trunk and takes its draft head from --mtp, so a GGUF
         // with llama.cpp's NextN block after the trunk (block_count 49, nextn_predict_layers 1) runs as the plain one
     };
@@ -158,15 +181,22 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
-    // MoE, every layer (the MTP block's too)
-    add("ffn_gate_inp.weight", {N, NE});
-    add("ffn_gate_inp_shexp.weight", {N});
-    add("ffn_gate_shexp.weight", {N, FS});
-    add("ffn_up_shexp.weight", {N, FS});
-    add("ffn_down_shexp.weight", {FS, N});
-    add("ffn_gate_exps.weight", {N, FF, NE});
-    add("ffn_up_exps.weight", {N, FF, NE});
-    add("ffn_down_exps.weight", {FF, N, NE});
+    if (g.has_experts()) {
+        // MoE, every layer (the MTP block's too)
+        add("ffn_gate_inp.weight", {N, NE});
+        add("ffn_gate_inp_shexp.weight", {N});
+        add("ffn_gate_shexp.weight", {N, FS});
+        add("ffn_up_shexp.weight", {N, FS});
+        add("ffn_down_shexp.weight", {FS, N});
+        add("ffn_gate_exps.weight", {N, FF, NE});
+        add("ffn_up_exps.weight", {N, FF, NE});
+        add("ffn_down_exps.weight", {FF, N, NE});
+    } else {
+        // Route B: the dense FFN, in the same orientation the dense engine and `ffn_gate_shexp` use
+        add("ffn_gate.weight", {N, FF});
+        add("ffn_up.weight", {N, FF});
+        add("ffn_down.weight", {FF, N});
+    }
     if (g.has_hyper_connections()) {
         // gated residual (Flash-Next): `gr_read` transposes, so the file's orientation is [hc_dim, hc_lr] / [hc_lr, hc_dim]
         const int64_t H = g.hc_dim();
