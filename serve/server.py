@@ -3438,6 +3438,12 @@ def on_demand_vision(cfg: dict, vcfg: dict) -> dict:
     upstream's "elastic" (Service._vision_up), and the local "lazy" (Service.start_lazy_vision), whose encoder found the
     card full without it - its cudaMalloc failed and the first picture's request got no answer."""
     elastic_cache = cfg.get("vram_elastic") is True or "--vram-elastic" in (cfg.get("args") or [])
+    # the resident low-RAM mode's expert cache holds experts RAM does not, so it cannot shrink for the encoder either
+    # (the engine logs "not with the resident low-RAM mode"; the first picture got a 503 OOM, 20 Nov 2026)
+    if "--resident-experts" in (cfg.get("args") or []) and (vcfg.get("lazy") or vcfg.get("elastic") is True) and vcfg.get("gpu"):
+        print('[strata] --resident-experts: the expert cache cannot shrink for an on-demand vision encoder (it holds '
+              "experts RAM does not): the encoder starts with the model instead", flush=True)
+        return {**vcfg, "lazy": False, "elastic": False}
     if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
         print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
               "encoder its VRAM): the encoder starts with the model instead", flush=True)
@@ -5067,6 +5073,19 @@ class Service:
             self.reasoning_close_text = atem.REASONING_CLOSE
             self.reasoning_wrap_up_text = atem.REASONING_WRAP_UP
             self.answer_open_text = atem.ANSWER_OPEN
+        elif family in ("inkling2", "inkling2_loop"):
+            # Inkling-2-Mini: its turn is message blocks (thinking, text, "<|message_model|>NAME<|content_invoke_tool_json|>
+            # {json}" calls), each closed by <|end_message|>; only <|content_model_end_sampling|> (200006) ends the turn.
+            # serve/inkling.py reads the blocks as the Qwen form and renders the model's own chat template
+            from serve import inkling
+            sid = getattr(self.tok, "special_ids", None) or {}
+            eos = sid.get("eos")
+            self.stop_ids = {int(eos)} if eos is not None else {inkling.EOS_ID}
+            self.parser_cls = inkling.InklingOutputParser
+            self._force_text = inkling.to_inkling_force
+            self.reasoning_close_text = inkling.REASONING_CLOSE
+            self.reasoning_wrap_up_text = inkling.REASONING_WRAP_UP
+            self.answer_open_text = inkling.ANSWER_OPEN
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -6151,6 +6170,12 @@ class Service:
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
+        if self.family in ("inkling2", "inkling2_loop"):
+            # Inkling-2-Mini's template has no generation prompt (the model writes <|message_model|> itself) and takes
+            # its thinking effort as a template variable; serve/inkling.py renders it (parity-tested against the
+            # official chat_template.jinja).  Its own effort line is the model's, so #458's effort_end does not apply.
+            from serve import inkling
+            return inkling.render(messages, tools, reasoning_effort=inkling.effort_from_kwargs(kwargs))
         if self.preserve_thinking is not None and "preserve_thinking" not in kwargs:
             kwargs = {**kwargs, "preserve_thinking": self.preserve_thinking}   # the config's default for the flag
         if self.add_vision_id is not None and "add_vision_id" not in kwargs:
@@ -6797,8 +6822,11 @@ class Service:
         if ka is not None:
             ka.acquire()
         reasoning, content, calls = [], [], []
+        trace = LiveTrace.open(ids, thinking, max_new)
         try:
             for item in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only):
+                if trace is not None and not trace.add(item):
+                    trace = None
                 if item[0] == "event" and item[1].kind in ("reasoning", "content"):
                     (reasoning if item[1].kind == "reasoning" else content).append(item[1].text or "")
                 elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
@@ -6807,6 +6835,8 @@ class Service:
                     self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
                 yield item
         finally:
+            if trace is not None:
+                trace.close()
             if ka is not None:
                 ka.release()
 
@@ -7473,6 +7503,58 @@ class Service:
         if rejected:
             done["rejected_tool_calls"] = rejected
         yield "done", done
+
+
+class LiveTrace:
+    """Opt-in live trace of every generation (STRATA_TRACE_DIR=<dir>): one plain-text file per request, written as the
+    tokens arrive, so a test's thinking can be read (tail -f) while it runs and survives a run that is stopped or
+    killed. Thinking, answer text and tool calls in order, then the finish line. Off (None) unless the variable names a
+    directory; a write that fails turns the trace off for that request and never fails the request."""
+    _seq = itertools.count(1)
+
+    def __init__(self, path: Path, head: str):
+        self.path, self.kind, self.f = path, None, open(path, "w", encoding="utf-8")
+        self.f.write(head + "\n")
+        self.f.flush()
+
+    @classmethod
+    def open(cls, ids, thinking, max_new):
+        d = os.environ.get("STRATA_TRACE_DIR", "").strip()
+        if not d:
+            return None
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+            n = next(cls._seq)
+            return cls(Path(d) / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{n:04d}.txt",
+                       f"# request {n} at {time.strftime('%F %T')}: prompt {len(ids)} tokens, "
+                       f"thinking {'on' if thinking else 'off'}, max_new {max_new}")
+        except OSError as e:
+            print(f"[strata] STRATA_TRACE_DIR: cannot write a trace in {d}: {e}", flush=True)
+            return None
+
+    def add(self, item) -> bool:
+        try:
+            kind, x = item
+            if kind == "event" and x.kind in ("reasoning", "content"):
+                if x.kind != self.kind:
+                    self.f.write(f"\n=== {'thinking' if x.kind == 'reasoning' else 'answer'} ===\n")
+                    self.kind = x.kind
+                self.f.write(x.text or "")
+            elif kind == "event" and x.kind == "tool_call" and x.call is not None:
+                self.f.write(f"\n=== tool call: {x.call.name} {json.dumps(x.call.arguments, ensure_ascii=False)}\n")
+                self.kind = None
+            elif kind == "done":
+                self.f.write(f"\n=== done: finish {x.get('finish')}, {x.get('completion_tokens')} tokens "
+                             f"({x.get('reasoning_tokens')} thinking) at {time.strftime('%T')}\n")
+            self.f.flush()
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self.f.close()
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -10578,6 +10660,10 @@ MODEL_CARD_SAMPLING = {
     # notes: 1.0 skips it, 0.6 / top_p 0.9 / top_k 20 gives clean calls)
     "muse-glimmer": {"thinking": {"temperature": 0.6, "top_p": 0.9, "top_k": 20},
                      "instruct": {"temperature": 0.6, "top_p": 0.9, "top_k": 20}},
+    # Inkling-2-Mini: its generation_config.json recommends temperature 1.0 with do_sample (no top_p/top_k given, so
+    # the engine's own off values stay)
+    "inkling2": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
+    "inkling2_loop": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
 }
 
 
@@ -11064,7 +11150,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer") else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer", "inkling2", "inkling2_loop")
+                       else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

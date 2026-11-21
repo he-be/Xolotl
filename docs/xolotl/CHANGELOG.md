@@ -8,6 +8,50 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### LoRA training proven end to end on QFN: a harness adapter trained from the served engine's activations (21 Nov, later)
+
+**A real fine-tune works** - [docs/LORA_TRAINING.md](../LORA_TRAINING.md#how-it-works-a-lora-for-a-125b-moe-on-one-gaming-pc).
+A rank-16 LoRA on Qwen3.8-Flash-Next's top four layers, trained on the RTX 4090 from activations the **served engine**
+captured (prefix + window prefill, quantized base, YaRN rope, layer 47's own sparse selection replayed), with the real
+next-token loss on agent transcripts (QuetzaCodetl / Claude Code sessions, assistant turns only). On 12 windows for 36
+steps (~6 min) the loss on two held-out windows fell **1.4116 -> 1.3197 (-6.5 %)**. Before training, the trainer's
+forward reproduced the engine on a real 21,686-position window (loss 1.7798 CPU / 1.7780 GPU vs the engine's 1.7795).
+New: the harness data builder and request capture, the capture driver, the QFN top-4 stack with the prefix carry, the
+GPU trainer (`tools/train/qfn_harness_train.cpp`) with live loss graphs (`lossplot.py`). Two CUDA fixes for training
+shapes in `xolotl-ggml.patch` (OUT_PROD with a cuBLAS-invalid view stride, REPEAT_BACK beyond the grid-z limit) - both
+backward-only ops, so inference is unchanged; rebuild after `fetch-llama.sh`.
+
+**Option, experimental: fast capture through `--serve`** - one engine, the root checkpoint at the prefix end: 2.6-3.6 s
+per window instead of 66-137 s. Opt-in engine flag `STRATA_KVA_CAPTURE_PER_REQ=1` (off = unchanged). **Its window rows
+do not match the slow capture yet** (median relative error 0.12-0.13 per row, prefix rows bit-identical), so do not
+train on it until that is explained - details in the doc.
+
+### LoRA training (experimental), the Hy4-flash engine, FP8 Qwen4-Exp n-gram tables, Windows build fix (21 Nov)
+
+**LoRA training, experimental** - [docs/LORA_TRAINING.md](../LORA_TRAINING.md). Backward kernels for training adapters
+on the MoE models Xolotl serves with the base frozen and quantized as served: OUT_PROD with a quantized weight on CUDA,
+the backward rules ggml lacked (SIGMOID, SWIGLU_CLAMP, CONCAT, CLAMP, GET_ROWS_BACK, SOLVE_TRI upper, TRI, CUMSUM,
+SSM_CONV, PAD), the chunked gated delta net and the MoE expert loop as differentiable graphs, a Hy4-flash trainer and
+QFN trainers on real pack weights, adapters written in llama.cpp's LoRA GGUF format (llama.cpp loads them). Every piece
+has finite-difference and reference gates. **Real fine-tuning is not proven yet** - the runs so far fit a fixed target.
+Nothing changes for inference: every ggml change is in the backward pass or in SOLVE_TRI's new upper variant, and
+DeepSeek-V4.1 greedy output (96 tokens, served settings) is identical to main's when both runs get the same number of
+VRAM expert slots - the slot count follows the card's free VRAM, and one slot more or less moves main's own output too.
+
+**Hy4-flash engine** (`tools/hy4/`, built only when asked): geometry + tensor map, the Engram shard writer (F8_E4M3,
+byte-exact vs Tencent), the dense half on CUDA passing the golden gate, experts on the DeepSeek-V4.1 tier, k-pool
+selection. `ds41_moe.cpp`'s expert cap is now `DS41_MOE_MAX_K` (default 8: DeepSeek-V4.1 builds unchanged).
+
+**FP8 Qwen4-Exp checkpoints from upstream llama.cpp's converter** (#32476) load: the n-gram table arrives as GGML type
+43 = F8_E4M3 with its scale in `per_layer_token_embd.scale`. 43 is also MXFP8 in older DeepSeek-V4.1 GGUFs (llama.cpp
+#30817, closed unmerged), so the reader tells the two apart by the tensor's size; MXFP8 files read exactly as before.
+
+**Windows:** `src/kernels/cuda/expert_keep.cu` builds with MSVC again (#143, reported and verified by
+[kelheor](https://github.com/kelheor)). Also: the Q2_0 AVX2 row kernel unpacks codes in 7 ops instead of ~8.5
+(llama.cpp #30447, homeofe; bit-identical, one token 1.28-1.58x faster a row), opt-in `STRATA_TRACE_DIR` live
+thinking traces in serve, a serve test that no longer breaks other tests under `unittest discover`, and ERNIE 5.5
+Flash (`ernie5_5`) is recognised - geometry and tensor map - and refused with a clear message (no execution path yet).
+
 ### DeepSeek-V4.1 decode switches on by default, agent tasks 42.7 tok/s (19 Nov)
 
 `tools/v41/serve/ds41-engine.sh` now turns on [Keisawaakira](https://github.com/Keisawaakira)'s decode set
