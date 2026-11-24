@@ -2863,6 +2863,7 @@ int main(int argc, char** argv) {
     std::string gguf_path, ids_arg, out_dir, cpu_exps, dspark_path, dspark_prefix;
     bool mtp = false;   // --mtp: the DSpark (MTP) drafter built into the model GGUF (tools/inkling/embed_dspark.py)
     std::string mmproj_path, vision_device = "auto";   // --mmproj: the image tower
+    int encode_max_tokens = 0;
     std::vector<std::string> encode_imgs, encode_outs;   // --encode pairs (one Encoder, N pictures)
     bool serve = false, dump = false, park_copy = true;
     ggml_type kv_k = GGML_TYPE_F16, kv_v = GGML_TYPE_F16;
@@ -2925,6 +2926,7 @@ int main(int argc, char** argv) {
             if (vision_device != "cpu" && vision_device != "gpu" && vision_device != "auto") { std::fprintf(stderr, "xolotl-inkling: --vision-device takes cpu or gpu\n"); return 2; }
         }
         else if (a == "--encode") { encode_imgs.push_back(val()); encode_outs.push_back(val()); }
+        else if (a == "--encode-max-tokens") encode_max_tokens = std::atoi(val().c_str());   // as llama.cpp --image-max-tokens
         else if (a == "--ids") {   // a,b,c,... or @file holding that list (long contexts overflow argv)
             ids_arg = val();
             if (!ids_arg.empty() && ids_arg[0] == '@') { std::ifstream f(ids_arg.substr(1)); std::stringstream ss; ss << f.rdbuf(); ids_arg = ss.str(); while (!ids_arg.empty() && std::isspace((unsigned char) ids_arg.back())) ids_arg.pop_back(); }
@@ -2955,7 +2957,7 @@ int main(int argc, char** argv) {
         int rc = 0;
         for (size_t i = 0; i < encode_imgs.size(); ++i) {
             const auto t0 = Clock::now();
-            const int rows = inkling_vision::encode(*ve, encode_imgs[i], encode_outs[i], 0, verr);
+            const int rows = inkling_vision::encode(*ve, encode_imgs[i], encode_outs[i], encode_max_tokens, verr);
             if (rows <= 0) { std::printf("ERR %s\n", verr.c_str()); rc = 1; break; }
             std::printf("OK %d %d 1 %.0f\n", rows, rows, ms_since(t0));
             std::fflush(stdout);

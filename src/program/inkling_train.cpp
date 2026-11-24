@@ -93,7 +93,8 @@ struct Args {
     float alpha = 32.0f, lr = 1e-4f, clip = 1.0f, init_b = 0.0f, lr_min = 0.1f;
 };
 
-struct Window { std::vector<int32_t> ids; std::vector<uint8_t> mask; };
+// media: an SVE1 embeddings file (xolotl-inkling --encode) whose rows replace the window's image tokens, in order
+struct Window { std::vector<int32_t> ids; std::vector<uint8_t> mask; std::string media; };
 
 // {"ids":[...], "mask":[...], ...} per line
 static bool parse_int_array(const std::string& s, const char* key, std::vector<long long>& out) {
@@ -125,6 +126,13 @@ static std::vector<Window> load_windows(const std::string& path, int max_t) {
         if (line.empty() || !parse_int_array(line, "ids", ids)) continue;
         if (!parse_int_array(line, "mask", mask) || mask.size() != ids.size()) die("--train: a window without a matching mask in " + path);
         Window x;
+        {   // "media":"<path>" (optional)
+            const size_t mp = line.find("\"media\"");
+            if (mp != std::string::npos) {
+                const size_t q0 = line.find('"', line.find(':', mp) + 1), q1 = q0 == std::string::npos ? q0 : line.find('"', q0 + 1);
+                if (q1 != std::string::npos) x.media = line.substr(q0 + 1, q1 - q0 - 1);
+            }
+        }
         const size_t n = std::min<size_t>(ids.size(), (size_t) max_t);
         for (size_t i = 0; i < n; ++i) { x.ids.push_back((int32_t) ids[i]); x.mask.push_back(mask[i] ? 1 : 0); }
         int nl = 0;
@@ -323,6 +331,8 @@ struct Trainer {
         return ggml_cont(c, ggml_view_2d(c, l, h.n_vocab, l->ne[1], l->nb[1], 0));
     }
 
+    // image windows: the encoder's rows go in raw at the image tokens (never normed), as the served graph blends them
+    std::string cur_media;
     std::vector<float> embed(const std::vector<int32_t>& ids) {
         const int64_t E = h.n_embd, T = (int64_t) ids.size();
         std::vector<float> raw((size_t) E * T);
@@ -339,7 +349,21 @@ struct Trainer {
         G g{m, h, gg.c, gg.gf, st, (int) T, 0};
         ggml_tensor* x = g.rms(gg.f32(raw.data(), E, T), m.tok_norm);
         gg.run(be, nullptr, {x});
-        return fetch(x);
+        std::vector<float> res = fetch(x);
+        if (!cur_media.empty()) {
+            static const std::vector<int32_t> mids = token_ids_named(m, {"<|unused_200054|>"});
+            std::vector<float> rows; std::string err;
+            if (!read_media(cur_media, (int) E, rows, err)) die("--train: " + err);
+            size_t k = 0;
+            for (int64_t t = 0; t < T; ++t) {
+                if (std::find(mids.begin(), mids.end(), ids[t]) == mids.end()) continue;
+                if ((k + 1) * (size_t) E > rows.size()) die("--train: " + cur_media + " has fewer rows than the window has image tokens");
+                std::memcpy(&res[(size_t) t * E], &rows[k * (size_t) E], (size_t) E * sizeof(float));
+                ++k;
+            }
+            if (k * (size_t) E != rows.size()) die("--train: " + cur_media + ": " + std::to_string(rows.size() / E) + " rows, the window has " + std::to_string(k) + " image tokens (was it cut by --max-t?)");
+        }
+        return res;
     }
 
     // forward every visit; X[id] = the streams. Returns the head's normed stream.
@@ -413,6 +437,7 @@ struct Trainer {
     double step_window(const Window& w, bool grads) {
         const int T = (int) w.ids.size();
         std::vector<std::vector<float>> X;
+        cur_media = w.media;
         const std::vector<float> xf = forward_streams(w.ids, X);
         std::vector<float> dxf;
         const double loss = head_ce(w, xf, grads ? &dxf : nullptr);
