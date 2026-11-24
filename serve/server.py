@@ -1993,6 +1993,11 @@ class StrataEngine:
             # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on the
             # spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a spare CPU
             # ignores a 1).  Anything else is not sent.
+            # --lora for this request (the Inkling engine): false/0 runs the base weights, e.g. the steps of a pipeline
+            # the adapter was not trained on.  The engine restarts its cached state when this changes.
+            lo = tune.get("lora")
+            if isinstance(lo, bool) or (isinstance(lo, int) and lo in (0, 1)):
+                keys += f" lora={int(lo)}"
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"

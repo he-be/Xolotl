@@ -282,6 +282,7 @@ struct Model {
     // --lora: one LoRA adapter (xolotl-inkling --train output) applied on top of the base weights in G::mm()
     std::unordered_map<const ggml_tensor*, InkLora> lora;
     float lora_scale = 1.0f;
+    bool lora_on = true;             // GEN lora=0|1: the adapter for this request (the state is restarted when it changes)
     ggml_context* lora_ctx = nullptr;
     ggml_backend_buffer_t lora_buf = nullptr;
     int64_t route_records = 0;
@@ -2131,7 +2132,7 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
 
     G g{m, h, c, s.gf, s, T, p0};
     g.st = m.st;
-    if (!m.lora.empty()) { g.lora = &m.lora; g.lora_scale = m.lora_scale; }
+    if (!m.lora.empty() && m.lora_on) { g.lora = &m.lora; g.lora_scale = m.lora_scale; }
     g.route = m.route_fp != nullptr;
     // log-scaled positions for the global layers: 1 + alpha*log(max(1, (pos + 1)/floor))
     ggml_tensor* tau = ggml_scale_bias(c, s.posf, 1.0f, 1.0f);
@@ -2605,6 +2606,7 @@ struct Ckpt {
     std::vector<int64_t> ring_pos;
     // serve: the tokens 0..pos-1 the checkpoint stands for, the drafter at that position, and an LRU stamp
     std::vector<int32_t> toks;
+    std::vector<std::pair<size_t, uint64_t>> mh;   // (position, row hash) of the image tokens in 0..pos-1
     DsparkSnap ds;
     bool has_ds = false;
     uint64_t used = 0;
@@ -3323,13 +3325,35 @@ int main(int argc, char** argv) {
     std::vector<Ckpt> cks;
     const size_t ck_cap = (size_t) std::max(1, std::getenv("XOLOTL_INKLING_CKPTS") ? std::atoi(std::getenv("XOLOTL_INKLING_CKPTS")) : 4);
     uint64_t ck_clock = 0;
-    auto ck_take = [&](const std::vector<int32_t>& toks, int64_t p, bool with_ds) {
+    // image rows: the token history alone does not tell two pictures apart (the same pad ids), so the state keeps a
+    // hash of every image token's row beside `fed` (fed_mh) and each checkpoint keeps its own; a prompt is reused past
+    // a picture only when its rows hash the same
+    using MediaHashes = std::vector<std::pair<size_t, uint64_t>>;
+    MediaHashes fed_mh;
+    auto mh_below = [](const MediaHashes& v, size_t q) {
+        MediaHashes out;
+        for (const auto& e : v) if (e.first < q) out.push_back(e);
+        return out;
+    };
+    // the first position below `lim` where the two images' rows differ (a position only one of them has counts), else lim
+    auto mh_diverge = [](const MediaHashes& a, const MediaHashes& b, size_t lim) {
+        size_t i = 0, j = 0;
+        for (;;) {
+            const size_t pa = i < a.size() ? a[i].first : SIZE_MAX, pb = j < b.size() ? b[j].first : SIZE_MAX;
+            const size_t p = std::min(pa, pb);
+            if (p >= lim) return lim;
+            if (pa != pb || a[i].second != b[j].second) return p;
+            ++i; ++j;
+        }
+    };
+    auto ck_take = [&](const std::vector<int32_t>& toks, const MediaHashes& mh, int64_t p, bool with_ds) {
         Ckpt* t = nullptr;
         for (Ckpt& c : cks) if (c.pos == p) { t = &c; break; }
         if (!t && cks.size() < ck_cap) { cks.emplace_back(); t = &cks.back(); }
         if (!t) { t = &cks[0]; for (Ckpt& c : cks) if (c.used < t->used) t = &c; }
         ckpt_take(m, *t, p);
         t->toks.assign(toks.begin(), toks.begin() + (long) p);
+        t->mh = mh_below(mh, (size_t) p);
         t->has_ds = with_ds && m.dspark;
         if (t->has_ds) dspark_snap(*m.dspark, t->ds);
         t->used = ++ck_clock;
@@ -3341,6 +3365,7 @@ int main(int argc, char** argv) {
             const size_t q = (size_t) c.pos;
             bool ok = c.pos > 0 && (q <= resume ||
                       (q <= fed.size() && std::equal(c.toks.begin() + (long) resume, c.toks.begin() + (long) q, fed.begin() + (long) resume)));
+            ok = ok && (q <= resume || mh_diverge(c.mh, fed_mh, q) == q);   // cells resume..q-1 hold the same pictures
             if (ok) keep.push_back(std::move(c));
         }
         cks.swap(keep);
@@ -3348,7 +3373,6 @@ int main(int argc, char** argv) {
     // the image token: the chat template writes `<|content_image|>` then one `<|unused_200054|>` per encoder row
     const std::vector<int32_t> media_ids = token_ids_named(m, {"<|unused_200054|>"});
     auto is_media = [&](int32_t t) { return std::find(media_ids.begin(), media_ids.end(), t) != media_ids.end(); };
-    size_t fed_media = SIZE_MAX;  // the first image token the state has read (its rows are not in `fed`)
     std::vector<float> lg;
     std::string line;
     const size_t need_mib = (m.weight_bytes >> 20) + (m.state_bytes >> 20) + 1200;
@@ -3421,6 +3445,7 @@ int main(int argc, char** argv) {
         strata::kernels::SamplerParams sp;
         sp.top_k = 20; sp.top_p = 1.0f; sp.temperature = 0.0f; sp.greedy = true;
         unsigned long long seed = 0;
+        int lora_req = 1;   // lora=0: this request runs the base weights (an adapter trained for one step of a pipeline)
         std::vector<int32_t> score_ids;
         bool score_bad = false;
         for (;;) {
@@ -3442,6 +3467,7 @@ int main(int argc, char** argv) {
             else if (key == "penalty_freq") sp.penalty_freq = fv;
             else if (key == "penalty_present") sp.penalty_present = fv;
             else if (key == "seed") seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+            else if (key == "lora") lora_req = std::atoi(tok.c_str() + eq + 1) != 0;
             else if (key == "score") {
                 score_bad = !parse_ids(tok.c_str() + eq + 1, score_ids) || score_ids.size() > 64;
                 for (const int32_t id : score_ids) score_bad = score_bad || id >= n_vocab;
@@ -3468,13 +3494,23 @@ int main(int argc, char** argv) {
         // ---- the image rows (GENI): one per image token, in prompt order
         std::vector<float> media;
         std::vector<int64_t> media_row(ids.size(), -1);
-        size_t first_media = ids.size();
+        MediaHashes req_mh;   // (position, row hash) of this prompt's image tokens
         if (geni) {
             std::string err;
             if (!read_media(media_path, m.hp.n_embd, media, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
             int64_t k = 0;
             for (size_t i = 0; i < ids.size(); ++i)
-                if (is_media(ids[i])) { media_row[i] = k++; first_media = std::min(first_media, i); }
+                if (is_media(ids[i])) media_row[i] = k++;
+            if ((size_t) k * m.hp.n_embd == media.size()) {
+                const size_t row_bytes = (size_t) m.hp.n_embd * sizeof(float);
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    if (media_row[i] < 0) continue;
+                    const unsigned char* b = reinterpret_cast<const unsigned char*>(media.data() + (size_t) media_row[i] * m.hp.n_embd);
+                    uint64_t h = 1469598103934665603ULL;   // FNV-1a over the row's bytes
+                    for (size_t x = 0; x < row_bytes; ++x) { h ^= b[x]; h *= 1099511628211ULL; }
+                    req_mh.emplace_back(i, h | 1);
+                }
+            }
             if ((size_t) k * m.hp.n_embd != media.size()) {
                 std::printf("ERR the prompt has %lld image tokens but the embeddings file %zu rows\n", (long long) k, media.size() / m.hp.n_embd);
                 std::fflush(stdout);
@@ -3482,16 +3518,24 @@ int main(int argc, char** argv) {
             }
         }
 
+        // lora=0|1 differs from the last request: every cached cell and checkpoint was computed with the other weights,
+        // and the graphs have the other projections built in - start over
+        if (!m.lora.empty() && (lora_req != 0) != m.lora_on) {
+            m.lora_on = lora_req != 0;
+            drop_graph(m);
+            for (auto& gsl : m.vg) if (gsl.last) { ggml_free(gsl.last->ctx); delete gsl.last; gsl.last = nullptr; for (int64_t& k : gsl.key) k = -1; }
+            state_reset(m); fed.clear(); fed_mh.clear(); cks.clear();
+            if (m.dspark) dspark_reset(*m.dspark);
+        }
         // ---- what of the state can be kept (the conv state is recurrent: append, or the checkpoint, or restart)
         size_t common = 0;
         {
             const size_t lim = std::min(fed.size(), ids.size());
             while (common < lim && fed[common] == ids[common]) ++common;
         }
-        // the state's token history does not carry the encoder rows: only reuse up to the first image token and up to
-        // the first media token the state already read (a new picture with the same pad ids is a different prompt)
-        common = std::min(common, first_media);
-        common = std::min(common, fed_media);
+        // the token history does not carry the encoder rows: reuse stops at the first image token whose row differs
+        // from the one the state read there (a new picture with the same pad ids is a different prompt)
+        common = mh_diverge(req_mh, fed_mh, common);
         size_t resume = 0;
         const DsparkSnap* ds_restored = nullptr;
         try {
@@ -3500,7 +3544,8 @@ int main(int argc, char** argv) {
                 Ckpt* best = nullptr;   // the furthest checkpoint inside the new prompt
                 for (Ckpt& c : cks)
                     if (c.pos > 0 && (size_t) c.pos < ids.size() && (size_t) c.pos <= common && (!best || c.pos > best->pos) &&
-                        std::equal(c.toks.begin(), c.toks.end(), ids.begin())) best = &c;
+                        std::equal(c.toks.begin(), c.toks.end(), ids.begin()) &&
+                        mh_diverge(c.mh, req_mh, (size_t) c.pos) == (size_t) c.pos) best = &c;
                 if (best) {
                     ckpt_restore(m, *best); resume = (size_t) best->pos; best->used = ++ck_clock;
                     if (best->has_ds) ds_restored = &best->ds;
@@ -3508,14 +3553,15 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) { std::printf("ERR %s\n", e.what()); std::fflush(stdout); continue; }
         fed.assign(ids.begin(), ids.begin() + (long) resume);
+        fed_mh = mh_below(fed_mh, resume);
         bool spec_ok = false;
         if (m.dspark && ds_restored) { dspark_restore(*m.dspark, *ds_restored); spec_ok = true; }   // the drafter as it was there
         else spec_ok = m.dspark && dspark_rewind(*m.dspark, (int64_t) resume);
         if (m.dspark && !spec_ok) {   // the drafter is behind the target: restart both (rare: a drafter-less request ran)
-            state_reset(m); dspark_reset(*m.dspark); resume = 0; fed.clear(); spec_ok = true;
+            state_reset(m); dspark_reset(*m.dspark); resume = 0; fed.clear(); fed_mh.clear(); spec_ok = true;
         }
         std::vector<float> dt_pp;
-        fed_media = first_media < ids.size() ? first_media : SIZE_MAX;
+        for (const auto& e : req_mh) if (e.first >= resume) fed_mh.push_back(e);   // trimmed to fed below if the read stops
 
         // ---- the prompt (a chunk whose compute buffer does not fit is read in halves)
         std::vector<float> chunk_media, chunk_sel;
@@ -3556,12 +3602,12 @@ int main(int argc, char** argv) {
                     run(p, T - 1);
                     fed.insert(fed.end(), ids.begin() + (long) p, ids.begin() + (long) (p + T - 1));
                     p += T - 1;
-                    ck_take(ids, (int64_t) p, spec_ok);
+                    ck_take(ids, req_mh, (int64_t) p, spec_ok);
                     run(p, 1);
                     fed.push_back(ids[p]);
                     p += 1;
                 } else {
-                    if (last) ck_take(ids, (int64_t) p, spec_ok);
+                    if (last) ck_take(ids, req_mh, (int64_t) p, spec_ok);
                     run(p, T);
                     fed.insert(fed.end(), ids.begin() + (long) p, ids.begin() + (long) (p + T));
                     p += T;
@@ -3574,10 +3620,11 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             std::fprintf(stderr, "xolotl-inkling: %s\n", e.what());
             std::printf("ERR %s\n", e.what()); std::fflush(stdout);
-            fed.clear(); cks.clear();
+            fed.clear(); fed_mh.clear(); cks.clear();
             failed = true;
         }
         if (failed) continue;
+        fed_mh = mh_below(fed_mh, fed.size());   // a cancelled read holds only the part it reached
         const double prompt_ms = ms_since(t_prompt);
         if (in.stop.load()) {
             ck_settle(resume);
@@ -3665,7 +3712,7 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "xolotl-inkling: %s\n", e.what());
-            fed.clear(); cks.clear();
+            fed.clear(); fed_mh.clear(); cks.clear();
             why = "cancel";
         }
         ck_settle(resume);
