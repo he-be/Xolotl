@@ -701,8 +701,9 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             const char * ce = std::getenv("STRATA_DENSE_REQUANT_CACHE");
             if (ce && *ce) rq_dir = std::strcmp(ce, "0") == 0 ? "" : ce;
             else if (model.size() > 0) {
+                // both separators: a Windows model path is "C:\...\x.gguf", where a '/' split finds nothing (#145)
                 const std::string mp0 = model.shard(0).path();
-                const size_t sl0 = mp0.find_last_of('/');
+                const size_t sl0 = mp0.find_last_of("/\\");
                 rq_dir = (sl0 == std::string::npos ? std::string(".") : mp0.substr(0, sl0)) + "/xolotl-cache";
                 if (ds41_sys::mkdir(rq_dir.c_str()) != 0 && errno != EEXIST) {
                     std::fprintf(stderr, "dense requant cache: cannot create %s (%s) - off (STRATA_DENSE_REQUANT_CACHE=<dir> to choose one)\n",
@@ -722,7 +723,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             ds41_sys::FileStat st;
             const std::string mp = model.shard(0).path();
             if (want > 0 && ds41_sys::stat_file(mp.c_str(), &st)) {
-                const size_t sl = mp.find_last_of('/');
+                const size_t sl = mp.find_last_of("/\\");     // the bare file name, never the drive or folders (#145)
                 char key[160];
                 std::snprintf(key, sizeof key, ".%llx.%llx.%s.%s.h%d.dense-rq", (unsigned long long) st.size,
                               (unsigned long long) st.mtime, rq != GGML_TYPE_COUNT ? ggml_type_name(rq) : "none",
@@ -955,6 +956,17 @@ static int attn_tail_mode() {
     return m >= 1 && m <= 3 ? m : 0;
 }
 static bool attn_tail() { return attn_tail_mode() > 0; }
+
+// STRATA_ROUTE_METER (with the smart router, default on): read back the exact top-k beside the biased picks, only for
+// the log line "routing vs exact: N% of expert picks swapped".  The protect / pool ranks do not use it.  Its extra
+// readback keeps the attention tail (and RB_HOOK / GRAPH_CONC behind it) and the pinned single-token readback off.
+// =0 lets them engage under STRATA_RB_PROTECT - measured 2026-11-19 (served q6 config, fast mode + s3, 8K probe / 512,
+// 3 rotated rounds): meter on 97.3 / 95.7 / 91.3 ms per pass (mean 94.8), meter off = tail on 100.3 / 96.7 / 99.1 (98.7);
+// dense stays ~30 ms either way, the expert tier (57-65 ms) is the pass.  No gain, so the default keeps the meter.
+static bool route_meter_on() {
+    static const bool on = smart_router() && env_on("STRATA_ROUTE_METER", true);
+    return on;
+}
 
 // STRATA_RB_HOOK=1 (decode, opt-in; needs STRATA_ATTN_TAIL): see Impl::rb_hook
 static bool rb_hook_env() {
@@ -1836,7 +1848,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         ggml_tensor * like = ggml_new_tensor_2d(gc, GGML_TYPE_F32, im.NE, n);
         ggml_tensor * protect = nullptr, * pool = nullptr;
         if (smart_router()) {
-            xids = ggml_cont(gc, ggml_view_2d(gc, ti, im.NU, n, ti->nb[1], 0));
+            if (route_meter_on()) xids = ggml_cont(gc, ggml_view_2d(gc, ti, im.NU, n, ti->nb[1], 0));
             // rknob column c = a one-hot over the kRK exact ranks + an offset: the P-th / M-th exact score, or +-1e30 for
             // rank 0 (protect nothing / pool everything).  mul + sum_rows, not mul_mat: one nonzero term, exact in F32.
             auto thr = [&](int c) {
@@ -2282,7 +2294,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.o_wts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
     if (lookahead_on()) im.o_la = ggml_new_tensor_2d(c, GGML_TYPE_I32, 16, NC);
     if (lookahead2_on()) im.o_la2 = ggml_new_tensor_2d(c, GGML_TYPE_I32, la2_width(), NC);
-    if (smart_router()) {
+    if (route_meter_on()) {
         im.o_xids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
         im.o_xwts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
     }
@@ -2752,7 +2764,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         im.host_wts.resize((size_t) (im.NU * NCM));
         if (lookahead_on()) im.host_la.resize((size_t) (16 * NCM));
         if (lookahead2_on()) im.host_la2.resize((size_t) (la2_width() * NCM));
-        if (smart_router()) {
+        if (route_meter_on()) {
             im.host_xids.resize((size_t) (im.NU * NCM));
             im.host_xwts.resize((size_t) (im.NU * NCM));
         }
@@ -3015,9 +3027,10 @@ static bool flush_pack(Ds41Dense::Impl & im) {
     const cudaStream_t st = (cudaStream_t) ggml_backend_cuda_get_stream(im.backend);
 #if CUDART_VERSION >= 13000
     const cudaError_t e = cudaMemcpyBatchAsync(im.pack_dst.data(), src.data(), im.pack_sz.data(), k, &at, &ai, 1, st);
-#else   // CUDA 12.8-12.9: the same call with a failIdx out-parameter
-    size_t fail_idx = 0;
-    const cudaError_t e = cudaMemcpyBatchAsync(im.pack_dst.data(), src.data(), im.pack_sz.data(), k, &at, &ai, 1, &fail_idx, st);
+#else
+    // #148: CUDA 12.8's form still takes the optional failIdx out-parameter (dropped in 13)
+    const cudaError_t e = cudaMemcpyBatchAsync(im.pack_dst.data(), src.data(), im.pack_sz.data(), k, &at, &ai, 1,
+                                               (size_t*) nullptr, st);
 #endif
     if (e == cudaSuccess) return true;
     // (a driver without it: the same copies one by one, synchronously, as before)

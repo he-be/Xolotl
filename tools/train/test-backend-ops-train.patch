@@ -1,0 +1,337 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2117,7 +2117,8 @@
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
+             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
+-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
++            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS ||
++            op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID;   // Xolotl: Inkling training
+ 
+         ggml_tensor * a;
+         if (v & 1) {
+@@ -2151,6 +2152,10 @@
+     void initialize_tensors(ggml_context * ctx) override {
+         float min = -150.f;
+         float max =  150.f;
++        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID) {   // Xolotl: keep the slope away from 0 for the grad check
++            min = -3.f;
++            max =  3.f;
++        }
+ 
+         // Keep FP16 exp/expm1 inputs in-range so all backends stay finite instead of
+         // disagreeing on whether overflow saturates to max-F16 or produces +inf.
+@@ -2166,9 +2171,24 @@
+     }
+ 
+     float grad_eps() override {
++        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID) {
++            return 1e-1f;
++        }
+         return 15.0f;
+     }
+ 
++    bool grad_precise() override {   // Xolotl: 4-point FD for the smooth ops (2-point at 1e-2 hits f32 rounding on 5K rows)
++        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID;
++    }
++
++    // Xolotl: the grad check's loss is an f32 SUM over 2-5K outputs; for sigmoid (all > 0) the sum reaches ~2.5K and its
++    // rounding sets a measured MAA floor of up to 6.3e-3 (tanh: 3e-4). A wrong rule scores >= 0.1, so these still gate.
++    double max_maa_err() override {
++        if (op == GGML_UNARY_OP_SIGMOID) return 1e-2;
++        if (op == GGML_UNARY_OP_TANH)    return 1e-3;
++        return test_case::max_maa_err();
++    }
++
+     std::vector<float> grad_expect() override {
+         if (op == GGML_UNARY_OP_ABS) {
+             return {-1.0f, 1.0f};
+@@ -2479,7 +2499,8 @@
+             ggml_set_name(rows, "view_of_rows");
+         }
+ 
+-        const bool grad_supported = !vs0 && ggml_is_matrix(in) && ggml_is_vector(rows);
++        const bool grad_supported = !vs0 && ((ggml_is_matrix(in) && ggml_is_vector(rows)) ||
++            (type == GGML_TYPE_F32 && be2 == 1));   // Xolotl: the batched get_rows backward (LoRA training)
+         if (grad_supported) {
+             ggml_set_param(in);
+             // rows is a constant input -> no gradients
+@@ -4723,6 +4744,8 @@
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
+         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
++        ggml_set_param(a);   // Xolotl: SSM_CONV backward
++        ggml_set_param(b);
+         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+         return out;
+     }
+@@ -5690,6 +5713,9 @@
+         }
+ 
+         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
++        if (type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32) {
++            ggml_set_param(b);   // Xolotl: MUL_MAT_ID backward w.r.t. b (frozen experts); F32 only: quantized
++        }                        // experts quantize b to Q8 on the CPU, which makes the FD check noisy
+         ggml_set_name(b, "b");
+ 
+         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+@@ -5734,6 +5760,108 @@
+ };
+ 
+ // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
++// Xolotl (LoRA training): softmax gradients that are not trivially zero - out = softmax(scale a + mask) * w (w a fixed
++// random input), both a and the mask trainable (Inkling's relative bias is the mask), optionally a broadcast mask and
++// attention sinks.  The stock SOFT_MAX grad cases use sum(softmax) = 1 (or ~1 with sinks), whose gradient is 0.
++struct test_soft_max_grad : public test_case {
++    const std::array<int64_t, 4> ne;
++    const bool mask_bcast, sinks;
++    const float scale;
++    std::string vars() override { return VARS_TO_STR4(ne, mask_bcast, sinks, scale); }
++    test_soft_max_grad(std::array<int64_t, 4> ne = {16, 8, 3, 1}, bool mask_bcast = false, bool sinks = false, float scale = 1.0f)
++        : ne(ne), mask_bcast(mask_bcast), sinks(sinks), scale(scale) {}
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
++        ggml_set_param(a);
++        ggml_set_name(a, "a");
++        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], mask_bcast ? 1 : ne[2], ne[3]);
++        ggml_set_param(m);
++        ggml_set_name(m, "mask");
++        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
++        ggml_set_name(w, "w");
++        ggml_tensor * y = ggml_soft_max_ext(ctx, a, m, scale, 0.0f);
++        if (sinks) {
++            ggml_tensor * sk = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[2]);
++            ggml_set_name(sk, "sinks");
++            ggml_soft_max_add_sinks(y, sk);
++        }
++        ggml_tensor * out = ggml_mul(ctx, y, w);
++        ggml_set_name(out, "out");
++        return out;
++    }
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t, -2.0f, 2.0f);
++        }
++    }
++    // The FD reference is noisy here (2-point at eps 0.1: MAA 1e-4..3.3e-3; smaller eps is worse, f32 SUM-loss rounding).
++    // The rule itself is checked against a double-precision analytic reference (Xolotl tools/train/smgrad_ref.cpp:
++    // tree: 16/16 at <1e-7); a wrong rule shows as an error the size of the gradient itself (0.2-1 here).
++    double max_maa_err() override { return 1e-2; }
++};
++
++// Xolotl (LoRA training): broadcast SUB backward (the subtrahend's gradient is summed over its broadcast dims).
++// out = (a - b) * w so the gradient is not a constant; output op MUL -> run with `-o MUL`.
++struct test_sub_bcast_grad : public test_case {
++    const std::array<int64_t, 4> ne;
++    const std::array<int64_t, 4> ne_b;
++    std::string vars() override { return VARS_TO_STR2(ne, ne_b); }
++    test_sub_bcast_grad(std::array<int64_t, 4> ne = {16, 5, 4, 3}, std::array<int64_t, 4> ne_b = {1, 5, 4, 3})
++        : ne(ne), ne_b(ne_b) {}
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_param(a);
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
++        ggml_set_param(b);
++        ggml_set_name(b, "b_sub");
++        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(w, "w");
++        ggml_tensor * out = ggml_mul(ctx, ggml_sub(ctx, a, b), w);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// Xolotl (LoRA training): GGML_OP_MUL_MAT_ID_BACK - the activation gradient of mul_mat_id through frozen experts of any
++// type, checked backend vs CPU (the CPU op is checked against finite differences through test_mul_mat_id's grad mode)
++struct test_mul_mat_id_back : public test_case {
++    const ggml_type type_a;
++    const int n_mats;
++    const int n_used;
++    const bool b;   // b was broadcast in the forward (ne11 == 1)
++    const int64_t m, n, k;
++    const bool skip;
++
++    std::string vars() override { return VARS_TO_STR8(type_a, n_mats, n_used, b, m, n, k, skip); }
++
++    double max_nmse_err() override { return 1e-6; }
++
++    test_mul_mat_id_back(ggml_type type_a = GGML_TYPE_F32, int n_mats = 8, int n_used = 2, bool b = false,
++            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool skip = false)
++        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), skip(skip) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
++        ggml_set_name(as, "as");
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
++        ggml_set_name(ids, "ids");
++        if (n_used != n_mats) {
++            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
++            ggml_set_name(ids, "view_of_ids");
++        }
++        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
++        ggml_set_name(g, "g");
++        ggml_tensor * out = ggml_mul_mat_id_back(ctx, as, g, ids, b ? 1 : n_used);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        init_mul_mat_id_tensors(ctx, n_mats, skip);
++    }
++};
++
+ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
+     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
+             int n_mats = 8, int n_used = 2, bool b = false,
+@@ -6354,12 +6482,13 @@
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
+-        ggml_set_param(a);
++        if (!inplace) ggml_set_param(a);   // Xolotl: autodiff refuses the in-place (view) result
+         ggml_set_name(a, "a");
+ 
+         ggml_tensor * mask = nullptr;
+         if (this->mask) {
+             mask = ggml_new_tensor_4d(ctx, m_prec, ne[0], ne[1], ne[2], ne[3]);
++            if (m_prec == GGML_TYPE_F32 && max_bias == 0.0f && !inplace) ggml_set_param(mask);   // Xolotl: the mask gradient (a learned bias)
+             ggml_set_name(mask, "mask");
+         }
+ 
+@@ -8312,6 +8441,7 @@
+         const std::array<int64_t, 4> ne_a = noncontig_rows ?
+             std::array<int64_t, 4>{ ne[1], ne[0], ne[2], ne[3] } : ne;
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
++        ggml_set_param(a);   // Xolotl: L2_NORM backward
+         ggml_set_name(a, "a");
+ 
+         if (noncontig_rows) {
+@@ -8328,6 +8458,10 @@
+ 
+         return out;
+     }
++
++    float grad_eps() override {   // Xolotl: the default 0.1 step leaves ~1e-4 of FD curvature error on |x| ~ 4.6 rows
++        return 2e-2f;
++    }
+ };
+ 
+ // GGML_OP_ACC
+@@ -8400,6 +8534,7 @@
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
++        if (!circular) ggml_set_param(a);   // Xolotl: PAD backward (crop); circular has none
+         ggml_set_name(a, "a");
+ 
+         ggml_tensor * out = circular
+@@ -9040,8 +9175,9 @@
+     const ggml_type              type;
+     const std::array<int64_t, 4> ne_lhs;
+     const std::array<int64_t, 4> ne_rhs;
++    const bool                   upper;   // Xolotl: upper-triangular A (back substitution, the backward's A^T solve)
+ 
+-    std::string vars() override { return VARS_TO_STR3(type, ne_lhs, ne_rhs); }
++    std::string vars() override { return VARS_TO_STR4(type, ne_lhs, ne_rhs, upper); }
+ 
+     uint64_t op_flops(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -9054,9 +9190,10 @@
+ 
+     test_solve_tri(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_lhs = { 10, 10, 4, 3 },
+-            std::array<int64_t, 4> ne_rhs = { 3, 10, 4, 3 }
++            std::array<int64_t, 4> ne_rhs = { 3, 10, 4, 3 },
++            bool upper = false
+         )
+-        : type(type), ne_lhs(ne_lhs), ne_rhs(ne_rhs) {}
++        : type(type), ne_lhs(ne_lhs), ne_rhs(ne_rhs), upper(upper) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne_lhs[0], ne_lhs[1], ne_lhs[2], ne_lhs[3]);
+@@ -9067,7 +9204,7 @@
+         ggml_set_param(b);
+         ggml_set_name(b, "b");
+ 
+-        ggml_tensor * out = ggml_solve_tri(ctx, a, b, true, true, false);
++        ggml_tensor * out = ggml_solve_tri(ctx, a, b, true, !upper, false);
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -9078,6 +9215,15 @@
+             if (strcmp(t->name, "a") == 0) {
+                 // note: avoid zeros in the diagonal
+                 init_tensor_tril(t, 0.1, 1.0f);
++                if (upper) {   // transpose each matrix: lower -> upper
++                    std::vector<float> d(ggml_nelements(t)), u(d.size());
++                    ggml_backend_tensor_get(t, d.data(), 0, ggml_nbytes(t));
++                    const int64_t n = t->ne[0];
++                    for (int64_t m = 0; m < t->ne[2] * t->ne[3]; ++m)
++                        for (int64_t i = 0; i < n; ++i)
++                            for (int64_t j = 0; j < n; ++j) u[(size_t) (m * n * n + i * n + j)] = d[(size_t) (m * n * n + j * n + i)];
++                    ggml_backend_tensor_set(t, u.data(), 0, ggml_nbytes(t));
++                }
+             } else {
+                 init_tensor_uniform(t, -1.0f, 1.0f);
+             }
+@@ -11541,6 +11687,39 @@
+         }
+     }
+ 
++    // Xolotl (LoRA training): softmax grads with a trainable mask (non-trivial loss)
++    for (bool bc : {false, true}) {
++        for (bool sk : {false, true}) {
++            for (float sc : {1.0f, 0.0883883f}) {   // 1 / sqrt(128): Inkling's attention scale
++                test_cases.emplace_back(new test_soft_max_grad({16, 8, 3, 1}, bc, sk, sc));
++                test_cases.emplace_back(new test_soft_max_grad({33, 5, 4, 2}, bc, sk, sc));
++            }
++        }
++    }
++    // Xolotl (LoRA training): broadcast SUB backward
++    test_cases.emplace_back(new test_sub_bcast_grad({16, 5, 4, 3}, {1, 5, 4, 3}));   // a row statistic
++    test_cases.emplace_back(new test_sub_bcast_grad({16, 5, 4, 3}, {16, 1, 4, 3}));
++    test_cases.emplace_back(new test_sub_bcast_grad({16, 5, 4, 3}, {1, 1, 1, 1}));
++
++    // Xolotl (LoRA training): MUL_MAT_ID_BACK, every expert type in the Inkling XQ file plus the common ones
++    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
++                        GGML_TYPE_Q2_0, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
++                        GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
++        for (bool bc : {false, true}) {
++            test_cases.emplace_back(new test_mul_mat_id_back(t, 16, 4, bc, 96, 37, 256));
++        }
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 8, 1, false, 64, 9, 256));             // one-hot routing
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 16, 4, false, 64, 21, 512, true));     // skipped ids
++    }
++    // Inkling-sized, the expert types the XQ file really has per tensor: gate_up [2304 -> 2304] with b broadcast,
++    // down [1152 -> 2304] (32-wide blocks only: 1152 is not a multiple of 256)
++    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_NVFP4, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 128, 8, true,  2304, 64, 2304));
++    }
++    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_NVFP4, GGML_TYPE_IQ4_NL}) {
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 128, 8, false, 2304, 64, 1152));
++    }
++
+     // Xolotl (LoRA training): mul_mat backward through a frozen quantized weight = out_prod(W, dy^T), weight-shaped.
+     // m 4096 x k 20000 makes the CUDA path dequantize in two row chunks (256 MiB of F32 each).
+     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS,
+@@ -12028,6 +12207,9 @@
+     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
+ 
+     test_cases.emplace_back(new test_solve_tri());
++    test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 10, 10, 4, 3 }, { 3, 10, 4, 3 }, true));   // Xolotl: upper
++    test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 2 }, { 64, 64, 4, 2 }, true));
++    test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 30, 30, 7, 1 }, { 8, 30, 7, 1 }, true));
+     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 11, 11, 1, 1 }, { 5, 11, 1, 1 }));
+     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 17, 17, 2, 4 }, { 9, 17, 2, 4 }));
+     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 30, 30, 7, 1 }, { 8, 30, 7, 1 }));
+@@ -12396,6 +12578,8 @@
+                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
+                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
++                    test_cases.emplace_back(new test_topk_moe({128, 64, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Xolotl: Inkling-2-Mini
++                    test_cases.emplace_back(new test_topk_moe({128, 512, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
+                     // rows at and just past the limit where one block still covers all rows
+                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));

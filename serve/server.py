@@ -92,6 +92,7 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
 from serve import images as images_api  # noqa: E402
 from serve import request_log as reqlog  # noqa: E402
+from serve import loop_guard  # noqa: E402  (ported from Delta 0.95 / Project Maya: a note when an agent repeats one tool call)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -1769,6 +1770,27 @@ class StrataEngine:
             if acquired:
                 ctl.release()
 
+    def encode_image(self, image: str, out: str, timeout: float = 120.0) -> str:
+        """`ENC <image> <out>` to an engine started with --mmproj (its own vision tower): the reply line,
+        "OK <n> <nx> <ny> <ms>" or "ERR ...".  The caller holds the FIFO (one exchange at a time), as for HAVE."""
+        proc, born, lines = self.proc, getattr(self, "gen", None), self.lines
+        self._send(f"ENC {image} {out}")
+        deadline = time.time() + timeout
+        while True:
+            if self.proc is not proc or getattr(self, "gen", None) != born:
+                raise EngineDied("the engine changed during its ENC answer")
+            try:
+                line = lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer ENC") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith(("OK", "ERR")):
+                return line
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer ENC in time")
+
     def _have_idle(self, keys: list[str], timeout: float = 30.0) -> list[tuple[int, int, int] | None]:
         """`HAVE <key,...>` between requests (the caller holds the FIFO): which pictures the engine holds by their keys
         (img_refs engines) -> (n, nx, ny) or None for each."""
@@ -1958,6 +1980,17 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        # DRY (llama.cpp's names; sent only when set: an engine without DRY ignores keys it does not know)
+        dm = sampling.get("dry_multiplier")
+        if isinstance(dm, (int, float)) and not isinstance(dm, bool) and float(dm) > 0.0:
+            keys += f" dry_multiplier={float(dm)!r}"
+            db = sampling.get("dry_base")
+            if isinstance(db, (int, float)) and not isinstance(db, bool) and float(db) > 1.0:
+                keys += f" dry_base={float(db)!r}"
+            for k in ("dry_allowed_length", "dry_penalty_last_n"):
+                v = sampling.get(k)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    keys += f" {k}={v}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -3438,6 +3471,12 @@ def on_demand_vision(cfg: dict, vcfg: dict) -> dict:
     upstream's "elastic" (Service._vision_up), and the local "lazy" (Service.start_lazy_vision), whose encoder found the
     card full without it - its cudaMalloc failed and the first picture's request got no answer."""
     elastic_cache = cfg.get("vram_elastic") is True or "--vram-elastic" in (cfg.get("args") or [])
+    # the resident low-RAM mode's expert cache holds experts RAM does not, so it cannot shrink for the encoder either
+    # (the engine logs "not with the resident low-RAM mode"; the first picture got a 503 OOM, 20 Nov 2026)
+    if "--resident-experts" in (cfg.get("args") or []) and (vcfg.get("lazy") or vcfg.get("elastic") is True) and vcfg.get("gpu"):
+        print('[strata] --resident-experts: the expert cache cannot shrink for an on-demand vision encoder (it holds '
+              "experts RAM does not): the encoder starts with the model instead", flush=True)
+        return {**vcfg, "lazy": False, "elastic": False}
     if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
         print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
               "encoder its VRAM): the encoder starts with the model instead", flush=True)
@@ -3453,6 +3492,8 @@ class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
+
+    in_engine = False   # set per config in __init__; the default covers an instance built without it (tests, embedders)
 
     @staticmethod
     def work_dir() -> Path:
@@ -3475,7 +3516,11 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
-        args = self.reader_args(cfg)
+        # xolotl: "in_engine": true - the ENGINE's own tower (started with --mmproj) reads the pictures; there is no
+        # strata-vision process, and main() binds `engine` once the engine exists (encode_keyed asks it over ENC)
+        self.in_engine = bool(cfg.get("in_engine"))
+        self.engine = None
+        args = [] if self.in_engine else self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.persistence_requested = bool((env if env is not None else os.environ).get("STRATA_PREFIX_CACHE_DIR"))
@@ -3503,7 +3548,7 @@ class Vision:
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         # xolotl: both on-demand modes - the local "lazy" (Service.start_lazy_vision) and upstream 0.1.44's
         # "elastic" (Service._vision_up / _vision_idle_down); a config picks one, neither = the resident encoder
-        if not lazy and not self.lazy_vision and not self.elastic:
+        if not lazy and not self.lazy_vision and not self.elastic and not self.in_engine:
             self._start()
 
     # What a picture may become when the config does not say (setup writes the same numbers, setup.VISION): an old, hand-edited or migrated
@@ -3675,6 +3720,8 @@ class Vision:
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
+        if self.in_engine:
+            return getattr(self, "engine", None) is not None and getattr(self.engine, "proc", None) is not None
         return self.proc is not None and not self.stopped and self.proc.poll() is None
 
     def unload(self):
@@ -3824,7 +3871,7 @@ class Vision:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
-            if (self.proc is None or self.proc.stdin is None) and not getattr(self, "lazy_vision", False):   # an elastic encoder not started yet, or one that was unloaded (xolotl: a lazy one starts below)
+            if not self.in_engine and (self.proc is None or self.proc.stdin is None) and not getattr(self, "lazy_vision", False):   # an elastic encoder not started yet, or one that was unloaded (xolotl: a lazy one starts below)
                 raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             self.last_used = time.time()
@@ -3835,13 +3882,16 @@ class Vision:
                 self._start()
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
-                self.proc.stdin.flush()
-                try:
-                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
-                except RuntimeError as e:                 # silent for VISION_ENCODE_S: the encoder was ended (#1317)
-                    self.stopped = True                   # alive() is False, so the next request starts it again
-                    raise ValueError(str(e)) from None
+                if self.in_engine:      # the engine's own tower (--mmproj): absolute paths, the engine's cwd is its own
+                    line = self.engine.encode_image(str(img), str(out), timeout=VISION_ENCODE_S)
+                else:
+                    self.proc.stdin.write(f"ENC {img.name} {out.name}\n")  # relative to the encoder's cwd (#480)
+                    self.proc.stdin.flush()
+                    try:
+                        line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+                    except RuntimeError as e:             # silent for VISION_ENCODE_S: the encoder was ended (#1317)
+                        self.stopped = True               # alive() is False, so the next request starts it again
+                        raise ValueError(str(e)) from None
             finally:                                                   # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
@@ -4038,8 +4088,9 @@ def apply_ready_timeout(cfg: dict) -> None:
 
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
-    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665);
+    with --remote-device (the DeepSeek-V4.1 / ERNIE engines) it holds and computes a share of the routed experts."""
+    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"] and "--remote-device" not in cfg["args"]
 
 
 _CARD_CLASS: list = []
@@ -4344,7 +4395,7 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None, archs=None) -> list[int]:
     if len(gl) < 2 or cfg.get("gpu_order") == "as_given" or gpu_roles_active(cfg):
         return gl
     args = cfg.get("args") or []
-    if "--peer-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
+    if "--peer-device" in args or "--remote-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
         return gl
     hip = cfg.get("backend") == "hip"
     if hip:
@@ -5026,6 +5077,11 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.repeat_wrap_up = True                       # ... unless the model is thinking: then the thinking is closed
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        # serve/loop_guard.py (ported from Delta 0.95, after Project Maya): the same tool call LOOP_GUARD repeats in a row,
+        # or TIMES of the last WINDOW calls with the same result, gets one note before the next turn (config "loop_guard")
+        self.loop_guard_repeats = loop_guard.REPEATS
+        self.loop_guard_window = loop_guard.TIMES
+        self.note_role = None                             # the loop guard note's role (_loop_note_role)
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.keep_cut_tool_calls = False                  # opt-in: a whole OpenAI answer keeps a call cut at the token limit (openai_collect)
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -5067,6 +5123,38 @@ class Service:
             self.reasoning_close_text = atem.REASONING_CLOSE
             self.reasoning_wrap_up_text = atem.REASONING_WRAP_UP
             self.answer_open_text = atem.ANSWER_OPEN
+        elif family in ("inkling2", "inkling2_loop"):
+            # Inkling-2-Mini: its turn is message blocks (thinking, text, "<|message_model|>NAME<|content_invoke_tool_json|>
+            # {json}" calls), each closed by <|end_message|>; only <|content_model_end_sampling|> (200006) ends the turn.
+            # serve/inkling.py reads the blocks as the Qwen form and renders the model's own chat template
+            from serve import inkling
+            sid = getattr(self.tok, "special_ids", None) or {}
+            eos = sid.get("eos")
+            self.stop_ids = {int(eos)} if eos is not None else {inkling.EOS_ID}
+            self.parser_cls = inkling.InklingOutputParser
+            self._force_text = inkling.to_inkling_force
+            self.reasoning_close_text = inkling.REASONING_CLOSE
+            self.reasoning_wrap_up_text = inkling.REASONING_WRAP_UP
+            self.answer_open_text = inkling.ANSWER_OPEN
+        elif family == "ernie5_5":
+            # ERNIE-5.5-Flash: <ernie:think>...</ernie:think> then the answer, calls as an <ernie:tool_call> block of
+            # <invoke name=..><parameter name=..> elements, the turn ended by <|ernie:im_end|>.  serve/ernie.py reads them
+            # as the Qwen form and renders with Baidu's own renderer (serve/ernie_encoding.py)
+            from serve import ernie
+            stops = set()
+            try:
+                stops.update(int(i) for i in self.tok.encode(ernie.END, parse_special=True))
+            except Exception:                               # a tokenizer without the marker: the generic end ids below
+                pass
+            eos = (getattr(self.tok, "special_ids", None) or {}).get("eos")
+            if eos is not None:
+                stops.add(int(eos))
+            self.stop_ids = stops or self.stop_ids
+            self.parser_cls = ernie.ErnieOutputParser
+            self._force_text = ernie.to_ernie_force
+            self.reasoning_close_text = ernie.REASONING_CLOSE
+            self.reasoning_wrap_up_text = ernie.REASONING_WRAP_UP
+            self.answer_open_text = ernie.ANSWER_OPEN
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -6004,6 +6092,8 @@ class Service:
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
             totals = dict(self.totals)
+            slots = max(1, int(getattr(self.engine, "batch", 0) or 1))
+            waiting = max(int(s.get("queued", 0) or 0), len(self.live_reqs) - slots)
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -6014,7 +6104,7 @@ class Service:
             state = "unloaded"
         else:
             state = "idle"
-        live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
+        live = {"state": state, "queued": waiting, "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
@@ -6151,6 +6241,16 @@ class Service:
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
+        if self.family == "ernie5_5":
+            # ERNIE-5.5-Flash: Baidu's renderer (serve/ernie_encoding.py), its reasoning_effort low / medium / high
+            from serve import ernie
+            return ernie.render(messages, tools, kwargs)
+        if self.family in ("inkling2", "inkling2_loop"):
+            # Inkling-2-Mini's template has no generation prompt (the model writes <|message_model|> itself) and takes
+            # its thinking effort as a template variable; serve/inkling.py renders it (parity-tested against the
+            # official chat_template.jinja).  Its own effort line is the model's, so #458's effort_end does not apply.
+            from serve import inkling
+            return inkling.render(messages, tools, reasoning_effort=inkling.effort_from_kwargs(kwargs))
         if self.preserve_thinking is not None and "preserve_thinking" not in kwargs:
             kwargs = {**kwargs, "preserve_thinking": self.preserve_thinking}   # the config's default for the flag
         if self.add_vision_id is not None and "add_vision_id" not in kwargs:
@@ -6359,6 +6459,10 @@ class Service:
                 hit = self.vision.encode_keyed(key, data, keep=[p for p, _ in encoded if p is not None])
             encoded.append(hit)
             refs.append(None)
+        if started:   # #146: the turn encoded: its lend/encoder lifecycle ends before the prompt reaches the engine
+            turn_done = getattr(self.vision, "turn_done", None)
+            if turn_done is not None:
+                turn_done()
         return encoded, refs
 
     def expand_image_tokens(self, ids, encoded, ends=None):
@@ -6389,6 +6493,35 @@ class Service:
             self.prompts.forget(ids)
 
 
+    def _loop_guard(self, messages):
+        """serve/loop_guard.py (Delta 0.94/0.95, after Project Maya): a request that answers the results of a tool call
+        the model has made loop_guard_repeats times in a row with the same arguments - or one the last WINDOW calls hold
+        loop_guard_window times with the same result - gets one short note after those results, for this prompt only.
+        Any other request is returned as it came, so it renders exactly as before."""
+        hit = loop_guard.repeated(messages, self.loop_guard_repeats)
+        if hit is not None:
+            names, times = hit
+            print(f"[strata] loop guard: {names} repeated {times} times", flush=True)
+            return messages + [{"role": self._loop_note_role(), "content": loop_guard.note(names, times)}]
+        hit = loop_guard.windowed(messages, self.loop_guard_window) if self.loop_guard_repeats else None
+        if hit is None:
+            return messages
+        names, times = hit
+        print(f"[strata] loop guard: {names} made {times} times in the last {loop_guard.WINDOW} calls", flush=True)
+        return messages + [{"role": self._loop_note_role(), "content": loop_guard.window_note(names, times)}]
+
+    def _loop_note_role(self) -> str:
+        """"system" when the template takes a system message in the middle of a conversation (DeepSeek V4.1's does),
+        else "user" (Qwen's template refuses a late system message)."""
+        if self.note_role is None:
+            try:
+                self.template.render([{"role": "system", "content": "a"}, {"role": "user", "content": "b"},
+                                      {"role": "system", "content": "c"}], tools=None)
+                self.note_role = "system"
+            except Exception:  # noqa: BLE001 - any refusal: the role every template takes
+                self.note_role = "user"
+        return self.note_role
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -6415,6 +6548,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         self._restore_reasoning(messages, log=kwargs.get("enable_thinking") is not False)
+        messages = self._loop_guard(messages)            # this prompt only; the client's conversation is not changed
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and (not self.thinking_model or kwargs.get("enable_thinking", True) is False):
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -6737,7 +6871,9 @@ class Service:
         with self.reasoning_mu:
             written = self.recent_reasoning.setdefault(key, [])
             written.append((end, reasoning))
-            del written[:-32]
+            # a turn claims the oldest unclaimed entry that fits it (_reasoning_for), so dropping an entry would shift
+            # every later turn's thinking by one and the prompt would leave the cache at the oldest of them: keep many
+            del written[:-1024]
             self.recent_reasoning.move_to_end(key)
             # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
             # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
@@ -6755,11 +6891,13 @@ class Service:
     def _restore_reasoning_locked(self, messages, log):
         if not self.recent_reasoning:
             return
+        claimed: dict[str, set[int]] = {}   # per answer: the remembered replies earlier turns of this request took
         for i, m in enumerate(messages):
             if m.get("role") != "assistant" or (m.get("reasoning_content") or "").strip():
                 continue
             key = self._answer_key(m.get("content"), m.get("tool_calls"))
-            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None)
+            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None,
+                                    claimed.setdefault(key, set()))
             if r:
                 m["reasoning_content"] = r
                 self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
@@ -6772,10 +6910,17 @@ class Service:
                       f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}", flush=True)
 
     @staticmethod
-    def _reasoning_for(written, before):
+    def _reasoning_for(written, before, claimed=None):
         """The thinking of the reply that wrote this turn: among the replies with this answer, the one whose prompt
         ended with the message this turn follows.  No such reply, none: another turn's thinking would change this
-        turn's text from one request to the next, and every request would leave the conversation cache there."""
+        turn's text from one request to the next, and every request would leave the conversation cache there.
+
+        An agent repeats itself (the same tool call after the same tool output), so several replies can fit one turn.
+        The turns take them in the order they were written: the oldest unclaimed fitting reply (`claimed` holds the
+        entries earlier turns of this request took).  Taking the newest instead gave every older repeat the newest
+        thinking, so each new repeat rewrote a turn in the middle of the history and the whole prompt was read again
+        (an agent loop re-read 65K tokens on every turn).  In order, a turn keeps its thinking from one request to the
+        next and the newest turn gets the thinking it was written with."""
         if not written or before is None:
             return None
         text = before.get("content")
@@ -6784,9 +6929,13 @@ class Service:
         tail = text.strip()[-48:] if isinstance(text, str) else ""
         if not tail:
             return None
-        for ctx, r in reversed(written):   # only the template's turn markers may follow it
+        for n, (ctx, r) in enumerate(written):   # only the template's turn markers may follow it
+            if claimed is not None and n in claimed:
+                continue
             at = ctx.rfind(tail)
             if at >= 0 and len(ctx) - at - len(tail) <= 80:
+                if claimed is not None:
+                    claimed.add(n)
                 return r
         return None
 
@@ -6797,8 +6946,11 @@ class Service:
         if ka is not None:
             ka.acquire()
         reasoning, content, calls = [], [], []
+        trace = LiveTrace.open(ids, thinking, max_new)
         try:
             for item in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only):
+                if trace is not None and not trace.add(item):
+                    trace = None
                 if item[0] == "event" and item[1].kind in ("reasoning", "content"):
                     (reasoning if item[1].kind == "reasoning" else content).append(item[1].text or "")
                 elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
@@ -6807,6 +6959,8 @@ class Service:
                     self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
                 yield item
         finally:
+            if trace is not None:
+                trace.close()
             if ka is not None:
                 ka.release()
 
@@ -7473,6 +7627,58 @@ class Service:
         if rejected:
             done["rejected_tool_calls"] = rejected
         yield "done", done
+
+
+class LiveTrace:
+    """Opt-in live trace of every generation (STRATA_TRACE_DIR=<dir>): one plain-text file per request, written as the
+    tokens arrive, so a test's thinking can be read (tail -f) while it runs and survives a run that is stopped or
+    killed. Thinking, answer text and tool calls in order, then the finish line. Off (None) unless the variable names a
+    directory; a write that fails turns the trace off for that request and never fails the request."""
+    _seq = itertools.count(1)
+
+    def __init__(self, path: Path, head: str):
+        self.path, self.kind, self.f = path, None, open(path, "w", encoding="utf-8")
+        self.f.write(head + "\n")
+        self.f.flush()
+
+    @classmethod
+    def open(cls, ids, thinking, max_new):
+        d = os.environ.get("STRATA_TRACE_DIR", "").strip()
+        if not d:
+            return None
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+            n = next(cls._seq)
+            return cls(Path(d) / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{n:04d}.txt",
+                       f"# request {n} at {time.strftime('%F %T')}: prompt {len(ids)} tokens, "
+                       f"thinking {'on' if thinking else 'off'}, max_new {max_new}")
+        except OSError as e:
+            print(f"[strata] STRATA_TRACE_DIR: cannot write a trace in {d}: {e}", flush=True)
+            return None
+
+    def add(self, item) -> bool:
+        try:
+            kind, x = item
+            if kind == "event" and x.kind in ("reasoning", "content"):
+                if x.kind != self.kind:
+                    self.f.write(f"\n=== {'thinking' if x.kind == 'reasoning' else 'answer'} ===\n")
+                    self.kind = x.kind
+                self.f.write(x.text or "")
+            elif kind == "event" and x.kind == "tool_call" and x.call is not None:
+                self.f.write(f"\n=== tool call: {x.call.name} {json.dumps(x.call.arguments, ensure_ascii=False)}\n")
+                self.kind = None
+            elif kind == "done":
+                self.f.write(f"\n=== done: finish {x.get('finish')}, {x.get('completion_tokens')} tokens "
+                             f"({x.get('reasoning_tokens')} thinking) at {time.strftime('%T')}\n")
+            self.f.flush()
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self.f.close()
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -10426,6 +10632,14 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not number or value != int(value) or value < 0:
                 raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
+        elif key in ("dry_multiplier", "dry_base"):
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected a number >= 0")
+            out[key] = float(value)
+        elif key in ("dry_allowed_length", "dry_penalty_last_n"):
+            if not number or value != int(value) or value < -1:
+                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected an integer >= -1")
+            out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
                 raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
@@ -10536,7 +10750,8 @@ def check_request_sampling(req) -> None:
             req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
     for key, integer in (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
                          ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
-                         ("penalty_last_n", True), ("seed", True)):
+                         ("penalty_last_n", True), ("seed", True), ("dry_multiplier", False), ("dry_base", False),
+                         ("dry_allowed_length", True), ("dry_penalty_last_n", True)):
         value = (req or {}).get(key)
         if value is None:
             continue
@@ -10578,6 +10793,11 @@ MODEL_CARD_SAMPLING = {
     # notes: 1.0 skips it, 0.6 / top_p 0.9 / top_k 20 gives clean calls)
     "muse-glimmer": {"thinking": {"temperature": 0.6, "top_p": 0.9, "top_k": 20},
                      "instruct": {"temperature": 0.6, "top_p": 0.9, "top_k": 20}},
+    # Inkling-2-Mini: its generation_config.json recommends temperature 1.0 with do_sample (no top_p/top_k given, so
+    # the engine's own off values stay)
+    "inkling2": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
+    "ernie5_5": {"thinking": {"temperature": 1.0, "top_p": 0.95}, "instruct": {"temperature": 1.0, "top_p": 0.95}},
+    "inkling2_loop": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
 }
 
 
@@ -10683,7 +10903,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "xolotl", "strata"], default="mock",
+                    help="xolotl = Xolotl's native engines (the config's exe); strata is the old name and still works")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -10775,6 +10996,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                          "{\"prefill_gpu\": 0, \"decode_gpu\": 1}; docs/SPLIT_SERVE.md)")
     launch_args = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(launch_args)
+    if a.engine == "xolotl":     # the user-facing name; inside, the native protocol keeps its old name (upstream syncs stay easy)
+        a.engine = "strata"
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
     global OPENS_BROWSER
@@ -11009,6 +11232,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         engine.deep_sleep = sleep_mode
+        if vision is not None and getattr(vision, "in_engine", False):
+            # xolotl: the engine's own tower (--mmproj) reads the pictures over the line protocol, no second process
+            vision.engine = engine
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None
@@ -11064,7 +11290,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer") else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer", "inkling2", "inkling2_loop", "ernie5_5")
+                       else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
@@ -11188,6 +11415,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    try:                                                # serve/loop_guard.py (on unless turned off)
+        svc.loop_guard_repeats = loop_guard.setting(cfg.get("loop_guard"))
+        svc.loop_guard_window = loop_guard.window_setting(cfg.get("loop_guard"))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}") from None
     svc.keep_cut_tool_calls = keep_cut_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):

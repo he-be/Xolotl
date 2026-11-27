@@ -243,6 +243,11 @@ elseif(STRATA_ENABLE_CUDA)
   # DLL's import library).  MSVC with a CUDA 12.x toolkit - the experimental Pascal/Volta build - then fails with
   # LNK1169 (every cudart symbol defined twice); GNU ld lets it pass.  That build links the shared runtime alone.  The
   # ready-made engine (CUDA 13, no STRATA_EXPERIMENTAL_SM60) is unchanged; -DCMAKE_CUDA_RUNTIME_LIBRARY overrides.
+  # #148: every MSVC build with a CUDA 12.x toolkit hits it, not only the SM60 one; the version is known after
+  # find_package(CUDAToolkit) below, and the property is read when targets are created, so it is set there too.
+  if(DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
+    set(_strata_cuda_rt_given ON)
+  endif()
   if(MSVC AND STRATA_EXPERIMENTAL_SM60 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   endif()
@@ -264,6 +269,9 @@ elseif(STRATA_ENABLE_CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
+  if(MSVC AND NOT _strata_cuda_rt_given AND CUDAToolkit_VERSION VERSION_LESS 13.0)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)   # #148 (CUDA 12.8, sm_86): LNK1169/LNK2005 with the static default
+  endif()
   option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
   if(_strata_cuda_arch_defaulted)
     # a recommendation, not a refusal: the release engine is built for 75;86;89;120, a hand build names its card
@@ -437,6 +445,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_geometry_test tests/core/ds4_geometry_test.cpp)
   target_link_libraries(ds4_geometry_test PRIVATE strata_artifact)
   add_test(NAME ds4_geometry_test COMMAND ds4_geometry_test $ENV{DS4_GGUF})
+  # ERNIE 5.5 geometry + tensor map (header-only; the real-file part opens ONE shard and skips without $ERNIE_GGUF)
+  add_executable(ernie_geometry_test tests/core/ernie_geometry_test.cpp)
+  target_link_libraries(ernie_geometry_test PRIVATE strata_artifact)
+  add_test(NAME ernie_geometry_test COMMAND ernie_geometry_test $ENV{ERNIE_GGUF})
   # the model's geometry from its metadata, and the check against the kernels' compiled shape (synthetic)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
@@ -1117,6 +1129,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_tq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
+      # the TQP AVX2 row kernel == the scalar reference, bit for bit (point table + vector state windows)
+      add_executable(tqp_avx2_exact_test tests/dsv41/tqp_avx2_exact_test.cpp)
+      target_include_directories(tqp_avx2_exact_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(tqp_avx2_exact_test PRIVATE strata_kernels_cpu)
+      add_test(NAME tqp_avx2_exact_test COMMAND tqp_avx2_exact_test)
+      # the CPU expert lane's decode speed on one ERNIE-shaped expert (2048 -> 2048x2 / 2048), TQP5 / TQP6 against the
+      # ggml low-bit types it already reads, through iq_cpu_* (the engine's own entry points).  No device, no model.
+      add_executable(xqt_decode_bench tests/dsv41/xqt_decode_bench.cpp src/dsv41/ds4_tq_cpu.cpp
+                     src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp)
+      target_include_directories(xqt_decode_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(xqt_decode_bench PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(xqt_decode_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
       # the i-quant experts (ds4_iq.cu) against ggml's own decode of the same blocks + a double reference, device and CPU
       # lane, for every type the device takes: the gate a new type (IQ2_XS ..) has to pass before the engine uses it
       set_source_files_properties(tests/dsv41/iq_expert_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
@@ -3132,4 +3158,19 @@ if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
   add_executable(xolotl-glimmer src/program/glimmer_main.cpp)
   target_include_directories(xolotl-glimmer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(xolotl-glimmer PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+endif()
+
+# Inkling-2-Mini (thinkingmachines, 26B-A3B looped MoE) behind the serve protocol: the Inkling 2 graph (llama.cpp PR
+# #32694, MIT) on ggml-backend (CUDA + CPU fallback), src/program/inkling_main.cpp (the xolotl-glimmer skeleton).
+if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
+  # inkling_vision.cpp: the inkling2v image tower in-process (--mmproj), stb_image for the file formats
+  add_executable(xolotl-inkling src/program/inkling_main.cpp src/program/inkling_dspark.cpp src/program/inkling_fused.cu src/program/inkling_vision.cpp)
+  set_source_files_properties(src/program/inkling_fused.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")   # == ggml-cuda's flags: same float results as the kernels it fuses
+  target_include_directories(xolotl-inkling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-inkling PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+  # the DSpark drafter alone, gated against target taps on disk (src/program/inkling_dspark.h, "-DXOLOTL_DSPARK_TOOL")
+  add_executable(xolotl-inkling-dspark src/program/inkling_dspark.cpp)
+  target_compile_definitions(xolotl-inkling-dspark PRIVATE XOLOTL_DSPARK_TOOL=1)
+  target_include_directories(xolotl-inkling-dspark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-inkling-dspark PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
 endif()

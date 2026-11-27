@@ -8,6 +8,393 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Second-card expert tier, faster; Engram tables in IQ4_NL (27 Nov)
+
+- **Second card (`--remote-device N`) for DeepSeek-V4.1 and ERNIE.** The card that holds the next-ranked experts now
+  takes prompt work too: a compact wire (only the tokens routed to its experts go over PCIe), MMQ for prompt calls of
+  32+ tokens, one metadata copy per block, keep-warm between requests, and a free-VRAM floor before the serve loop grows
+  its buffers (fixes an out-of-memory exit on `--fast`). Measured on an RTX 4090 + RTX 3060 12 GB, DS4.1-1017, 4.1K-token
+  prompt:
+
+  | setup | prefill tok/s | decode tok/s |
+  |---|---:|---:|
+  | 4090 alone | 231 | 25.3 |
+  | 4090 + 3060, before | 139.5 | 28.2 |
+  | 4090 + 3060, `STRATA_REMOTE_HEAD=1` | 247 | 28.5 |
+  | + `STRATA_REMOTE_PIPE=1` (blocks double-buffered) | 252.9 | 27.5 |
+  | `--fast` + 3060 | 249 | 29.9 |
+
+  ERNIE-5.5-Flash with the 3060: 12.5 tok/s decode, 136 prefill (4090 alone 9.8-10.5 / 111-115).
+  `STRATA_REMOTE_HEAD=1` puts the hottest experts on the second card; it and `STRATA_REMOTE_PIPE=1` are opt-in for now.
+  Known: on our short34 logit check two cards score a little below one (top-1 75.2 % vs 76.9 %, the same with the old
+  and the new wire, so it predates this change); we are looking into it.
+- **Engram tables in IQ4_NL, one GGUF per layer** (`--engram L1.gguf:L14.gguf`). 202 GB of FP8 tables become 110 GB.
+  With a 2 GiB IQ4 hot set (`ds41_engram_hot pack --dir L1.gguf:L14.gguf`, about twice the rows of the FP8 one) and both
+  files on one NVMe: decode 29.11 vs 27.25 tok/s, prefill 244.9 vs 248.3, short34 logits level with FP8 (top-1
+  75.24 vs 74.72 %). Keep the tables on a filesystem that reads fast at random; on exFAT decode fell to ~25 tok/s.
+  Converter: `tools/v41/engram/engram_iq4nl_cuda.cu` (byte-identical to ggml's `quantize_iq4_nl`, one layer per GPU,
+  ~7 min a layer). IQ4_NL Engram idea from ISTA-DASLab's GSQ GGUFs; the GGUF table reader is NektoDron's.
+- **CPU: TQP5/6/7 AVX2 row kernel 3.3x** (bit-identical to the scalar reference, `tqp_avx2_exact_test`), and
+  `xqt_decode_bench` for the CPU expert lane.
+- **ERNIE:** DSpark speculative decoding behind `--dspark` (work in progress: acceptance is still below the reference,
+  so it stays off), the DSA indexer scores in column blocks (fixes a graph allocation failure on 25K-token prompts), and
+  `STRATA_DENSE_REQUANT=<type>` for the dense matrices.
+
+### Windows: the rest of #148 lands (27 Nov)
+
+Six pull requests from [mehzhure](https://github.com/mehzhure), each one fix from the #148 report:
+`strata/platform/win_compat.hpp` for the POSIX pieces MSVC lacks (#149), the Inkling image encoder reads its mmproj
+through the fd API MSVC has (#150), `ds4_moe` reads the shards through `tools/ds4/ds4_fd.hpp` with a positional
+`ReadFile` and a pread test from 8 threads (#151), `xolotl-lfm3` starts its speech helper with `CreateProcess` (#152),
+`tools/lfm3/build-helpers-win.bat` (#153) and the GLM census write-back that now replaces the file on Windows (#154).
+Linux behaviour is unchanged (the Linux build of every touched program and the pread test pass).
+
+### Trellis-coded tensor types (TQP5/6/7) (27 Nov)
+
+- **New ggml types** `TQP5`, `TQP6`, `TQP7` (ids 147-149; 2.625, 3.125 and 3.625 bits a weight: 128 weights in 2 + 8K bytes), in
+  `tools/xolotl/ggml/xolotl-ggml.patch`: CPU `to_float` / `vec_dot`, CUDA matrix-vector (decode) and dequant, and
+  gguf-py ids. The ids sit well above upstream ggml's range and the file carries a GGUF metadata flag, so other
+  engines reject a TQP file cleanly instead of misreading it. Re-run `tools/xolotl/fetch-llama.sh` after pulling.
+- **Prompt path.** By default a TQP tensor is dequantised and multiplied with cuBLAS. `XOLOTL_TQP_MMQ=1` switches
+  to a tiled MMQ kernel for the TQP types only (no other type is affected even when it is set). It is faster on
+  prompts and very slightly less accurate, so it stays opt-in.
+- **Status: experimental.** On a 13.9 GB Inkling-2-Mini test file the trellis tensors came out measurably closer to the
+  parent model than our XQ file (agent-KL cross-entropy 0.19618 vs 0.19939) with benchmarks at parity, but prompts were
+  14-26 % slower. We are not releasing that file; a smaller Inkling edition at XQ quality, and an ERNIE-5.5-Flash one,
+  are being tested.
+- Thanks: trellis-coded quantisation follows [QTIP](https://arxiv.org/abs/2406.11235) (Tseng, Sun, Hou, De Sa) and
+  turboderp's [EXL3](https://github.com/turboderp-org/exllamav3); the MMQ tile loader follows the pattern of
+  [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)'s IQ*_KT types and the TQ loader in the agentionai
+  llama.cpp fork by Laurent Zuijdwijk (MIT); recipe ideas from [nari-labs](https://huggingface.co/nari-labs). The model
+  is Thinking Machines Lab's (Apache 2.0), the refusal edit nokeep's; Xolotl is built on
+  [Strata](https://github.com/Niko1221/Strata).
+
+### Monitor: the queued count includes requests waiting beyond the engine's batch slots (24 Nov, #147)
+
+- In parallel mode a request enters the server's live set at once and its `queued` flag is cleared, so the Monitor
+  showed 0 waiting while the engine had requests queued behind its batch slots. The count now includes live requests
+  beyond the engine's slots (one slot when the engine runs requests one at a time).
+- Thanks: **lodos2005** (Hakan Yavuz) for the fix (#147, first contribution).
+
+### Windows fixes for the DeepSeek V4.1 engine and its picture reader; a tool-call loop guard in the server (24 Nov)
+
+- **#144** (fast mode on Windows): every `XOLOTL_*` name now works on Windows too (it was copied onto `STRATA_*` on Linux
+  only), and the `XOLOTL_SHADOW` / `STRATA_SHADOW` list - and the `.list` that `--build-shadow` writes - uses `;` on
+  Windows, as `--engram` does, so a drive letter's `:` no longer splits it. A Windows `.list` built before this is
+  `:`-joined: replace the `:` between files with `;` ([XOLOTL_FAST.md](../XOLOTL_FAST.md)).
+- **#145** (dense requant cache on Windows): the model path is split on `/` and `\`, so the cache lands in
+  `xolotl-cache` next to the model under the model's own file name, and later starts read it back (~25 s of a load).
+- **#146** (`lend_mib` / `per_image`): the server's keyed picture path now takes the turn's VRAM lend before the first
+  picture it has to encode and stops a `per_image` encoder (standby respawn included) before the prompt reaches the
+  engine; a picture already encoded takes neither. New-picture turns were 3.5-4x slower without it on Windows.
+- **Loop guard** (`serve/loop_guard.py`, on by default, config `"loop_guard"`): an agent that makes the same tool call 4
+  times in a row, or one of its last turn's calls 3 times in its last 12 with the same result, gets one short note
+  before its next turn (that prompt only; nothing is blocked).
+- Thanks: **kelheor** for #144-#146, each with a reproduction on Windows and a proposed fix; the loop guard and its 32
+  tests are from **musicurgy**'s [Delta Inference Engine](https://github.com/musicurgy/delta-inference-engine) 0.95
+  (MIT), whose design follows [Project Maya](https://github.com/mw00/project-maya)'s (MIT).
+
+### Inkling-2-Mini LoRA training behind the real harness prompt: prompt carry, bit for bit with the engine (24 Nov)
+
+- **Prompt carry** (`--prefix prompt.json`, or a per-window `"prefix"` / `"context"`): the context before a window runs
+  through the inference engine once; each slot visit attends to that slot's cached K/V and starts from its conv state.
+  The state after the shared prompt is snapshotted, so windows restore it instead of re-reading it, and a growing
+  conversation prefills only its new tokens. `tools/train/harness_subwindows.py` cuts windows to fit behind the prompt.
+- **Gate:** `--check T --check-prefix P` matches the engine bit for bit at every prefix tried, up to the full
+  23,061-token harness prompt (top-1 64/64). The first version drifted by 3-6e-2: not wrong state, but Inkling's
+  f16-accumulated attention product depends on the cell layout, so the trainer now pads its cells to the engine's
+  256-multiple and the gate reads sliding slots in the engine's order.
+- **Harness r2:** 22,921 coding-weighted sub-windows behind the 23K prompt, held-out loss **1.382 -> 1.166 (-15.6 %)**
+  in 300 steps (87 min). LiveCodeBench-20 with the adapter: 13/20 vs base 15/20, inside the noise: lower transcript loss
+  is not yet better coding. How-to and numbers: [docs/LORA_TRAINING.md](../LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090).
+- `harness_build_inkling.py --mask-errors`: leave out of the loss an assistant turn whose tool call came back as an error.
+- A task adapter trained on 6 teacher runs of a private agent benchmark: held-out loss -28.4 %, but worse on the
+  benchmark itself. Both results point at the data (size, whole trajectories, success selection), written up in
+  [What we learned about the data](../LORA_TRAINING.md#what-we-learned-about-the-data-24-nov).
+- REPEAT_BACK (CUDA) runs in grid-y slabs too, so the backward no longer stops at 65,535 attention cells (untested past
+  65K; memory is the next limit there).
+
+### LoRA training for Inkling-2-Mini, the whole model on one RTX 4090, and `--lora` at serve time (23 Nov)
+
+- **`xolotl-inkling --train`** trains rank-16 LoRA adapters on every layer of Inkling-2-Mini (attention q / k / v /
+  output / gate / rel, 144 adapters, 9.78M parameters) through the full looped forward (48 slot visits), with the base
+  weights frozen and quantized exactly as served. On the QuetzaCodetl harness data (15,227 windows, T <= 2048):
+  held-out loss **1.492 -> 1.243 in 100 steps (-16.7 %)**, 1.212 at 400 (-18.8 %). 3.0 / 5.7 / 14 s a step at
+  T = 512 / 1024 / 2048, 15.8-17.4 GB VRAM. How-to and gates: [docs/LORA_TRAINING.md](../LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090).
+- **Checkpoints and resume.** `--save P --save-every N` keeps `P-stepNNNNNN.gguf` per checkpoint, `P` = the latest
+  adapter, `P.state` = the AdamW state; `--resume P` continues the run exactly; `systemctl stop` / Ctrl-C writes a
+  checkpoint before exiting.
+- **`xolotl-inkling --serve ... --lora adapter.gguf [--lora-scale S]`** serves an adapter (llama.cpp LoRA GGUF format,
+  what `--train` writes). Gate: with the adapter on both sides the training graph and the engine's forward agree bit
+  for bit; the fused serve path stays within the same 4 % of the trainer with or without the adapter, while the
+  adapter itself moves the logits by ~110 %. Without `--lora` nothing changes.
+- **New ggml backward** (in `tools/xolotl/ggml/xolotl-ggml.patch`, inference untouched): `GGML_OP_MUL_MAT_ID_BACK`, the
+  activation gradient through frozen quantized experts (CPU + CUDA, every XQ expert type), TANH, L2_NORM, FILL, batched
+  GET_ROWS_BACK, the softmax mask gradient, broadcast SUB. Each has a finite-difference test in test-backend-ops
+  (`tools/train/test-backend-ops-train.patch`); the softmax mask rule is also checked against a double-precision
+  reference (`tools/train/smgrad_ref.cpp`).
+- **Harness data for Inkling**: `tools/train/harness_build_inkling.py` (+ `--heldout-only` eval sets) and
+  `check_harness_inkling.py`.
+- Found on the way: the fused CUDA top-k MoE router and the unfused graph give losses 0.8 % apart on Inkling. The
+  kernel is right (they agree to 1.6e-7 at the first slot; new test-backend-ops cases at Inkling's 128 experts / top-8);
+  the gap is rounding amplified through the 48 looped visits, the same size as f16 vs f32 attention.
+
+### Inkling-2-Mini: `--vram-budget-mib` fixed, 96 fewer decode launches, numeric reasoning effort (23 Nov)
+
+- **`--vram-budget-mib` works again** (the mode that splits experts between VRAM and pinned RAM for 12-16 GB cards).
+  Two bugs, both on prompt chunks: (1) every expert absent from an arena mapped to one shared zero row, so a token
+  could name that row several times, and llama.cpp's MMQ id helper assumes a token uses an expert at most once: the
+  unwritten slots sent `quantize_mmq_q8_1` out of bounds (illegal memory access). Each top-k position now has its own
+  zero row. (2) The cold experts were staged into a new graph *leaf*, which ggml-alloc never frees, so every layer's
+  staging stayed resident (13-24 GB of graph buffer at 128K) and MMQ asserted on the padded view; now a DUP node.
+  Greedy tokens match the all-in-VRAM run. Decode with cold experts is PCIe-bound (XQ at a 10 GB budget: 13.5 tok/s).
+- **Decode, -96 launches a token, bit-identical** (teacher-forced NLL through the decode path unchanged to the bit):
+  the K and V attention-prepare kernels run as one launch (`XOLOTL_INKLING_PREP_PAIR=0` = two), the q and rel clips as
+  one op writing one buffer (`XOLOTL_INKLING_CLIP_PAIR=0`), and the loop controller's down projection reads its
+  activations once per 4 rows (7.06 -> 6.13 us; `XOLOTL_INKLING_CTRL_RB`). ~130 -> ~132 tok/s in-process.
+- **Numeric `reasoning_effort`** for Inkling (0 = off .. 0.99), as llama.cpp and SGLang clients send it in
+  `chat_template_kwargs`; the names keep their meaning.
+- **Loop count.** `XOLOTL_INKLING_PASSES=N` (research only) runs the loop core N times. WikiText 8K perplexity: 2 passes
+  12.06, **3 (trained) 6.71**, 4 11.23, 6 7.07 - the three-pass cycle that
+  [drhb's looped-transformer study](https://drhb.github.io/blog/posts/looped-transformers/) found; 3 stays.
+- **The exact NVFP4 parent** on one 4090: 97 tok/s decode with everything in VRAM up to 32K context (k8v4); above
+  that its BF16 layer-20-23 experts spill and decode is PCIe-bound (`--cpu-exps 20-23`: 36 tok/s at 128K).
+
+### Inkling-2-Mini decode 118 -> 127 tok/s: fused loop controllers, folded expert scales, BF16 router (22 Nov, late)
+
+Peer engines for this model (satellitedown/skyne98's ingine, 140 tok/s on an RTX 3090; ManyGlue0's InklingEngine) run
+about 450 kernels a token; we ran 2,111. A decode token reads ~3.8 GB of weights (1.8 GB dense with the 3x loop,
+1.6 GB of experts, 0.5 GB head) and our weight mat-vecs already ran at ~950 GB/s, so the gap was the small kernels.
+- **Loop controllers** (24 visits a token, ~25 kernels each for the q/k/v and FFN controllers): one fused op, three
+  kernels, reading BF16 copies of the controller weights. The checkpoint stores them as BF16 and the GGUF's F32
+  tensors hold exactly those values, so the copies are exact and half the bytes.
+- **Per-expert NVFP4 scales**: the gate/up scale is applied inside the SiTU kernel and the down scale inside the
+  fused MoE finish (the same fp32 multiply, bit-identical), removing a gather and a multiply each a visit.
+- **Router** read as its exact BF16 copy for decode.
+
+2,111 -> 1,482 kernels a token, GPU time 7.48 -> 6.80 ms. Served decode, k8v4, no drafter:
+
+| context | 7.3K | 30K | 117K | 477K |
+| --- | ---: | ---: | ---: | ---: |
+| before | 118 | 108 | 93 | 55 |
+| after | **127** | **118** | **100** | **56** |
+
+With the DSpark drafter, code requests run ~150 tok/s. Quality: 8K NLL in 16-token steps at the f16 run-to-run floor
+(controllers vs the chain 0.0205 per-token, mean -0.0004; scale folds bit-identical). Switches back:
+`XOLOTL_INKLING_CTRL_FUSED=0`, `XOLOTL_INKLING_SCALE_FOLD=0`, `XOLOTL_INKLING_ROUTER_F32=1`.
+
+### Inkling-2-Mini long-context decode near the memory bandwidth: 477K tokens 30 -> 55 tok/s (22 Nov, night)
+
+Profiled with Nsight Systems at
+117K: the global layers' decode attention took 571 us a visit (~340 GB/s of K/V), the merge of its splits ~20 us a
+call, 48 calls a token, and the host filled and uploaded a `[cells, T]` mask and distance array every token.
+- A new decode attention kernel scores **one cell per lane**: each lane holds its cell's whole K row in registers
+  and dots it with q from shared memory, the relative-position bias folded in, so a score needs no cross-lane
+  reduction; then p v with lanes over dims, 16 V loads in flight. 571 -> 232 us a visit at 117K (~840 GB/s).
+- The split merge runs parallel over the splits (8 warps, coalesced) instead of every thread walking all of them.
+- The global layers' mask and distance come from the token's position inside the kernel (cell j = position j):
+  no host arrays (3.8 MB a token at 477K). Bit-identical to the arrays.
+
+Served decode, k8v4, no drafter, 400 tokens after the prompt, RTX 4090:
+
+| context | 7.3K | 30K | 117K | 477K |
+| --- | ---: | ---: | ---: | ---: |
+| before | 108 | 93 | 65 | 30 |
+| after | **118** | **108** | **93** | **55** |
+
+Quality: 8K wikitext NLL in 16-token steps (the decode kernel on every position) stays at the f16 run-to-run floor
+for f16 and k8v4, 32K mean NLL change -0.00005 (se 0.0005); the 477K needle and the drafter's verify path checked.
+Each piece has a switch back (`XOLOTL_INKLING_DECATTN_LANE=0`, `_RED2=0`, `_POS=0`, `_STREAM=0`).
+
+### Inkling-2-Mini: 512K context on one RTX 4090 with k8v4 on the fast kernels, 4-bit V leg Hadamard-rotated (22 Nov, evening)
+
+**Quantised K/V on the fast kernels.** `--kv-type k8v4` (q8_0 keys, q4_0 values on the global layers) and `q8_0` used
+to fall back to the reference op chain, about 130 tok/s of prefill at 100K. The tensor-core prompt attention now stages
+the raw q8_0 / q4_0 rows with cp.async and dequantises them into its f16 tile, decode attention reads them in place,
+and the decode prepare kernel (K/V conv, key clip, value norm, cache store) writes q8_0 / q4_0 rows itself. A
+107,800-token prompt at k8v4 prefills in **29 s (~3.7K tok/s)**; decode at 32K context is **90 tok/s at k8v4**
+(89 at f16, 86.6 before the prepare kernel took quantised rows). Gate: fast vs chain KL 3.1e-3 at k8v4 (f16 run-to-run
+floor 2.0e-3); a 107K-token summary is correct.
+
+**512K context on one RTX 4090** (`--context 524288 --kv-type k8v4`, with the DSpark drafter and the image tower
+loaded: 12.5 GiB of weights + 6.8 GiB of K/V state, 23.4 GB of VRAM in use). A 477,603-token prompt (wikitext + the
+four Vedas, one planted sentence at 10 % depth) prefills in ~218 s (~2.2K tok/s) and the model quotes the planted
+sentence exactly; decode at that depth ran ~27 tok/s with the drafter on (55 tok/s plain after the kernel work
+below). Two things stood in the way:
+- Decode at long context fell off the fast kernel: the decode window was split into chunks sized for the old
+  chain's score tensors (`--attn-budget`), and past ~100K cells that meant several chunks, which the split-K kernel
+  does not take. Decode then fell back to the chain, which asked for a 17 GB graph buffer at 477K. Decode and verify
+  steps now plan one chunk at any length (the kernel reads K/V in place and builds no score tensor).
+- The kernel kept one partial result per 64 cells: ~93 MB per token at 477K, and ~3 GB across the drafter's verify
+  lengths, which each keep their own graph buffer. Splits are now capped at 512; past 32K cells a split walks
+  several 64-cell chunks and joins them with an online softmax. Up to 32K context nothing changes (bit-identical
+  output); with the cap forced low the result stays at the f16 noise floor.
+
+**Hadamard rotation of the 4-bit leg, default on** (`XOLOTL_INKLING_KV_ROT`, 0 = off, 2 = every leg). A q4_0 leg is
+rotated by a randomised Hadamard transform before it is stored, which spreads outlier channels across each 32-value
+block; on k8v4 that is the values, with the attention output rotated back once per head. The q8_0 keys stay plain:
+they are near-lossless without it (q8_0 noise = the f16 floor on Inkling; int8 KL 3.4e-4, top-1 99.5 % on the dense
+27B). The decode prepare kernel applies the rotation itself (a shared-memory FWHT), so it costs no speed. Per-token
+|dNLL| against f16, wikitext:
+
+| k8v4 | 32K prompt path | 8K in 16-token steps (decode kernels) |
+| --- | ---: | ---: |
+| f16 run-to-run floor | 0.0395 | 0.0359 |
+| no rotation | 0.0483 | 0.0438 |
+| K and V rotated | 0.0459 | 0.0403 |
+| **V rotated (default)** | **0.0454** | **0.0403** |
+
+Mean perplexity is unchanged in every arm (within one standard error).
+
+**Fixes, all in the released engine too:**
+- Graph reuse: the prompt attention kernel bakes the chunk's start position into its op params, but the graph key had
+  no start position, so a prompt chunk with the same length in the same 256-cell bucket reran at the previous chunk's
+  position (wrong attention on multi-turn follow-ups that hit it). Dump gate: KL to the chain 0.258 -> 0.002.
+- The prompt kernel's dequantise step read cp.async-staged rows without a block barrier (cp.async.wait covers only a
+  thread's own copies): garbage logits on long quantised prompts.
+- The DSpark drafter kept a full-context f16 cache on its global layer (2 GiB at 512K, the allocation that refused to
+  load, and an O(context) cast per draft step). It is now a ring of the last `XOLOTL_DSPARK_WINDOW` positions
+  (default 32768; 0 = the old cache).
+
+### Inkling-2-Mini XQ re-released as "Unbound" (22 Nov)
+
+[IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored) now holds the **Unbound** build, under the same file name and
+size (13.93 GB), so existing links and configs keep working; the first (ARA) file stays in the repo's history.
+[nokeep](https://huggingface.co/nokeepai/Inkling-2-Mini-Unbound) found that a plain refusal-direction projection does
+not survive on this model: the short causal convolution after each attention output mixes neighbouring positions, so
+19-88 % of what a projection removes leaks back. Their edit projects through a convolution-aware subspace and keeps
+row norms, on the 20 attention-output projections of layers 4-23; no expert is touched. This build applies it at
+strength 4 (they ship 3): on a sweep, 3 / 4 / 5 gave greedy MATH-24 87.5 / 87.5 / 83.3 % and 34 / 24 / 21 refused of
+100 harmful prompts. The XQ experts are unchanged from the first release.
+
+| RTX 4090, Xolotl's engine | first release (ARA) | **Unbound** |
+| --- | ---: | ---: |
+| MATH-24 sampled, 3 seeds (thinking tokens) | 83.3 % (1,024) | **88.9 % (911)** |
+| MMLU-100 greedy / MMLU-30 thinking | 76 % / 87 % | 71 % / 86.7 % |
+| HumanEval (21) / tool choice (10) / agent loops (3) | 19 / 8 / 3 | **21 / 9 / 3** |
+| WikiText-2 perplexity (same engine) | 4.554 | **4.496** |
+| KL to the official model, 8,192 held-out tokens (top-1) | - (its bf16 parent: 0.0336, 92.1 %) | **0.0282 (92.8 %)** |
+| harmful / harmless refused of 100 (BERT gate, thinking off) | 4 / 1 | 24 / 0 |
+| Gauntlet v3, 7 tasks, thinking on | not run | 4/7 solved |
+| Gauntlet v3-small, 6 tasks (the README table's score) | not run | 4.42 of 6 (3 solved) |
+
+MMLU-100 moves ~4.5 points on a 100-question sample. Most of the 24 counted refusals are partial or vague answers; if
+you need zero, nokeep's own release at strength 3 measures 0/277 on their sealed set with a judge (a different gate).
+
+### Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K, decode 93 -> 113 tok/s, DSpark 136 tok/s (22 Nov)
+
+**Prompt attention on the tensor cores** (a port of Basalt's `attn_prompt.cu`, by Jesus Gulfo, MIT): a prompt chunk
+attends flash style over the f16 K/V cache in place, with the relative-position bias and the attention sink computed
+inside the kernel (the bias is one extra small tensor-core product over the band of distances a key tile spans). The
+old path built a `[cells, rows, heads]` score tensor and host masks, so its cost grew with context and it had to keep
+chunks at 512 rows. Without it, prompt chunks grow to **2048 rows**, which reads each expert once for four times as
+many tokens. Measured on the RTX 4090, 14 GB XQ quant, served:
+
+| prompt | before | after |
+| --- | ---: | ---: |
+| 8K tokens | ~1,670 tok/s | ~3,500 tok/s |
+| 32K tokens | ~1,210 tok/s (27 s) | **4,190 tok/s (7.8 s)** |
+
+Also for prompt chunks: the MoE weighted sum over the 8 experts is one bandwidth-bound kernel instead of a batched
+mat-vec over a transposed copy (-24 % of prefill GPU time at 2048-row chunks). The chunk size is picked at load from
+the VRAM left after the weights (2048 / 1024 / 512 / 256 rows: the quant at 36K-131K context gets 2048, the NVFP4
+parent at 32K gets 256); `--ubatch N` still overrides it. `XOLOTL_INKLING_PROMPT_ATTN=0` restores the old path.
+
+**Decode** (all default on, each with an env switch back to the old path): split-K decode attention that reads the f16
+K/V window in place with the relative bias in-kernel (`XOLOTL_INKLING_DECATTN=0`), the attention prepare (K/V
+convolutions, key clip, value norm, cache writes) in two kernels, the MoE finish (weighted sum, post-conv, residual) in
+one, and the verify step's conv history fused. Plain decode **93 -> 113 tok/s**; with the DSpark drafter (`--dspark`)
+**136 tok/s** on a 2.8K-token prompt (2.4 of up to 7 drafts accepted per step) and ~140 tok/s on served thinking
+requests. The NVFP4 parent on the same engine: 89 tok/s plain, 137 tok/s with DSpark.
+
+**Quality:** this model's logits move at the rounding level with any kernel change (near-tied expert picks flip), so
+each change was judged by paired NLL and KL against the NVFP4 parent on 2 x 1024 held-out tokens, prefill and decode
+paths: prefill NLL 1.1967 -> 1.1987, KL to the parent 0.0364 -> 0.0369; decode KL to the parent 0.0377, unchanged.
+Both inside the noise between runs of the old path.
+
+Also: Inkling-2-Mini is **3B active** per token (the official count), about 5.4B effective because its 12-layer loop
+core runs 3 times; the 21 Nov notes said "5.4B active". The example config's sampling now matches the model card
+(temperature 1.0, top_p 1.0, top_k 64 = the engine's maximum).
+
+### Inkling-2-Mini decode 67 -> 93 tok/s: fused conv, SiTU and stream-stack kernels (21 Nov, evening)
+
+**Inkling-2-Mini decode 67 -> 93 tok/s** on the RTX 4090 (the 14 GB XQ quant, 256-token
+greedy; 93-96 tok/s in served evals): the depthwise conv step, SiTU and the residual-stream stack are one CUDA
+kernel each (bit-identical logits to the op chains they replace), q/rel/gate are one stacked mat-vec per token, and
+the loop controllers run as one batched chain. Needs the updated ggml patch (one new hook, no effect on other
+engines): `bash tools/xolotl/fetch-llama.sh <your ggml dir>`, then rebuild. Quick quality screen of the released
+quant against its parents (greedy, thinking off): MMLU-100 76 % (original 73 %, abliterated parent 74 %),
+HumanEval-21 19-21/21 for all three, tool choice 8/10 and agent loops 3/3 for all three. Worth knowing for anyone
+measuring this model: its logits are chaotic at the rounding level (near-tied expert picks flip), so any engine
+change - even a different prefill chunk size - moves held-out KL by ~0.005 over 2K tokens.
+
+### Inkling-2-Mini XQ, abliterated, released (21 Nov)
+
+**Inkling-2-Mini XQ, abliterated**: 13.93 GB, passed its quality gates against the
+abliterated parent (held-out KL 0.013, top-1 96.3 %) and refuses 4/100 harmful prompts (1/100 harmless). On one RTX
+4090 through Xolotl's server: **1,162 tok/s prefill at 8K, 59.7 tok/s decode**, the same as the 22.9 GB parent.
+On [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)
+with the model's DSpark (MTP) drafter and vision projector as optional files; the agentic Gauntlet is running.
+Engine: speculative decoding with the DSpark drafter (`--dspark`, experimental)
+and quantised K/V caches (`--kv-type q8_0|k8v4`). Decode is kernel-launch bound (16.7 ms a token against a ~3.4 ms
+memory floor), so kernel fusion toward 100+ tok/s is next, then vision (first step: 93 tok/s, above).
+
+### Inkling-2-Mini on its own engine, `xolotl-inkling` (21 Nov)
+
+[Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, 5.4B active per token) on
+its own engine, `xolotl-inkling`: **57 tok/s decode, 1.1K tok/s prefill** on the RTX 4090 from the exact NVFP4
+checkpoint, greedy output matching the llama.cpp reference. The graph is ported from llama.cpp PR #32694 by Pedro
+Cuenca (MIT); a loop-pass expert-scale bug in it is fixed here. First numbers: fused kernels, flash attention
+and MTP drafting are next.
+
+Correction (21 Nov, evening): Inkling-2-Mini is 5.4B active per token, not "about 3B". About 3.1B distinct weights
+are read per token (1.6B shared + 8 of 128 experts), but layers 6-17 run three times, so the per-token compute is 5.4B
+(Thinking Machines' figure).
+
+### LoRA training proven end to end on QFN: a harness adapter trained from the served engine's activations (21 Nov, later)
+
+**A real fine-tune works** - [docs/LORA_TRAINING.md](../LORA_TRAINING.md#how-it-works-a-lora-for-a-125b-moe-on-one-gaming-pc).
+A rank-16 LoRA on Qwen3.8-Flash-Next's top four layers, trained on the RTX 4090 from activations the **served engine**
+captured (prefix + window prefill, quantized base, YaRN rope, layer 47's own sparse selection replayed), with the real
+next-token loss on agent transcripts (QuetzaCodetl / Claude Code sessions, assistant turns only). On 12 windows for 36
+steps (~6 min) the loss on two held-out windows fell **1.4116 -> 1.3197 (-6.5 %)**. Before training, the trainer's
+forward reproduced the engine on a real 21,686-position window (loss 1.7798 CPU / 1.7780 GPU vs the engine's 1.7795).
+New: the harness data builder and request capture, the capture driver, the QFN top-4 stack with the prefix carry, the
+GPU trainer (`tools/train/qfn_harness_train.cpp`) with live loss graphs (`lossplot.py`). Two CUDA fixes for training
+shapes in `xolotl-ggml.patch` (OUT_PROD with a cuBLAS-invalid view stride, REPEAT_BACK beyond the grid-z limit) - both
+backward-only ops, so inference is unchanged; rebuild after `fetch-llama.sh`.
+
+**Option, experimental: fast capture through `--serve`** - one engine, the root checkpoint at the prefix end: 2.6-3.6 s
+per window instead of 66-137 s. Opt-in engine flag `STRATA_KVA_CAPTURE_PER_REQ=1` (off = unchanged). **Its window rows
+do not match the slow capture yet** (median relative error 0.12-0.13 per row, prefix rows bit-identical), so do not
+train on it until that is explained - details in the doc.
+
+### LoRA training (experimental), the Hy4-flash engine, FP8 Qwen4-Exp n-gram tables, Windows build fix (21 Nov)
+
+**LoRA training, experimental** - [docs/LORA_TRAINING.md](../LORA_TRAINING.md). Backward kernels for training adapters
+on the MoE models Xolotl serves with the base frozen and quantized as served: OUT_PROD with a quantized weight on CUDA,
+the backward rules ggml lacked (SIGMOID, SWIGLU_CLAMP, CONCAT, CLAMP, GET_ROWS_BACK, SOLVE_TRI upper, TRI, CUMSUM,
+SSM_CONV, PAD), the chunked gated delta net and the MoE expert loop as differentiable graphs, a Hy4-flash trainer and
+QFN trainers on real pack weights, adapters written in llama.cpp's LoRA GGUF format (llama.cpp loads them). Every piece
+has finite-difference and reference gates. **Real fine-tuning is not proven yet** - the runs so far fit a fixed target.
+Nothing changes for inference: every ggml change is in the backward pass or in SOLVE_TRI's new upper variant, and
+DeepSeek-V4.1 greedy output (96 tokens, served settings) is identical to main's when both runs get the same number of
+VRAM expert slots - the slot count follows the card's free VRAM, and one slot more or less moves main's own output too.
+
+**Hy4-flash engine** (`tools/hy4/`, built only when asked): geometry + tensor map, the Engram shard writer (F8_E4M3,
+byte-exact vs Tencent), the dense half on CUDA passing the golden gate, experts on the DeepSeek-V4.1 tier, k-pool
+selection. `ds41_moe.cpp`'s expert cap is now `DS41_MOE_MAX_K` (default 8: DeepSeek-V4.1 builds unchanged).
+
+**FP8 Qwen4-Exp checkpoints from upstream llama.cpp's converter** (#32476) load: the n-gram table arrives as GGML type
+43 = F8_E4M3 with its scale in `per_layer_token_embd.scale`. 43 is also MXFP8 in older DeepSeek-V4.1 GGUFs (llama.cpp
+#30817, closed unmerged), so the reader tells the two apart by the tensor's size; MXFP8 files read exactly as before.
+
+**Windows:** `src/kernels/cuda/expert_keep.cu` builds with MSVC again (#143, reported and verified by
+[kelheor](https://github.com/kelheor)). Also: the Q2_0 AVX2 row kernel unpacks codes in 7 ops instead of ~8.5
+(llama.cpp #30447, homeofe; bit-identical, one token 1.28-1.58x faster a row), opt-in `STRATA_TRACE_DIR` live
+thinking traces in serve, a serve test that no longer breaks other tests under `unittest discover`, and ERNIE 5.5
+Flash (`ernie5_5`) is recognised - geometry and tensor map - and refused with a clear message (no execution path yet).
+
 ### DeepSeek-V4.1 decode switches on by default, agent tasks 42.7 tok/s (19 Nov)
 
 `tools/v41/serve/ds41-engine.sh` now turns on [Keisawaakira](https://github.com/Keisawaakira)'s decode set
@@ -652,6 +1039,15 @@ cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's encoder cannot load. 
 and LFM3 transcribes and speaks while QFN keeps its speed: 0.75 s for a 96-token answer while 3.5 s of speech streamed.
 
 ## Model releases
+
+### Inkling-2-Mini XQ Unbound 13.9 GB (22 Nov; first release 21 Nov)
+
+On [Hugging Face](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored): Thinking Machines' 26B looped MoE (3B active), our XQ quant with nokeep's
+convolution-aware refusal edit ("Unbound"), plus the model's own DSpark drafter and vision projector as optional
+files. On the 4090 it does **113 tok/s decode (136-140 with the drafter), 4,190 tok/s prefill at 32K, and 512K
+context** (55 tok/s decode at 477K tokens). Held-out KL to the official model 0.028 (top-1 92.8 %), HumanEval 21/21,
+Gauntlet v3 4/7. Runs on its own engine, `xolotl-inkling`: [docs/INKLING.md](../INKLING.md).
+[Release notes](#inkling-2-mini-xq-re-released-as-unbound-22-nov).
 
 ### Qwen3.8-Flash-Next XQ 45 GB (31 Oct)
 

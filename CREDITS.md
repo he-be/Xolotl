@@ -15,6 +15,14 @@
 - Weights: DeepSeek, Zhipu AI and Qwen, with quants and fine-tunes by peasantsmith, ukisai, d0xin and gcsa-abliterix.
 - SenseNova-Loop-9B by SenseTime; the dense engine's loop and mHC follow their reference `modeling_sensenova_loop.py`.
 - LFM3-Omni by [Liquid AI](https://huggingface.co/LiquidAI); its engine follows llama.cpp's LFM3 and libmtmd work.
+- Inkling-2-Mini by [Thinking Machines Lab](https://thinkingmachines.ai) (Apache 2.0); its engine's graph and image
+  tower follow llama.cpp PR #32694 by [Pedro Cuenca](https://github.com/pcuenca) (MIT). Our release's refusal edit
+  is [nokeep](https://huggingface.co/nokeepai/Inkling-2-Mini-Unbound)'s convolution-aware "Unbound" edit; its DSpark
+  drafter GGUF was converted by [unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF).
+- ERNIE-5.5-Flash by [Baidu](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) (Apache 2.0); the engine reads the GGUF
+  layout of llama.cpp PR [#31925](https://github.com/ggml-org/llama.cpp/pull/31925) by
+  [FakerVSdonk](https://github.com/FakerVSdonk), and was checked tensor by tensor against that PR's build and the
+  vLLM-ERNIE model code.
 - Muse Glimmer by Meta Superintelligence Labs; its engine follows llama.cpp's Muse Glimmer support (ggml-org/llama.cpp
   #26841: graph, chat parser, mtmd projector). The abliterated build it was measured with is darkc0de's, quantised by bartowski. Its DFlash drafter is Meta's; the drafter graph follows llama.cpp's `src/models/dflash.cpp`.
 
@@ -75,11 +83,14 @@
 - **[penink-WH](https://github.com/penink-WH)**: the AC922 rig
 - **[cpacsm75](https://github.com/cpacsm75)**: 192 GB arena tuning on Windows (#77); the RTX 5090 arena and `--kv-q8`
   numbers at 256K/512K (#114)
-- **[jesdga95](https://github.com/jesdga95/basalt)** (Basalt): the priced stream-all prefill chunk, quoted tool calls in
+- **[jesdga95](https://github.com/jesdga95/basalt)** (Basalt, Jesus Gulfo): the Inkling-2-Mini prompt attention kernel (`attn_prompt.cu`, ported as `inkling_attn_prompt`) and the fused-decode and DSpark designs our Inkling kernels follow; the priced stream-all prefill chunk, quoted tool calls in
   string values, union/nullable tool parameters, IQ code bytes by shift, IQ1_M on MMQ, and the ideas behind the
   DeepSeek-V4.1 Engram read-ahead and late shared expert
+- **[mehzhure](https://github.com/mehzhure)**: the Windows 11 / CUDA 12.8 port report with patches (#148): the tokenizer
+  pack's special-id names (Glimmer's finish_reason), the MSVC + CUDA 12.x shared runtime, the 12.8 `cudaMemcpyBatchAsync` form
 
 ---
 
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe.
+ Then the rest of it as six pull requests (#149-#154): the MSVC POSIX shims, positional shard reads in `ds4_moe`, the LFM3 speech helper and helper build script, and the GLM census write-back on Windows.
