@@ -8,7 +8,7 @@
     "--experts",
     "gpu",
     "--engram",
-    "/mnt/engram/FP8-engram-1017",
+    "/mnt/engram/IQ4NL-engram-1017/L1.gguf:/mnt/engram/IQ4NL-engram-1017/L14.gguf",
     "--rank",
     "/root/models/V41-XQ-1017-v4/rank-1017-v4.bin",
     "--ctx",
